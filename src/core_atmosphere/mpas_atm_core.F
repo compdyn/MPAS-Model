@@ -1008,7 +1008,7 @@ module atm_core
 #ifdef DO_CHEMISTRY
       use mpas_atm_chemistry, only: chemistry_step
 #endif
-      use mpas_atm_partmc, only: atm_partmc_check, atm_partmc_particles_transport
+      use mpas_atm_partmc, only: atm_partmc_check, atm_partmc_particles_transport, atm_partmc_particles_to_scalar
       use mpas_atm_halos, only: exchange_halo_group
 
       implicit none
@@ -1045,6 +1045,8 @@ module atm_core
 #ifdef DO_CHEMISTRY
       call chemistry_step()
 #endif
+
+      call atm_partmc_particles_to_scalar(domain)
 
       call atm_timestep(domain, dt, currTime, itimestep, exchange_halo_group)
 

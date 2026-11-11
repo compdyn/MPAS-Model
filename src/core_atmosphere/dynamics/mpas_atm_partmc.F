@@ -112,11 +112,15 @@ module mpas_atm_partmc
    implicit none
    private
 
-   public :: atm_partmc_init, atm_partmc_check, atm_partmc_particles_init, atm_partmc_particles_transport
+   public :: atm_partmc_init, atm_partmc_check, atm_partmc_particles_init, atm_partmc_particles_transport, &
+             atm_partmc_particles_to_scalar
 
 #ifdef MPAS_PARTMC
    !> Target number of computational particles per cell (0 disables particles). Env: PMC_N_PART.
    integer :: pmc_n_part = 0
+   !> Whether pmc_num is reset from the particle counts before every step (Env: PMC_COUPLED, default 1).
+   !> If not, particles follow the free-running Eulerian pmc_num (one-way test mode).
+   logical :: pmc_coupled = .true.
    !> Aerosol species data.
    type(aero_data_t) :: aero_data
    !> Particle populations, (nVertLevels, nCellsSolve).
@@ -145,7 +149,7 @@ contains
       type (mpas_pool_type), pointer :: mesh, state
       real (kind=RKIND), dimension(:,:,:), pointer :: scalars
       real (kind=RKIND), dimension(:), pointer :: latCell, lonCell
-      integer, pointer :: index_pmc_num, nCells, nVertLevels
+      integer, pointer :: index_pmc_num, index_pmc_ref, nCells, nVertLevels
       integer :: iCell, k
       real (kind=RKIND) :: d, cosd
       real (kind=RKIND), parameter :: q_background = 1.0e8_RKIND
@@ -161,6 +165,7 @@ contains
          nullify(index_pmc_num)
          call mpas_pool_get_dimension(state, 'index_pmc_num', index_pmc_num)
          if (.not. associated(index_pmc_num)) return
+         call mpas_pool_get_dimension(state, 'index_pmc_ref', index_pmc_ref)
          call mpas_pool_get_dimension(mesh, 'nCells', nCells)
          call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
          call mpas_pool_get_array(mesh, 'latCell', latCell)
@@ -173,6 +178,7 @@ contains
                d = acos(max(-1.0_RKIND, min(1.0_RKIND, cosd)))
                do k = 1, nVertLevels
                   scalars(index_pmc_num,k,iCell) = q_background + q_blob*exp(-(d/width)**2)
+                  scalars(index_pmc_ref,k,iCell) = scalars(index_pmc_num,k,iCell)
                end do
             end do
             call mpas_log_write('PartMC: initialized pmc_num with background + blob')
@@ -202,18 +208,24 @@ contains
       real (kind=RKIND) :: recon, out, s
       real (kind=RKIND) :: err_max, c_max, out_max, total_old, total_new
       real (kind=RKIND) :: g_err_max, g_c_max, g_out_max, g_total_old, g_total_new
+      real (kind=RKIND) :: state_err, g_state_err
+      real (kind=RKIND), dimension(:,:,:), pointer :: scalars_new
+      real (kind=RKIND), dimension(:,:), pointer :: rho_zz_new
 
       err_max = 0.0_RKIND
       c_max = 0.0_RKIND
       out_max = 0.0_RKIND
       total_old = 0.0_RKIND
       total_new = 0.0_RKIND
+      state_err = 0.0_RKIND
 
       block => domain % blocklist
       do while (associated(block))
          call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
          call mpas_pool_get_subpool(block % structs, 'state', state)
          call mpas_pool_get_subpool(block % structs, 'diag', diag)
+         call mpas_pool_get_array(state, 'scalars', scalars_new, 2)
+         call mpas_pool_get_array(state, 'rho_zz', rho_zz_new, 2)
          nullify(index_pmc_num)
          call mpas_pool_get_dimension(state, 'index_pmc_num', index_pmc_num)
          if (.not. associated(index_pmc_num)) return
@@ -241,6 +253,7 @@ contains
                   out = out + max(0.0_RKIND, s)
                end do
                err_max = max(err_max, abs(recon - c_new(k,iCell)))
+               state_err = max(state_err, abs(rho_zz_new(k,iCell)*scalars_new(index_pmc_num,k,iCell) - c_new(k,iCell)))
                c_max = max(c_max, c_new(k,iCell))
                if (c_old(k,iCell) > 0.0_RKIND) out_max = max(out_max, out/c_old(k,iCell))
                total_old = total_old + c_old(k,iCell)*areaCell(iCell)/rdzw(k)
@@ -257,9 +270,15 @@ contains
       call mpas_dmpar_sum_real(domain % dminfo, total_old, g_total_old)
       call mpas_dmpar_sum_real(domain % dminfo, total_new, g_total_new)
 
-      call mpas_log_write('PartMC check step $i: recon rel err = $r, max outflow frac = $r, total rel change = $r', &
-                          intArgs=(/itimestep/), &
-                          realArgs=(/g_err_max/g_c_max, g_out_max, (g_total_new - g_total_old)/g_total_old/))
+      call mpas_dmpar_max_real(domain % dminfo, state_err, g_state_err)
+
+      if (mod(itimestep, 12) == 0 .or. itimestep <= 2) then
+         call mpas_log_write('PartMC check step $i: recon rel err = $r, max outflow frac = $r, total rel change = $r', &
+                             intArgs=(/itimestep/), &
+                             realArgs=(/g_err_max/g_c_max, g_out_max, (g_total_new - g_total_old)/g_total_old/))
+         call mpas_log_write('PartMC check step $i: captured vs model state rel diff = $r', &
+                             intArgs=(/itimestep/), realArgs=(/g_state_err/g_c_max/))
+      end if
 
    end subroutine atm_partmc_check
 
@@ -293,6 +312,8 @@ contains
 
       call get_environment_variable('PMC_N_PART', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_n_part
+      call get_environment_variable('PMC_COUPLED', envval, status=stat)
+      if (stat == 0) pmc_coupled = (trim(envval) /= '0')
       if (pmc_n_part <= 0) then
          call mpas_log_write('PartMC: particles disabled (set PMC_N_PART > 0 to enable)')
          return
@@ -381,9 +402,56 @@ contains
 
       call mpas_log_write('PartMC: created $i particles in each of $i cells', &
                           intArgs=(/pmc_n_part, nVertLevels*nCellsSolve/))
+      if (pmc_coupled) then
+         call mpas_log_write('PartMC: coupled mode, pmc_num is reset from particle counts every step')
+      else
+         call mpas_log_write('PartMC: one-way mode, particles follow the Eulerian pmc_num')
+      end if
 #endif
 
    end subroutine atm_partmc_particles_init
+
+
+   !> Coupled mode: set pmc_num (time level 1) from the particle counts, so that the
+   !> host's scalar transport computes fluxes for the field the particles represent.
+   subroutine atm_partmc_particles_to_scalar(domain)
+
+      type (domain_type), intent(inout) :: domain
+
+#ifdef MPAS_PARTMC
+      type (block_type), pointer :: block
+      type (mpas_pool_type), pointer :: mesh, state
+      type (field3DReal), pointer :: scalars_field
+      real (kind=RKIND), dimension(:,:,:), pointer :: scalars
+      real (kind=RKIND), dimension(:,:), pointer :: rho_zz, zz
+      integer, pointer :: index_pmc_num, nCellsSolve, nVertLevels
+      integer :: iCell, k
+
+      if (pmc_n_part <= 0 .or. .not. pmc_coupled) return
+
+      block => domain % blocklist
+      call mpas_pool_get_subpool(block % structs, 'mesh', mesh)
+      call mpas_pool_get_subpool(block % structs, 'state', state)
+      call mpas_pool_get_dimension(state, 'index_pmc_num', index_pmc_num)
+      call mpas_pool_get_dimension(mesh, 'nCellsSolve', nCellsSolve)
+      call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
+      call mpas_pool_get_array(mesh, 'zz', zz)
+      call mpas_pool_get_array(state, 'scalars', scalars, 1)
+      call mpas_pool_get_array(state, 'rho_zz', rho_zz, 1)
+
+      do iCell = 1, nCellsSolve
+         do k = 1, nVertLevels
+            ! number mixing ratio = number concentration / density, density = rho_zz * zz
+            scalars(index_pmc_num,k,iCell) = real(aero_state_n_part(aero_states(k,iCell)), kind=RKIND) &
+                 * aero_states(k,iCell)%awa%weight(1,1)%magnitude / (rho_zz(k,iCell) * zz(k,iCell))
+         end do
+      end do
+
+      call mpas_pool_get_field(state, 'scalars', scalars_field, 1)
+      call mpas_dmpar_exch_halo_field(scalars_field)
+#endif
+
+   end subroutine atm_partmc_particles_to_scalar
 
 
    !> Move particles between cells using the captured transport fluxes of pmc_num.
@@ -414,6 +482,13 @@ contains
       integer :: g_n_part_total, g_n_part_min, g_n_part_max, g_n_moved, g_n_cells
       real (kind=RKIND) :: g_err2, g_norm2, g_tot_part, g_tot_euler
       integer :: i_nbr, n_bytes, dest_global, comm
+      type (mpas_pool_type), pointer :: state
+      real (kind=RKIND), dimension(:,:,:), pointer :: scalars_new
+      real (kind=RKIND), dimension(:,:), pointer :: rho_zz_new
+      integer, pointer :: index_ref
+      real (kind=RKIND) :: p_sum_max, g_p_sum_max, step2, g_step2, c_ref
+      real (kind=RKIND) :: p_sum, lost, g_lost
+      integer :: n_over, g_n_over
       integer, dimension(:), pointer :: indexToCellID
       type(aero_particle_t) :: particle
 
@@ -437,8 +512,20 @@ contains
       call mpas_pool_get_array(diag, 'pmc_content_old', c_old)
       call mpas_pool_get_array(diag, 'pmc_content_new', c_new)
       call mpas_pool_get_array(mesh, 'indexToCellID', indexToCellID)
+      call mpas_pool_get_subpool(block % structs, 'state', state)
+      call mpas_pool_get_array(state, 'scalars', scalars_new, 2)
+      call mpas_pool_get_array(state, 'rho_zz', rho_zz_new, 2)
+      if (pmc_coupled) then
+         call mpas_pool_get_dimension(state, 'index_pmc_ref', index_ref)
+      else
+         call mpas_pool_get_dimension(state, 'index_pmc_num', index_ref)
+      end if
 
       n_moved = 0
+      p_sum_max = 0.0_RKIND
+      step2 = 0.0_RKIND
+      n_over = 0
+      lost = 0.0_RKIND
       do iCell = 1, nCellsSolve
          do k = 1, nVertLevels
             if (c_old(k,iCell) <= 0.0_RKIND) cycle
@@ -463,6 +550,18 @@ contains
                dest_cell(n_face) = iCell
                dest_k(n_face) = k - 1
                prob(n_face) = max(0.0_RKIND, -rdzw(k)*flux_v(k,iCell)) / c_old(k,iCell)
+            end if
+
+            ! The limiter bounds the net update, not the gross outflow, so in a noisy field a cell
+            ! with much less content than its neighbours can have outflow exceeding its content.
+            ! Scale the probabilities to sum to one (as WRF-PartMC does) and record the shortfall.
+            p_sum = sum(prob(1:n_face))
+            p_sum_max = max(p_sum_max, p_sum)
+            if (p_sum > 1.0_RKIND) then
+               n_over = n_over + 1
+               lost = lost + (p_sum - 1.0_RKIND) * c_old(k,iCell) * zz(k,iCell) &
+                             * cell_volume(areaCell(iCell), rdzw(k), zz(k,iCell))
+               prob(1:n_face) = prob(1:n_face) / p_sum
             end if
 
             ! multinomial sample of destinations by sequential binomials
@@ -552,10 +651,13 @@ contains
             vol = cell_volume(areaCell(iCell), rdzw(k), zz(k,iCell))
             ! particle content in the same units as c_new (number conc / zz)
             c_part = real(i, kind=RKIND) * aero_states(k,iCell)%awa%weight(1,1)%magnitude / zz(k,iCell)
-            err2 = err2 + (c_part - c_new(k,iCell))**2 * vol
-            norm2 = norm2 + c_new(k,iCell)**2 * vol
+            ! Eulerian reference content, and the one-step expected content c_new
+            c_ref = rho_zz_new(k,iCell) * scalars_new(index_ref,k,iCell)
+            err2 = err2 + (c_part - c_ref)**2 * vol
+            norm2 = norm2 + c_ref**2 * vol
+            step2 = step2 + (c_part - c_new(k,iCell))**2 * vol
             tot_part = tot_part + c_part * zz(k,iCell) * vol
-            tot_euler = tot_euler + c_new(k,iCell) * zz(k,iCell) * vol
+            tot_euler = tot_euler + c_ref * zz(k,iCell) * vol
          end do
       end do
 
@@ -575,6 +677,14 @@ contains
                                         real(g_n_moved, kind=RKIND)/real(max(1,g_n_part_total), kind=RKIND)/))
          call mpas_log_write('PartMC particles step $i: n_part per cell mean/min/max = $i $i $i', &
                              intArgs=(/itimestep, g_n_part_total/g_n_cells, g_n_part_min, g_n_part_max/))
+         call mpas_dmpar_sum_real(domain % dminfo, step2, g_step2)
+         call mpas_dmpar_max_real(domain % dminfo, p_sum_max, g_p_sum_max)
+         call mpas_log_write('PartMC particles step $i: one-step L2 rel noise = $r, max outflow prob sum = $r', &
+                             intArgs=(/itimestep/), realArgs=(/sqrt(g_step2/g_norm2), g_p_sum_max/))
+         call mpas_dmpar_sum_int(domain % dminfo, n_over, g_n_over)
+         call mpas_dmpar_sum_real(domain % dminfo, lost, g_lost)
+         call mpas_log_write('PartMC particles step $i: cells with outflow > content = $i of $i, unmoved number frac = $r', &
+                             intArgs=(/itimestep, g_n_over, g_n_cells/), realArgs=(/g_lost/g_tot_euler/))
       end if
 
    contains

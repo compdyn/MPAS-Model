@@ -28,6 +28,7 @@ module atm_core
       use mpas_kind_types
       use mpas_stream_manager
       use mpas_atm_dimensions, only : mpas_atm_set_dims
+      use mpas_atm_partmc, only : atm_partmc_init, atm_partmc_particles_init
       use mpas_atm_diagnostics_manager, only : mpas_atm_diag_setup
       use mpas_atm_threading, only : mpas_atm_threading_init
       use atm_time_integration, only : mpas_atm_dynamics_init, &
@@ -285,6 +286,9 @@ module atm_core
       ! Prepare the dynamics for integration
       !
       call mpas_atm_dynamics_init(domain)
+
+      call atm_partmc_init(domain)
+      call atm_partmc_particles_init(domain)
 
       !
       ! Initialize the chemistry package
@@ -1004,6 +1008,7 @@ module atm_core
 #ifdef DO_CHEMISTRY
       use mpas_atm_chemistry, only: chemistry_step
 #endif
+      use mpas_atm_partmc, only: atm_partmc_check, atm_partmc_particles_transport
       use mpas_atm_halos, only: exchange_halo_group
 
       implicit none
@@ -1042,6 +1047,9 @@ module atm_core
 #endif
 
       call atm_timestep(domain, dt, currTime, itimestep, exchange_halo_group)
+
+      call atm_partmc_check(domain, itimestep)
+      call atm_partmc_particles_transport(domain, itimestep)
 
    end subroutine atm_do_timestep
    

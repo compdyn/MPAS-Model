@@ -799,6 +799,12 @@ endif
 	LIBS += -L$(PNETCDF)/$(PNETCDFLIBLOC) -lpnetcdf
 endif
 
+ifneq "$(PARTMC)" ""
+	FCINCLUDES += -I$(PARTMC)
+	LIBS += -L$(PARTMC) -lpartmc -L$(shell nf-config --prefix)/lib -lnetcdff -L$(NETCDF)/lib -lnetcdf
+	override CPPFLAGS += -DMPAS_PARTMC
+endif
+
 ifneq "$(LAPACK)" ""
         LIBS += -L$(LAPACK)
         LIBS += -llapack

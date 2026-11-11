@@ -5006,6 +5006,11 @@ module atm_time_integration
       type (field3DReal), pointer :: scale
       real (kind=RKIND), dimension(:,:,:), pointer :: scale_arr
 
+      ! PartMC flux capture
+      integer, pointer :: index_pmc_num
+      integer :: pmc_idx
+      real (kind=RKIND), dimension(:,:), pointer :: pmc_flux_h, pmc_flux_v, pmc_content_old, pmc_content_new
+
 
       call mpas_pool_get_config(configs, 'config_coef_3rd_order', coef_3rd_order)
 
@@ -5013,6 +5018,17 @@ module atm_time_integration
       call mpas_pool_get_dimension(mesh, 'nEdges', nEdges)
       call mpas_pool_get_dimension(mesh, 'nCellsSolve', nCellsSolve)
       call mpas_pool_get_dimension(state, 'num_'//trim(field_name), num_scalars)
+
+      pmc_idx = -1
+      nullify(index_pmc_num)
+      if (trim(field_name) == 'scalars') then
+         call mpas_pool_get_dimension(state, 'index_pmc_num', index_pmc_num)
+         if (associated(index_pmc_num)) pmc_idx = index_pmc_num
+      end if
+      call mpas_pool_get_array(diag, 'pmc_flux_h', pmc_flux_h)
+      call mpas_pool_get_array(diag, 'pmc_flux_v', pmc_flux_v)
+      call mpas_pool_get_array(diag, 'pmc_content_old', pmc_content_old)
+      call mpas_pool_get_array(diag, 'pmc_content_new', pmc_content_new)
 
       call mpas_pool_get_array(diag, 'ruAvg', uhAvg)
       call mpas_pool_get_array(diag, 'wwAvg', wwAvg)
@@ -5055,7 +5071,8 @@ module atm_time_integration
                                    advCellsForEdge, adv_coefs, adv_coefs_3rd, scalar_old, scalar_new, s_max, s_min, &
                                    wdtn, scale_arr, flux_arr, flux_upwind_tmp, flux_tmp, &
                                    bdyMaskCell, bdyMaskEdge, config_gpu_aware_mpi, &
-                                   exchange_halo_group, advance_density, rho_zz_int)
+                                   exchange_halo_group, advance_density, rho_zz_int, &
+                                   pmc_idx, pmc_flux_h, pmc_flux_v, pmc_content_old, pmc_content_new)
 
       call mpas_deallocate_scratch_field(scale)
 
@@ -5103,7 +5120,8 @@ module atm_time_integration
                                    advCellsForEdge, adv_coefs, adv_coefs_3rd, scalar_old, scalar_new, s_max, s_min, &
                                    wdtn, scale_arr, flux_arr, flux_upwind_tmp, flux_tmp, &
                                    bdyMaskCell, bdyMaskEdge, config_gpu_aware_mpi, &
-                                   exchange_halo_group, advance_density, rho_zz_int)
+                                   exchange_halo_group, advance_density, rho_zz_int, &
+                                   pmc_idx, pmc_flux_h, pmc_flux_v, pmc_content_old, pmc_content_new)
 
       use mpas_atm_dimensions, only : nVertLevels
 
@@ -5122,6 +5140,10 @@ module atm_time_integration
       procedure (halo_exchange_routine) :: exchange_halo_group
       logical, intent(in), optional :: advance_density
       real (kind=RKIND), dimension(:,:), intent(inout), optional :: rho_zz_int
+
+      ! PartMC flux capture: index of the number scalar (or -1) and output arrays
+      integer, intent(in) :: pmc_idx
+      real (kind=RKIND), dimension(:,:), pointer :: pmc_flux_h, pmc_flux_v, pmc_content_old, pmc_content_new
 
       integer :: ii,jj
       integer, dimension(10) :: ica
@@ -5736,6 +5758,44 @@ module atm_time_integration
          end do
 
          !$acc end parallel
+
+         !
+         ! PartMC: save the total (upwind + limited correction) fluxes that produced this update,
+         ! with the factor of dt included, plus the coupled content (rho_zz*scalar) before and after.
+         !   horizontal: content change in cell = -edgesOnCell_sign * pmc_flux_h * invAreaCell
+         !   vertical:   content change in cell = -rdnw(k) * (pmc_flux_v(k+1) - pmc_flux_v(k))
+         !
+         if (iScalar == pmc_idx) then
+            do iEdge=edgeStart,edgeEnd
+               cell1 = cellsOnEdge(1,iEdge)
+               cell2 = cellsOnEdge(2,iEdge)
+               if (cell1 <= nCellsSolve .or. cell2 <= nCellsSolve) then
+                  do k=1,nVertLevels
+                     pmc_flux_h(k,iEdge) = flux_upwind_tmp(k,iEdge) + flux_arr(k,iEdge)
+                  end do
+               else
+                  do k=1,nVertLevels
+                     pmc_flux_h(k,iEdge) = 0.0_RKIND
+                  end do
+               end if
+            end do
+            do iCell=cellSolveStart,cellSolveEnd
+               pmc_flux_v(1,iCell) = 0.0_RKIND
+               pmc_flux_v(nVertLevels+1,iCell) = 0.0_RKIND
+               do k=2,nVertLevels
+                  pmc_flux_v(k,iCell) = wdtn(k,iCell) + dt*(max(0.0_RKIND,wwAvg(k,iCell))*scalar_old(k-1,iCell) &
+                                                           + min(0.0_RKIND,wwAvg(k,iCell))*scalar_old(k,iCell))
+               end do
+               do k=1,nVertLevels
+                  pmc_content_old(k,iCell) = scalar_old(k,iCell)*rho_zz_old(k,iCell)
+                  if (local_advance_density) then
+                     pmc_content_new(k,iCell) = scalar_new(k,iCell)*rho_zz_int(k,iCell)
+                  else
+                     pmc_content_new(k,iCell) = scalar_new(k,iCell)*rho_zz_new(k,iCell)
+                  end if
+               end do
+            end do
+         end if
 
 #ifdef DEBUG_TRANSPORT
          !$acc update self(scalar_new)

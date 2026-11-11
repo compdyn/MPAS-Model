@@ -1702,6 +1702,9 @@
                         <var name="qv" array_group="moist" units="kg kg^{-1}"
                              description="Water vapor mixing ratio"/>
 
+                        <var name="pmc_num" array_group="pmc" units="kg^{-1}"
+                             description="PartMC particle number mixing ratio"/>
+
                         <var name="qc" array_group="moist" units="kg kg^{-1}"
                              description="Cloud water mixing ratio"
                              packages="bl_mynn_in;bl_ysu_in;cu_ntiedtke_in;mp_kessler_in;mp_thompson_in;mp_thompson_aers_in;mp_wsm6_in"/>
@@ -1941,6 +1944,18 @@
                 <var name="wwAvg" type="real" dimensions="nVertLevelsP1 nCells Time" units="kg m^{-2} s^{-1}"
                      description="time-averaged rho*omega/zz used in scalar transport"/>
 
+                <var name="pmc_flux_h" type="real" dimensions="nVertLevels nEdges Time" units="m^{-1}"
+                     description="PartMC: time-integrated horizontal number flux through each edge from monotonic scalar transport"/>
+
+                <var name="pmc_flux_v" type="real" dimensions="nVertLevelsP1 nCells Time" units="m^{-3}"
+                     description="PartMC: time-integrated vertical number flux through each cell top/bottom face from monotonic scalar transport"/>
+
+                <var name="pmc_content_old" type="real" dimensions="nVertLevels nCells Time" units="m^{-3}"
+                     description="PartMC: rho_zz times number mixing ratio before transport"/>
+
+                <var name="pmc_content_new" type="real" dimensions="nVertLevels nCells Time" units="m^{-3}"
+                     description="PartMC: rho_zz times number mixing ratio after transport"/>
+
                 <var name="ruAvg_split" type="real" dimensions="nVertLevels nEdges Time" units="kg m^{-2} s^{-1}"
                      description="time-averaged rho*u/zz used in scalar transport"/>
 
@@ -2068,6 +2083,9 @@
                 <var_array name="scalars_tend" type="real" dimensions="nVertLevels nCells Time">
                         <var name="tend_qv" name_in_code="qv" array_group="moist" units="kg m^{-3} s^{-1}"
                              description="Tendency of water vapor mass per unit volume divided by d(zeta)/dz"/>
+
+                        <var name="tend_pmc_num" name_in_code="pmc_num" array_group="pmc" units="m^{-3} s^{-1}"
+                             description="Tendency of PartMC particle number per unit volume divided by d(zeta)/dz"/>
 
                         <var name="tend_qc" name_in_code="qc" array_group="moist" units="kg m^{-3} s^{-1}"
                              description="Tendency of cloud water mass per unit volume divided by d(zeta)/dz"

@@ -10,6 +10,9 @@
 !                     lagrangian: particles carry positions and follow the winds
 !   PMC_LAGR_CONTROL  lagrangian mode: 1 = keep the particle count per cell near PMC_N_PART by
 !                     splitting and thinning particles with power-of-two weights (default 0)
+!   PMC_KZ_MAX        peak of a prescribed vertical diffusivity profile (m^2/s, default 0 = no
+!                     vertical mixing); applied to the Eulerian scalars and, in lagrangian
+!                     mode, to the particles. PMC_KZ_TOP is the height where it reaches zero.
 !   PMC_LAGR_SUBSTEPS lagrangian mode: trajectory sub-steps per model step (default 1)
 !   PMC_TEST_WIND     lagrangian mode: replace the model winds by an analytic flow with a
 !                     12-day period: solid (tilted solid-body rotation) or deform
@@ -136,7 +139,7 @@ module mpas_atm_partmc
    private
 
    public :: atm_partmc_init, atm_partmc_check, atm_partmc_particles_init, atm_partmc_particles_transport, &
-             atm_partmc_particles_to_scalar, atm_partmc_output
+             atm_partmc_particles_to_scalar, atm_partmc_output, atm_partmc_vertical_mixing
 
    integer, parameter :: MODE_FLUX = 1, MODE_LAGR = 2
    integer, parameter :: MAX_CLASS = 2
@@ -173,6 +176,9 @@ module mpas_atm_partmc
    logical :: lagr_control = .false.
    !> Particles removed by thinning and added by splitting since the start of the run.
    integer :: n_thinned = 0, n_split = 0
+   !> Test vertical mixing: peak diffusivity (m^2/s, 0 = off) and the height where it reaches zero (m).
+   real (kind=RKIND) :: pmc_kz_max = 0.0_RKIND, pmc_kz_top = 12000.0_RKIND
+   integer :: n_mixed = 0
    !> Particle output: interval in steps (0 = off), fraction of cells written, directory.
    integer :: pmc_out_interval = 0
    real (kind=RKIND) :: pmc_out_frac = 1.0_RKIND
@@ -250,6 +256,10 @@ contains
       end if
       call get_environment_variable('PMC_LAGR_CONTROL', envval, status=stat)
       if (stat == 0) lagr_control = (trim(envval) /= '0')
+      call get_environment_variable('PMC_KZ_MAX', envval, status=stat)
+      if (stat == 0) read(envval, *) pmc_kz_max
+      call get_environment_variable('PMC_KZ_TOP', envval, status=stat)
+      if (stat == 0) read(envval, *) pmc_kz_top
       call get_environment_variable('PMC_LAGR_SUBSTEPS', envval, status=stat)
       if (stat == 0) read(envval, *) lagr_substeps
       call get_environment_variable('PMC_N_CLASS', envval, status=stat)
@@ -1082,7 +1092,7 @@ contains
                   call pos_append(pos(k,iCell), pos_in(k,iCell) % x(:,i))
                end do
                pos_in(k,iCell) % n = 0
-               if (lagr_control) call lagr_rebalance()
+               if (lagr_control) call lagr_rebalance(k, iCell, nCells, nEdgesOnCell, cellsOnCell)
             else
                call aero_state_add_particles(aero_states(k,iCell), aero_incoming(k,iCell), aero_data)
             end if
@@ -1300,57 +1310,6 @@ contains
       end if
 
    contains
-
-      !> Lagrangian population control for cell (k,iCell). Too many particles: each particle of
-      !> the lightest group present is either removed or moved up one group (twice the weight),
-      !> with equal probability, which keeps the expected number and mass. Too few: each particle
-      !> of the heaviest group present becomes two of the next group down (half the weight), which
-      !> is exact; the new one is placed at a random point of the cell.
-      subroutine lagr_rebalance()
-         integer :: n, j, g, g_sel
-         real (kind=RKIND) :: xp(NPOS)
-         type(aero_particle_t) :: twin
-
-         n = pos(k,iCell) % n
-         do while (n > 2*pmc_n_part)
-            g_sel = LAGR_GROUPS + 1
-            do j = 1, n
-               g_sel = min(g_sel, aero_states(k,iCell)%apa%particle(j)%weight_group)
-            end do
-            if (g_sel >= LAGR_GROUPS) exit
-            do j = n, 1, -1
-               if (aero_states(k,iCell)%apa%particle(j)%weight_group /= g_sel) cycle
-               if (pmc_random() < 0.5d0) then
-                  call aero_state_remove_particle_no_info(aero_states(k,iCell), j)
-                  call pos_remove(pos(k,iCell), j)
-                  n_thinned = n_thinned + 1
-               else
-                  aero_states(k,iCell)%apa%particle(j)%weight_group = g_sel + 1
-               end if
-            end do
-            n = pos(k,iCell) % n
-         end do
-         do while (n > 0 .and. n < pmc_n_part/2)
-            g_sel = 0
-            do j = 1, n
-               g_sel = max(g_sel, aero_states(k,iCell)%apa%particle(j)%weight_group)
-            end do
-            if (g_sel <= 1) exit
-            do j = 1, n
-               if (aero_states(k,iCell)%apa%particle(j)%weight_group /= g_sel) cycle
-               aero_states(k,iCell)%apa%particle(j)%weight_group = g_sel - 1
-               twin = aero_states(k,iCell)%apa%particle(j)
-               call aero_particle_new_id(twin)
-               call aero_state_add_particle(aero_states(k,iCell), twin, aero_data)
-               call random_in_cell(iCell, k, nCells, nEdgesOnCell, cellsOnCell, xp(1:4))
-               xp(5:7) = pos(k,iCell) % x(5:7,j)
-               call pos_append(pos(k,iCell), xp)
-               n_split = n_split + 1
-            end do
-            n = pos(k,iCell) % n
-         end do
-      end subroutine lagr_rebalance
-
 
       !> Number of particles in each weight class.
       subroutine count_classes(aero_state, n)
@@ -1758,6 +1717,226 @@ contains
 #endif
 
    end subroutine atm_partmc_particles_transport
+
+
+#ifdef MPAS_PARTMC
+   !> Lagrangian population control for cell (k,iCell). Too many particles: each particle of
+   !> the lightest group present is either removed or moved up one group (twice the weight),
+   !> with equal probability, which keeps the expected number and mass. Too few: each particle
+   !> of the heaviest group present becomes two of the next group down (half the weight), which
+   !> is exact; the new one is placed at a random point of the cell.
+   subroutine lagr_rebalance(k, iCell, nCells, nEdgesOnCell, cellsOnCell)
+      integer, intent(in) :: k, iCell, nCells
+      integer, dimension(:), intent(in) :: nEdgesOnCell
+      integer, dimension(:,:), intent(in) :: cellsOnCell
+      integer :: n, j, g, g_sel
+      real (kind=RKIND) :: xp(NPOS)
+      type(aero_particle_t) :: twin
+
+      n = pos(k,iCell) % n
+      do while (n > 2*pmc_n_part)
+         g_sel = LAGR_GROUPS + 1
+         do j = 1, n
+            g_sel = min(g_sel, aero_states(k,iCell)%apa%particle(j)%weight_group)
+         end do
+         if (g_sel >= LAGR_GROUPS) exit
+         do j = n, 1, -1
+            if (aero_states(k,iCell)%apa%particle(j)%weight_group /= g_sel) cycle
+            if (pmc_random() < 0.5d0) then
+               call aero_state_remove_particle_no_info(aero_states(k,iCell), j)
+               call pos_remove(pos(k,iCell), j)
+               n_thinned = n_thinned + 1
+            else
+               aero_states(k,iCell)%apa%particle(j)%weight_group = g_sel + 1
+            end if
+         end do
+         n = pos(k,iCell) % n
+      end do
+      do while (n > 0 .and. n < pmc_n_part/2)
+         g_sel = 0
+         do j = 1, n
+            g_sel = max(g_sel, aero_states(k,iCell)%apa%particle(j)%weight_group)
+         end do
+         if (g_sel <= 1) exit
+         do j = 1, n
+            if (aero_states(k,iCell)%apa%particle(j)%weight_group /= g_sel) cycle
+            aero_states(k,iCell)%apa%particle(j)%weight_group = g_sel - 1
+            twin = aero_states(k,iCell)%apa%particle(j)
+            call aero_particle_new_id(twin)
+            call aero_state_add_particle(aero_states(k,iCell), twin, aero_data)
+            call random_in_cell(iCell, k, nCells, nEdgesOnCell, cellsOnCell, xp(1:4))
+            xp(5:7) = pos(k,iCell) % x(5:7,j)
+            call pos_append(pos(k,iCell), xp)
+            n_split = n_split + 1
+         end do
+         n = pos(k,iCell) % n
+      end do
+   end subroutine lagr_rebalance
+
+
+#endif
+
+
+   !> Vertical sub-grid mixing with a prescribed diffusivity profile (a test stand-in for the
+   !> host's boundary-layer and convective mixing).
+   !>
+   !> The implicit diffusion step A q_new = q_old for the mixing ratio in a column is applied to
+   !> the Eulerian number scalars. For the particles the same step is written for layer contents,
+   !> m_new = T m_old with T = D A^-1 D^-1 and D = air mass per area of each layer. T is a
+   !> transition matrix (non-negative, columns sum to one): a particle in layer j moves to layer
+   !> i with probability T(i,j), to a random height in that layer. A uniform mixing ratio is
+   !> then preserved in expectation for any time step.
+   subroutine atm_partmc_vertical_mixing(domain, itimestep)
+
+      type (domain_type), intent(inout) :: domain
+      integer, intent(in) :: itimestep
+
+#ifdef MPAS_PARTMC
+      type (mpas_pool_type), pointer :: mesh, state
+      type (field3DReal), pointer :: scalars_field
+      real (kind=RKIND), dimension(:,:,:), pointer :: scalars
+      real (kind=RKIND), dimension(:,:), pointer :: rho_zz, zz, zgrid
+      real (kind=RKIND), dimension(:), pointer :: rdzw
+      real (kind=RKIND), pointer :: config_dt
+      integer, dimension(:,:), pointer :: cellsOnCell
+      integer, dimension(:), pointer :: nEdgesOnCell
+      integer, pointer :: nCells, nCellsSolve, nVertLevels, index_pmc_num, index_pmc_num2, index_ref, index_src2
+      integer :: iCell, k, kk, j, i_s, nz, idx(4)
+      real (kind=RKIND), allocatable :: d_mass(:), e(:), lower(:), diag_a(:), upper(:), rhs(:), sol(:), tmat(:,:)
+      real (kind=RKIND) :: s_h, kz, rho_f, dz_c, u, cum, xp(NPOS)
+      type(aero_particle_t) :: particle
+
+      if (pmc_kz_max <= 0.0_RKIND) return
+
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'state', state)
+      call mpas_pool_get_config(domain % blocklist % configs, 'config_dt', config_dt)
+      call mpas_pool_get_dimension(mesh, 'nCells', nCells)
+      call mpas_pool_get_dimension(mesh, 'nCellsSolve', nCellsSolve)
+      call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
+      call mpas_pool_get_dimension(state, 'index_pmc_num', index_pmc_num)
+      call mpas_pool_get_dimension(state, 'index_pmc_num2', index_pmc_num2)
+      call mpas_pool_get_dimension(state, 'index_pmc_ref', index_ref)
+      call mpas_pool_get_dimension(state, 'index_pmc_ref_src2', index_src2)
+      call mpas_pool_get_array(mesh, 'rdzw', rdzw)
+      call mpas_pool_get_array(mesh, 'zz', zz)
+      call mpas_pool_get_array(mesh, 'zgrid', zgrid)
+      call mpas_pool_get_array(mesh, 'nEdgesOnCell', nEdgesOnCell)
+      call mpas_pool_get_array(mesh, 'cellsOnCell', cellsOnCell)
+      call mpas_pool_get_array(state, 'scalars', scalars, 2)
+      call mpas_pool_get_array(state, 'rho_zz', rho_zz, 2)
+      idx = (/ index_pmc_num, index_pmc_num2, index_ref, index_src2 /)
+      nz = nVertLevels
+      allocate(d_mass(nz), e(nz+1), lower(nz), diag_a(nz), upper(nz), rhs(nz), sol(nz), tmat(nz,nz))
+
+      do iCell = 1, nCellsSolve
+         ! air mass per area of each layer, and the exchange coefficient at each interior face
+         e = 0.0_RKIND
+         do k = 1, nz
+            d_mass(k) = rho_zz(k,iCell) / rdzw(k)
+         end do
+         do k = 2, nz
+            s_h = zgrid(k,iCell) / pmc_kz_top
+            kz = 0.0_RKIND
+            if (s_h < 1.0_RKIND) kz = pmc_kz_max * 6.75_RKIND * s_h * (1.0_RKIND - s_h)**2
+            rho_f = 0.5_RKIND*(rho_zz(k,iCell)*zz(k,iCell) + rho_zz(k-1,iCell)*zz(k-1,iCell))
+            dz_c = 0.5_RKIND*(zgrid(k+1,iCell) - zgrid(k-1,iCell))
+            e(k) = config_dt * rho_f * kz / dz_c
+         end do
+         do k = 1, nz
+            lower(k) = -e(k) / d_mass(k)
+            upper(k) = -e(k+1) / d_mass(k)
+            diag_a(k) = 1.0_RKIND - lower(k) - upper(k)
+         end do
+
+         ! Eulerian scalars
+         do i_s = 1, 4
+            rhs = scalars(idx(i_s),:,iCell)
+            call tridiag_solve(nz, lower, diag_a, upper, rhs, sol)
+            scalars(idx(i_s),:,iCell) = sol
+         end do
+
+         if (pmc_n_part <= 0 .or. pmc_mode /= MODE_LAGR) cycle
+
+         ! transition matrix, one column per source layer
+         do j = 1, nz
+            rhs = 0.0_RKIND
+            rhs(j) = 1.0_RKIND
+            call tridiag_solve(nz, lower, diag_a, upper, rhs, sol)
+            tmat(:,j) = max(0.0_RKIND, d_mass * sol / d_mass(j))
+            tmat(:,j) = tmat(:,j) / sum(tmat(:,j))
+         end do
+
+         do k = 1, nz
+            if (tmat(k,k) >= 1.0_RKIND) cycle
+            do j = pos(k,iCell) % n, 1, -1
+               u = pmc_random()
+               ! try the particle's own layer first, since that is the usual outcome
+               if (u < tmat(k,k)) cycle
+               cum = tmat(k,k)
+               do kk = 1, nz
+                  if (kk == k) cycle
+                  cum = cum + tmat(kk,k)
+                  if (u < cum) exit
+               end do
+               kk = min(kk, nz)
+               if (kk == k) cycle
+               particle = aero_states(k,iCell)%apa%particle(j)
+               xp = pos(k,iCell) % x(:,j)
+               xp(4) = zf(kk) + pmc_random()*(zf(kk+1) - zf(kk))
+               call aero_state_remove_particle_no_info(aero_states(k,iCell), j)
+               call pos_remove(pos(k,iCell), j)
+               call aero_state_add_particle(aero_incoming(kk,iCell), particle, aero_data)
+               call pos_append(pos_in(kk,iCell), xp)
+               n_mixed = n_mixed + 1
+            end do
+         end do
+         do k = 1, nz
+            do j = 1, pos_in(k,iCell) % n
+               call aero_state_add_particle(aero_states(k,iCell), aero_incoming(k,iCell)%apa%particle(j), aero_data)
+               call pos_append(pos(k,iCell), pos_in(k,iCell) % x(:,j))
+            end do
+            if (pos_in(k,iCell) % n > 0) then
+               pos_in(k,iCell) % n = 0
+               call aero_state_zero(aero_incoming(k,iCell))
+            end if
+            if (lagr_control) call lagr_rebalance(k, iCell, nCells, nEdgesOnCell, cellsOnCell)
+         end do
+      end do
+
+      call mpas_pool_get_field(state, 'scalars', scalars_field, 2)
+      call mpas_dmpar_exch_halo_field(scalars_field)
+
+      if (mod(itimestep, 12) == 0 .and. pmc_mode == MODE_LAGR .and. pmc_n_part > 0) then
+         call mpas_dmpar_sum_int(domain % dminfo, n_mixed, j)
+         call mpas_log_write('PartMC mixing step $i: particle layer changes by vertical mixing so far = $i', &
+                             intArgs=(/itimestep, j/))
+      end if
+#endif
+
+   end subroutine atm_partmc_vertical_mixing
+
+
+   !> Solve a tridiagonal system (Thomas algorithm).
+   pure subroutine tridiag_solve(n, lower, diag_a, upper, rhs, sol)
+      integer, intent(in) :: n
+      real (kind=RKIND), intent(in) :: lower(n), diag_a(n), upper(n), rhs(n)
+      real (kind=RKIND), intent(out) :: sol(n)
+      real (kind=RKIND) :: cp(n), dp_(n), denom
+      integer :: i
+
+      cp(1) = upper(1) / diag_a(1)
+      dp_(1) = rhs(1) / diag_a(1)
+      do i = 2, n
+         denom = diag_a(i) - lower(i)*cp(i-1)
+         cp(i) = upper(i) / denom
+         dp_(i) = (rhs(i) - lower(i)*dp_(i-1)) / denom
+      end do
+      sol(n) = dp_(n)
+      do i = n-1, 1, -1
+         sol(i) = dp_(i) - cp(i)*sol(i+1)
+      end do
+   end subroutine tridiag_solve
 
 
 #ifdef MPAS_PARTMC

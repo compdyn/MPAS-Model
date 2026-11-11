@@ -8,6 +8,8 @@
 !   PMC_N_PART        target computational particles per cell (0 = no particles)
 !   PMC_TRANSPORT     flux (default): stochastic transfer with the captured fluxes;
 !                     lagrangian: particles carry positions and follow the winds
+!   PMC_LAGR_CONTROL  lagrangian mode: 1 = keep the particle count per cell near PMC_N_PART by
+!                     splitting and thinning particles with power-of-two weights (default 0)
 !   PMC_LAGR_SUBSTEPS lagrangian mode: trajectory sub-steps per model step (default 1)
 !   PMC_TEST_WIND     lagrangian mode: replace the model winds by an analytic flow with a
 !                     12-day period: solid (tilted solid-body rotation) or deform
@@ -164,6 +166,13 @@ module mpas_atm_partmc
    !> Lagrangian mode: winds used (model, or an analytic test flow) and sub-steps per model step.
    integer :: lagr_wind = WIND_MODEL
    integer :: lagr_substeps = 1
+   !> Lagrangian mode: a particle in weight group g represents lagr_w * 2**(g - LAGR_G0) real
+   !> particles. With population control, cells split heavy particles and thin light ones to
+   !> stay near the target count.
+   integer, parameter :: LAGR_GROUPS = 64, LAGR_G0 = 45
+   logical :: lagr_control = .false.
+   !> Particles removed by thinning and added by splitting since the start of the run.
+   integer :: n_thinned = 0, n_split = 0
    !> Particle output: interval in steps (0 = off), fraction of cells written, directory.
    integer :: pmc_out_interval = 0
    real (kind=RKIND) :: pmc_out_frac = 1.0_RKIND
@@ -206,10 +215,12 @@ module mpas_atm_partmc
    ! Lagrangian mode
    !> Particle positions, and positions of arrivals, (nVertLevels, nCellsSolve).
    type(pos_t), allocatable :: pos(:,:), pos_in(:,:)
-   !> Real particles represented by each computational particle (the same for all).
+   !> Real particles represented by a computational particle in weight group LAGR_G0.
    real (kind=RKIND) :: lagr_w = 0.0_RKIND
    !> Unit vectors of the cell centres (3, nCells), zeta of faces and of level centres.
    real (kind=RKIND), allocatable :: cxyz(:,:), zf(:), zc(:)
+   !> Radius (on the unit sphere) of a disc around each cell centre that covers the cell.
+   real (kind=RKIND), allocatable :: cell_rmax(:)
    real (kind=RKIND) :: radius = 1.0_RKIND
    !> Source-2 second moments at the first diagnostic step.
    real (kind=RKIND) :: m2_ref0 = 0.0_RKIND, m2_part0 = 0.0_RKIND
@@ -237,6 +248,8 @@ contains
          if (trim(envval) == 'solid') lagr_wind = WIND_SOLID
          if (trim(envval) == 'deform') lagr_wind = WIND_DEFORM
       end if
+      call get_environment_variable('PMC_LAGR_CONTROL', envval, status=stat)
+      if (stat == 0) lagr_control = (trim(envval) /= '0')
       call get_environment_variable('PMC_LAGR_SUBSTEPS', envval, status=stat)
       if (stat == 0) read(envval, *) lagr_substeps
       call get_environment_variable('PMC_N_CLASS', envval, status=stat)
@@ -553,6 +566,38 @@ contains
    end function find_cell
 
 
+#ifdef MPAS_PARTMC
+   !> Uniform random position (unit vector and zeta) in cell iCell, level k.
+   subroutine random_in_cell(iCell, k, nCells, nEdgesOnCell, cellsOnCell, x)
+      integer, intent(in) :: iCell, k, nCells
+      integer, dimension(:), intent(in) :: nEdgesOnCell
+      integer, dimension(:,:), intent(in) :: cellsOnCell
+      real (kind=RKIND), intent(out) :: x(4)
+      real (kind=RKIND) :: v(3), e1(3), e2(3), a, b
+
+      ! tangent-plane basis at the cell centre
+      v = (/ 0.0_RKIND, 0.0_RKIND, 1.0_RKIND /)
+      if (abs(cxyz(3,iCell)) > 0.9_RKIND) v = (/ 1.0_RKIND, 0.0_RKIND, 0.0_RKIND /)
+      e1 = v - dot_product(v, cxyz(:,iCell)) * cxyz(:,iCell)
+      e1 = e1 / norm2(e1)
+      e2(1) = cxyz(2,iCell)*e1(3) - cxyz(3,iCell)*e1(2)
+      e2(2) = cxyz(3,iCell)*e1(1) - cxyz(1,iCell)*e1(3)
+      e2(3) = cxyz(1,iCell)*e1(2) - cxyz(2,iCell)*e1(1)
+      do
+         do
+            a = 2.0_RKIND*pmc_random() - 1.0_RKIND
+            b = 2.0_RKIND*pmc_random() - 1.0_RKIND
+            if (a*a + b*b <= 1.0_RKIND) exit
+         end do
+         x(1:3) = cxyz(:,iCell) + cell_rmax(iCell)*(a*e1 + b*e2)
+         x(1:3) = x(1:3) / norm2(x(1:3))
+         if (find_cell(x(1:3), iCell, nCells, nEdgesOnCell, cellsOnCell) == iCell) exit
+      end do
+      x(4) = zf(k) + pmc_random()*(zf(k+1) - zf(k))
+   end subroutine random_in_cell
+#endif
+
+
    !> Level whose zeta range contains z.
    pure integer function find_level(z)
       real (kind=RKIND), intent(in) :: z
@@ -582,12 +627,12 @@ contains
       integer, dimension(:), pointer :: indexToCellID, nEdgesOnCell
       integer, dimension(:,:), pointer :: cellsOnCell, verticesOnCell
       integer, pointer :: index_ref, index_src2, nCells, nCellsSolve, nVertLevels
-      integer :: iCell, k, i, j, rank, n, n2, n_t, i_so4, i_nh4, i_oc, i_bc, i_src, g_n_cells
+      integer :: iCell, k, i, j, g, rank, n, n2, n_t, i_so4, i_nh4, i_oc, i_bc, i_src, g_n_cells
       type (field1DReal), pointer :: owner_field
       real (kind=RKIND), dimension(:), pointer :: owner
       type(spec_file_t) :: file
       real (kind=dp), allocatable :: vols(:)
-      real (kind=RKIND) :: conc_tot, conc1, conc2, vol, f2, total, g_total, r_max, x(NPOS), e1(3), e2(3), a, b, v(3)
+      real (kind=RKIND) :: conc_tot, conc1, conc2, vol, f2, total, g_total, x(NPOS), v(3)
       type(aero_particle_t) :: particle
 
       call read_settings()
@@ -692,6 +737,16 @@ contains
             zc(k) = 0.5_RKIND*(zf(k) + zf(k+1))
          end do
          allocate(pos(nVertLevels, nCellsSolve), pos_in(nVertLevels, nCellsSolve))
+         allocate(cell_rmax(nCells))
+         cell_rmax = 0.0_RKIND
+         do iCell = 1, nCellsSolve
+            do j = 1, nEdgesOnCell(iCell)
+               i = verticesOnCell(j,iCell)
+               v = (/ xVertex(i), yVertex(i), zVertex(i) /)
+               v = v / norm2(v)
+               cell_rmax(iCell) = max(cell_rmax(iCell), 1.05_RKIND * norm2(v - cxyz(:,iCell)))
+            end do
+         end do
 
          ! every computational particle represents the same number of real particles
          total = 0.0_RKIND
@@ -707,24 +762,6 @@ contains
       end if
 
       do iCell = 1, nCellsSolve
-         if (pmc_mode == MODE_LAGR) then
-            ! tangent-plane basis and radius of a disc that covers the cell
-            v = (/ 0.0_RKIND, 0.0_RKIND, 1.0_RKIND /)
-            if (abs(cxyz(3,iCell)) > 0.9_RKIND) v = (/ 1.0_RKIND, 0.0_RKIND, 0.0_RKIND /)
-            e1 = v - dot_product(v, cxyz(:,iCell)) * cxyz(:,iCell)
-            e1 = e1 / norm2(e1)
-            e2(1) = cxyz(2,iCell)*e1(3) - cxyz(3,iCell)*e1(2)
-            e2(2) = cxyz(3,iCell)*e1(1) - cxyz(1,iCell)*e1(3)
-            e2(3) = cxyz(1,iCell)*e1(2) - cxyz(2,iCell)*e1(1)
-            r_max = 0.0_RKIND
-            do j = 1, nEdgesOnCell(iCell)
-               i = verticesOnCell(j,iCell)
-               v = (/ xVertex(i), yVertex(i), zVertex(i) /)
-               v = v / norm2(v)
-               r_max = max(r_max, norm2(v - cxyz(:,iCell)))
-            end do
-            r_max = 1.05_RKIND * r_max
-         end if
          do k = 1, nVertLevels
             call aero_state_zero(aero_states(k,iCell))
             call aero_state_set_weight(aero_states(k,iCell), aero_data, AERO_STATE_WEIGHT_FLAT_SPECIFIED)
@@ -738,28 +775,29 @@ contains
             vol = cell_volume(areaCell(iCell), rdzw(k), zz(k,iCell))
 
             if (pmc_mode == MODE_LAGR) then
-               f2 = conc_tot * vol / lagr_w
+               ! one weight per group, a factor of two apart
+               call aero_weight_array_set_sizes(aero_states(k,iCell)%awa, LAGR_GROUPS, 1)
+               aero_states(k,iCell)%awa%weight%type = AERO_WEIGHT_TYPE_NONE
+               aero_states(k,iCell)%awa%weight%exponent = 0.0d0
+               do g = 1, LAGR_GROUPS
+                  aero_states(k,iCell)%awa%weight(g,1)%magnitude = lagr_w * 2.0d0**(g - LAGR_G0) / vol
+               end do
+               g = LAGR_G0
+               if (lagr_control) then
+                  ! the group that puts the count nearest the target in this cell
+                  g = LAGR_G0 + nint(log(conc_tot * vol / (real(pmc_n_part, kind=RKIND) * lagr_w)) / log(2.0_RKIND))
+                  g = max(1, min(LAGR_GROUPS, g))
+               end if
+               f2 = conc_tot * vol / (lagr_w * 2.0_RKIND**(g - LAGR_G0))
                n = int(f2)
                if (pmc_random() < f2 - real(n, kind=RKIND)) n = n + 1
-               aero_states(k,iCell)%awa%weight(1,1)%magnitude = lagr_w / vol
                do i = 1, n
                   if (pmc_random() < conc2/conc_tot) then
-                     call make_particle(2, 1)
+                     call make_particle(2, 1, g)
                   else
-                     call make_particle(1, 1)
+                     call make_particle(1, 1, g)
                   end if
-                  ! uniform position in the cell
-                  do
-                     do
-                        a = 2.0_RKIND*pmc_random() - 1.0_RKIND
-                        b = 2.0_RKIND*pmc_random() - 1.0_RKIND
-                        if (a*a + b*b <= 1.0_RKIND) exit
-                     end do
-                     x(1:3) = cxyz(:,iCell) + r_max*(a*e1 + b*e2)
-                     x(1:3) = x(1:3) / norm2(x(1:3))
-                     if (find_cell(x(1:3), iCell, nCells, nEdgesOnCell, cellsOnCell) == iCell) exit
-                  end do
-                  x(4) = zf(k) + pmc_random()*(zf(k+1) - zf(k))
+                  call random_in_cell(iCell, k, nCells, nEdgesOnCell, cellsOnCell, x(1:4))
                   x(5:7) = x(1:3)
                   call pos_append(pos(k,iCell), x)
                end do
@@ -772,9 +810,9 @@ contains
                if (pmc_random() < f2 - real(n2, kind=dp)) n2 = n2 + 1
                do i = 1, pmc_n_part
                   if (i <= n2) then
-                     call make_particle(2, 1)
+                     call make_particle(2, 1, 1)
                   else
-                     call make_particle(1, 1)
+                     call make_particle(1, 1, 1)
                   end if
                end do
                cnt(1,k,iCell) = pmc_n_part
@@ -783,13 +821,13 @@ contains
                n_t = pmc_n_part / n_class
                aero_states(k,iCell)%awa%weight(1,1)%magnitude = conc1 / real(n_t, kind=dp)
                do i = 1, n_t
-                  call make_particle(1, 1)
+                  call make_particle(1, 1, 1)
                end do
                cnt(1,k,iCell) = n_t
                if (conc2 > 1.0e-3_RKIND * conc1) then
                   aero_states(k,iCell)%awa%weight(1,2)%magnitude = conc2 / real(n_t, kind=dp)
                   do i = 1, n_t
-                     call make_particle(2, 2)
+                     call make_particle(2, 2, 1)
                   end do
                   cnt(2,k,iCell) = n_t
                else
@@ -820,8 +858,8 @@ contains
    contains
 
       !> Add a new particle from source i_source to cell (k,iCell) in weight class i_class.
-      subroutine make_particle(i_source, i_class)
-         integer, intent(in) :: i_source, i_class
+      subroutine make_particle(i_source, i_class, i_group)
+         integer, intent(in) :: i_source, i_class, i_group
          real (kind=dp) :: diam, vol_tot
 
          call aero_particle_zero(particle, aero_data)
@@ -843,7 +881,7 @@ contains
          call aero_particle_set_component(particle, i_source, 0.0d0)
          call aero_particle_set_vols(particle, vols)
          call aero_particle_new_id(particle)
-         call aero_particle_set_weight(particle, 1, i_class)
+         call aero_particle_set_weight(particle, i_group, i_class)
          call aero_state_add_particle(aero_states(k,iCell), particle, aero_data)
       end subroutine make_particle
 #endif
@@ -924,6 +962,7 @@ contains
       integer, pointer :: nCells, nCellsSolve, nEdges, nVertLevels, index_ref, index_src2
       integer :: iCell, k, i, c, i_part, i_nbr, n_bytes, dest_global, comm, i_spec, k_worst
       integer :: n_part_total, n_part_min, n_part_max, n_moved, n_over, n_copy_max, n_clamp, n_t, n_thin, g_n_thin
+      integer :: g_n_thinned, g_n_split
       integer :: g_n_part_total, g_n_part_min, g_n_part_max, g_n_moved, g_n_cells, g_n_over, g_n_copy_max, g_n_clamp
       integer :: counts(MAX_CLASS)
       real (kind=RKIND) :: w_src, vol, m, x(NPOS), xe(3), d
@@ -1043,6 +1082,7 @@ contains
                   call pos_append(pos(k,iCell), pos_in(k,iCell) % x(:,i))
                end do
                pos_in(k,iCell) % n = 0
+               if (lagr_control) call lagr_rebalance()
             else
                call aero_state_add_particles(aero_states(k,iCell), aero_incoming(k,iCell), aero_data)
             end if
@@ -1102,7 +1142,8 @@ contains
             v2_part = 0.0_RKIND
             do i_part = 1, i
                c = aero_states(k,iCell)%apa%particle(i_part)%weight_class
-               m = aero_states(k,iCell)%awa%weight(1,c)%magnitude / zz(k,iCell)
+               m = aero_states(k,iCell)%awa%weight(aero_states(k,iCell)%apa%particle(i_part)%weight_group,c)%magnitude &
+                   / zz(k,iCell)
                c_part = c_part + m
                v_part = v_part + m*m
                if (aero_states(k,iCell)%apa%particle(i_part)%component(1)%source_id == 2) then
@@ -1230,8 +1271,11 @@ contains
                              intArgs=(/itimestep/), realArgs=(/mass_dev/))
          if (pmc_mode == MODE_LAGR) then
             call mpas_dmpar_sum_int(domain % dminfo, n_clamp, g_n_clamp)
-            call mpas_log_write('PartMC lagrangian step $i: particles held at the top or bottom = $i', &
-                                intArgs=(/itimestep, g_n_clamp/))
+            call mpas_dmpar_sum_int(domain % dminfo, n_thinned, g_n_thinned)
+            call mpas_dmpar_sum_int(domain % dminfo, n_split, g_n_split)
+            call mpas_log_write('PartMC lagrangian step $i: particles held at the top or bottom = $i, ' &
+                                // 'removed by thinning so far = $i, added by splitting so far = $i', &
+                                intArgs=(/itimestep, g_n_clamp, g_n_thinned, g_n_split/))
          else
             call mpas_dmpar_max_real(domain % dminfo, p_sum_max, g_p_sum_max)
             call mpas_log_write('PartMC particles step $i: one-step L2 rel noise = $r, max outflow prob sum = $r', &
@@ -1256,6 +1300,57 @@ contains
       end if
 
    contains
+
+      !> Lagrangian population control for cell (k,iCell). Too many particles: each particle of
+      !> the lightest group present is either removed or moved up one group (twice the weight),
+      !> with equal probability, which keeps the expected number and mass. Too few: each particle
+      !> of the heaviest group present becomes two of the next group down (half the weight), which
+      !> is exact; the new one is placed at a random point of the cell.
+      subroutine lagr_rebalance()
+         integer :: n, j, g, g_sel
+         real (kind=RKIND) :: xp(NPOS)
+         type(aero_particle_t) :: twin
+
+         n = pos(k,iCell) % n
+         do while (n > 2*pmc_n_part)
+            g_sel = LAGR_GROUPS + 1
+            do j = 1, n
+               g_sel = min(g_sel, aero_states(k,iCell)%apa%particle(j)%weight_group)
+            end do
+            if (g_sel >= LAGR_GROUPS) exit
+            do j = n, 1, -1
+               if (aero_states(k,iCell)%apa%particle(j)%weight_group /= g_sel) cycle
+               if (pmc_random() < 0.5d0) then
+                  call aero_state_remove_particle_no_info(aero_states(k,iCell), j)
+                  call pos_remove(pos(k,iCell), j)
+                  n_thinned = n_thinned + 1
+               else
+                  aero_states(k,iCell)%apa%particle(j)%weight_group = g_sel + 1
+               end if
+            end do
+            n = pos(k,iCell) % n
+         end do
+         do while (n > 0 .and. n < pmc_n_part/2)
+            g_sel = 0
+            do j = 1, n
+               g_sel = max(g_sel, aero_states(k,iCell)%apa%particle(j)%weight_group)
+            end do
+            if (g_sel <= 1) exit
+            do j = 1, n
+               if (aero_states(k,iCell)%apa%particle(j)%weight_group /= g_sel) cycle
+               aero_states(k,iCell)%apa%particle(j)%weight_group = g_sel - 1
+               twin = aero_states(k,iCell)%apa%particle(j)
+               call aero_particle_new_id(twin)
+               call aero_state_add_particle(aero_states(k,iCell), twin, aero_data)
+               call random_in_cell(iCell, k, nCells, nEdgesOnCell, cellsOnCell, xp(1:4))
+               xp(5:7) = pos(k,iCell) % x(5:7,j)
+               call pos_append(pos(k,iCell), xp)
+               n_split = n_split + 1
+            end do
+            n = pos(k,iCell) % n
+         end do
+      end subroutine lagr_rebalance
+
 
       !> Number of particles in each weight class.
       subroutine count_classes(aero_state, n)
@@ -1694,7 +1789,8 @@ contains
             do i_part = 1, aero_state_n_part(aero_states(k,iCell))
                c = aero_states(k,iCell)%apa%particle(i_part)%weight_class
                vol_sum = vol_sum + aero_states(k,iCell)%apa%particle(i_part)%vol &
-                                   * aero_states(k,iCell)%awa%weight(1,c)%magnitude
+                                   * aero_states(k,iCell)%awa%weight( &
+                                        aero_states(k,iCell)%apa%particle(i_part)%weight_group,c)%magnitude
             end do
             local = local + vol_sum * aero_data%density * cell_volume(areaCell(iCell), rdzw(k), zz(k,iCell))
          end do
@@ -1838,7 +1934,7 @@ contains
                   ! exact cell totals are accumulated in double precision before the particle
                   ! masses are stored in single precision
                   c = aero_states(k,iCell)%apa%particle(i_part)%weight_class
-                  wt = aero_states(k,iCell)%awa%weight(1,c)%magnitude
+                  wt = aero_states(k,iCell)%awa%weight(aero_states(k,iCell)%apa%particle(i_part)%weight_group,c)%magnitude
                   p_wt(ip) = wt
                   if (pmc_mode == MODE_LAGR) then
                      p_lat(ip) = asin(max(-1.0_RKIND, min(1.0_RKIND, pos(k,iCell) % x(3,i_part))))

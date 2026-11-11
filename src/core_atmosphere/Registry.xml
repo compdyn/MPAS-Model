@@ -1705,6 +1705,9 @@
                         <var name="pmc_num" array_group="pmc" units="kg^{-1}"
                              description="PartMC particle number mixing ratio"/>
 
+                        <var name="pmc_num2" array_group="pmc" units="kg^{-1}"
+                             description="PartMC particle number mixing ratio of the second weight class"/>
+
                         <var name="pmc_ref" array_group="pmc" units="kg^{-1}"
                              description="PartMC: Eulerian reference number mixing ratio, never reset from particles"/>
 
@@ -1965,6 +1968,30 @@
                 <var name="pmc_content_new" type="real" dimensions="nVertLevels nCells Time" units="m^{-3}"
                      description="PartMC: rho_zz times number mixing ratio after transport"/>
 
+                <var name="pmc2_flux_h" type="real" dimensions="nVertLevels nEdges Time" units="m^{-1}"
+                     description="PartMC: as pmc_flux_h, for the second weight class"/>
+
+                <var name="pmc2_flux_v" type="real" dimensions="nVertLevelsP1 nCells Time" units="m^{-3}"
+                     description="PartMC: as pmc_flux_v, for the second weight class"/>
+
+                <var name="pmc2_content_old" type="real" dimensions="nVertLevels nCells Time" units="m^{-3}"
+                     description="PartMC: as pmc_content_old, for the second weight class"/>
+
+                <var name="pmc2_content_new" type="real" dimensions="nVertLevels nCells Time" units="m^{-3}"
+                     description="PartMC: as pmc_content_new, for the second weight class"/>
+
+                <var name="pmc_ux" type="real" dimensions="nVertLevels nCells Time" units="m s^{-1}"
+                     description="PartMC: x component of the step-averaged transport velocity at cell centres"/>
+
+                <var name="pmc_uy" type="real" dimensions="nVertLevels nCells Time" units="m s^{-1}"
+                     description="PartMC: y component of the step-averaged transport velocity at cell centres"/>
+
+                <var name="pmc_uz" type="real" dimensions="nVertLevels nCells Time" units="m s^{-1}"
+                     description="PartMC: z component of the step-averaged transport velocity at cell centres"/>
+
+                <var name="pmc_omega" type="real" dimensions="nVertLevelsP1 nCells Time" units="m s^{-1}"
+                     description="PartMC: step-averaged rate of change of zeta at cell faces"/>
+
                 <var name="ruAvg_split" type="real" dimensions="nVertLevels nEdges Time" units="kg m^{-2} s^{-1}"
                      description="time-averaged rho*u/zz used in scalar transport"/>
 
@@ -2095,6 +2122,9 @@
 
                         <var name="tend_pmc_num" name_in_code="pmc_num" array_group="pmc" units="m^{-3} s^{-1}"
                              description="Tendency of PartMC particle number per unit volume divided by d(zeta)/dz"/>
+
+                        <var name="tend_pmc_num2" name_in_code="pmc_num2" array_group="pmc" units="m^{-3} s^{-1}"
+                             description="Tendency of PartMC second weight class number per unit volume divided by d(zeta)/dz"/>
 
                         <var name="tend_pmc_ref" name_in_code="pmc_ref" array_group="pmc" units="m^{-3} s^{-1}"
                              description="Tendency of PartMC Eulerian reference number per unit volume divided by d(zeta)/dz"/>

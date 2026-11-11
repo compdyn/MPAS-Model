@@ -150,13 +150,20 @@ contains
       real (kind=RKIND), dimension(:,:,:), pointer :: scalars
       real (kind=RKIND), dimension(:), pointer :: latCell, lonCell
       integer, pointer :: index_pmc_num, index_pmc_ref, nCells, nVertLevels
-      integer :: iCell, k
-      real (kind=RKIND) :: d, cosd
+      integer :: iCell, k, stat
+      real (kind=RKIND) :: d, cosd, scale_height, z_mid
+      real (kind=RKIND), dimension(:,:), pointer :: zgrid
+      character(len=32) :: envval
       real (kind=RKIND), parameter :: q_background = 1.0e8_RKIND
       real (kind=RKIND), parameter :: q_blob = 1.0e9_RKIND
       real (kind=RKIND), parameter :: lat0 = 0.6981317_RKIND   ! 40 N
       real (kind=RKIND), parameter :: lon0 = 1.5707963_RKIND   ! 90 E
       real (kind=RKIND), parameter :: width = 0.25_RKIND       ! radians of arc
+
+      ! optional exponential decay of the mixing ratio with height (m). Env: PMC_SCALE_HEIGHT.
+      scale_height = 0.0_RKIND
+      call get_environment_variable('PMC_SCALE_HEIGHT', envval, status=stat)
+      if (stat == 0) read(envval, *) scale_height
 
       block => domain % blocklist
       do while (associated(block))
@@ -170,6 +177,7 @@ contains
          call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
          call mpas_pool_get_array(mesh, 'latCell', latCell)
          call mpas_pool_get_array(mesh, 'lonCell', lonCell)
+         call mpas_pool_get_array(mesh, 'zgrid', zgrid)
          call mpas_pool_get_array(state, 'scalars', scalars, 1)
 
          if (maxval(scalars(index_pmc_num,:,1:nCells)) <= 0.0_RKIND) then
@@ -178,6 +186,10 @@ contains
                d = acos(max(-1.0_RKIND, min(1.0_RKIND, cosd)))
                do k = 1, nVertLevels
                   scalars(index_pmc_num,k,iCell) = q_background + q_blob*exp(-(d/width)**2)
+                  if (scale_height > 0.0_RKIND) then
+                     z_mid = 0.5_RKIND*(zgrid(k,iCell) + zgrid(k+1,iCell))
+                     scalars(index_pmc_num,k,iCell) = scalars(index_pmc_num,k,iCell) * exp(-z_mid/scale_height)
+                  end if
                   scalars(index_pmc_ref,k,iCell) = scalars(index_pmc_num,k,iCell)
                end do
             end do
@@ -489,6 +501,9 @@ contains
       real (kind=RKIND) :: p_sum_max, g_p_sum_max, step2, g_step2, c_ref
       real (kind=RKIND) :: p_sum, lost, g_lost
       integer :: n_over, g_n_over
+      real (kind=RKIND), allocatable :: err2_k(:), norm2_k(:), g_err2_k(:), g_norm2_k(:)
+      real (kind=RKIND) :: ratio_max, ratio_min, g_ratio_max, g_ratio_min, lev_mean, lev_worst
+      integer :: n_copy_max, g_n_copy_max, k_worst
       integer, dimension(:), pointer :: indexToCellID
       type(aero_particle_t) :: particle
 
@@ -526,6 +541,12 @@ contains
       step2 = 0.0_RKIND
       n_over = 0
       lost = 0.0_RKIND
+      ratio_max = 0.0_RKIND
+      ratio_min = huge(1.0_RKIND)
+      n_copy_max = 0
+      allocate(err2_k(nVertLevels), norm2_k(nVertLevels), g_err2_k(nVertLevels), g_norm2_k(nVertLevels))
+      err2_k = 0.0_RKIND
+      norm2_k = 0.0_RKIND
       do iCell = 1, nCellsSolve
          do k = 1, nVertLevels
             if (c_old(k,iCell) <= 0.0_RKIND) cycle
@@ -655,6 +676,8 @@ contains
             c_ref = rho_zz_new(k,iCell) * scalars_new(index_ref,k,iCell)
             err2 = err2 + (c_part - c_ref)**2 * vol
             norm2 = norm2 + c_ref**2 * vol
+            err2_k(k) = err2_k(k) + (c_part - c_ref)**2 * vol
+            norm2_k(k) = norm2_k(k) + c_ref**2 * vol
             step2 = step2 + (c_part - c_new(k,iCell))**2 * vol
             tot_part = tot_part + c_part * zz(k,iCell) * vol
             tot_euler = tot_euler + c_ref * zz(k,iCell) * vol
@@ -681,6 +704,26 @@ contains
          call mpas_dmpar_max_real(domain % dminfo, p_sum_max, g_p_sum_max)
          call mpas_log_write('PartMC particles step $i: one-step L2 rel noise = $r, max outflow prob sum = $r', &
                              intArgs=(/itimestep/), realArgs=(/sqrt(g_step2/g_norm2), g_p_sum_max/))
+         call mpas_dmpar_sum_real_array(domain % dminfo, nVertLevels, err2_k, g_err2_k)
+         call mpas_dmpar_sum_real_array(domain % dminfo, nVertLevels, norm2_k, g_norm2_k)
+         call mpas_dmpar_max_real(domain % dminfo, ratio_max, g_ratio_max)
+         call mpas_dmpar_min_real(domain % dminfo, ratio_min, g_ratio_min)
+         call mpas_dmpar_max_int(domain % dminfo, n_copy_max, g_n_copy_max)
+         lev_mean = 0.0_RKIND
+         lev_worst = 0.0_RKIND
+         k_worst = 0
+         do k = 1, nVertLevels
+            vol = sqrt(g_err2_k(k)/g_norm2_k(k))
+            lev_mean = lev_mean + vol/real(nVertLevels, kind=RKIND)
+            if (vol > lev_worst) then
+               lev_worst = vol
+               k_worst = k
+            end if
+         end do
+         call mpas_log_write('PartMC particles step $i: per-level L2 rel err mean = $r, worst = $r at level $i', &
+                             intArgs=(/itimestep, k_worst/), realArgs=(/lev_mean, lev_worst/))
+         call mpas_log_write('PartMC particles step $i: weight ratio src/dst min = $r, max = $r, max copies of one particle = $i', &
+                             intArgs=(/itimestep, g_n_copy_max/), realArgs=(/g_ratio_min, g_ratio_max/))
          call mpas_dmpar_sum_int(domain % dminfo, n_over, g_n_over)
          call mpas_dmpar_sum_real(domain % dminfo, lost, g_lost)
          call mpas_log_write('PartMC particles step $i: cells with outflow > content = $i of $i, unmoved number frac = $r', &
@@ -702,6 +745,9 @@ contains
                        * cell_volume(areaCell(cell_to), rdzw(k_to), zz(k_to,cell_to)))
          n = int(r)
          if (pmc_random() < r - real(n, kind=RKIND)) n = n + 1
+         ratio_max = max(ratio_max, r)
+         ratio_min = min(ratio_min, r)
+         n_copy_max = max(n_copy_max, n)
          do j = 1, n
             if (j > 1) call aero_particle_new_id(part)
             call aero_state_add_particle(aero_incoming(k_to,cell_to), part, aero_data)

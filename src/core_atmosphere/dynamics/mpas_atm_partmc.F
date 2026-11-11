@@ -8,6 +8,10 @@
 !   PMC_N_PART        target computational particles per cell (0 = no particles)
 !   PMC_TRANSPORT     flux (default): stochastic transfer with the captured fluxes;
 !                     lagrangian: particles carry positions and follow the winds
+!   PMC_LAGR_SUBSTEPS lagrangian mode: trajectory sub-steps per model step (default 1)
+!   PMC_TEST_WIND     lagrangian mode: replace the model winds by an analytic flow with a
+!                     12-day period: solid (tilted solid-body rotation) or deform
+!                     (Nair and Lauritzen 2010 reversing deformational flow)
 !   PMC_N_CLASS       flux mode: 1 (default) one weight class; 2 one class per source,
 !                     each with its own advected number scalar
 !   PMC_COUPLED       1 (default): the class scalars are reset from the particles every step
@@ -134,6 +138,11 @@ module mpas_atm_partmc
 
    integer, parameter :: MODE_FLUX = 1, MODE_LAGR = 2
    integer, parameter :: MAX_CLASS = 2
+   !> Reals stored per particle in Lagrangian mode: unit vector, zeta, initial unit vector.
+   integer, parameter :: NPOS = 7
+   integer, parameter :: WIND_MODEL = 0, WIND_SOLID = 1, WIND_DEFORM = 2
+   !> Period of the analytic test winds (s).
+   real (kind=RKIND), parameter :: test_period = 12.0_RKIND * 86400.0_RKIND
 
    !> Initial number mixing ratios (kg^-1) and shape of the blob.
    real (kind=RKIND), parameter :: q_background = 1.0e8_RKIND
@@ -152,6 +161,9 @@ module mpas_atm_partmc
    integer :: n_class = 1
    real (kind=RKIND) :: scale_height = 0.0_RKIND
    character(len=256) :: aero_data_file = 'aero_data.dat'
+   !> Lagrangian mode: winds used (model, or an analytic test flow) and sub-steps per model step.
+   integer :: lagr_wind = WIND_MODEL
+   integer :: lagr_substeps = 1
    !> Particle output: interval in steps (0 = off), fraction of cells written, directory.
    integer :: pmc_out_interval = 0
    real (kind=RKIND) :: pmc_out_frac = 1.0_RKIND
@@ -162,7 +174,7 @@ module mpas_atm_partmc
       real (kind=RKIND), dimension(:,:), pointer :: fh => null(), fv => null(), co => null(), cn => null()
    end type flux_set_t
 
-   !> Positions of the particles of one cell (Lagrangian mode): unit vector and zeta.
+   !> Positions of the particles of one cell (Lagrangian mode): unit vector, zeta, initial unit vector.
    type pos_t
       real (kind=RKIND), allocatable :: x(:,:)
       integer :: n = 0
@@ -220,6 +232,13 @@ contains
       if (stat == 0) then
          if (trim(envval) == 'lagrangian') pmc_mode = MODE_LAGR
       end if
+      call get_environment_variable('PMC_TEST_WIND', envval, status=stat)
+      if (stat == 0) then
+         if (trim(envval) == 'solid') lagr_wind = WIND_SOLID
+         if (trim(envval) == 'deform') lagr_wind = WIND_DEFORM
+      end if
+      call get_environment_variable('PMC_LAGR_SUBSTEPS', envval, status=stat)
+      if (stat == 0) read(envval, *) lagr_substeps
       call get_environment_variable('PMC_N_CLASS', envval, status=stat)
       if (stat == 0) read(envval, *) n_class
       if (pmc_mode == MODE_LAGR) n_class = 1
@@ -429,6 +448,47 @@ contains
 
    end subroutine atm_partmc_check
 
+   !> Zonal and meridional wind (m/s) of the analytic test flows at time t (s).
+   subroutine test_wind(lat, lon, t, u, v)
+      real (kind=RKIND), intent(in) :: lat, lon, t
+      real (kind=RKIND), intent(out) :: u, v
+      real (kind=RKIND) :: p(3), a(3), vel(3), lon_p, kk
+
+      if (lagr_wind == WIND_SOLID) then
+         ! rotation about an axis tilted 45 degrees from the pole
+         a = (/ sqrt(0.5_RKIND), 0.0_RKIND, sqrt(0.5_RKIND) /)
+         p = (/ cos(lat)*cos(lon), cos(lat)*sin(lon), sin(lat) /)
+         vel(1) = a(2)*p(3) - a(3)*p(2)
+         vel(2) = a(3)*p(1) - a(1)*p(3)
+         vel(3) = a(1)*p(2) - a(2)*p(1)
+         vel = vel * radius * 2.0_RKIND*pii/test_period
+         u = -sin(lon)*vel(1) + cos(lon)*vel(2)
+         v = -sin(lat)*cos(lon)*vel(1) - sin(lat)*sin(lon)*vel(2) + cos(lat)*vel(3)
+      else
+         ! Nair and Lauritzen (2010) case 4: deformation that reverses at half the period,
+         ! on top of a zonal rotation
+         kk = 10.0_RKIND * radius / test_period
+         lon_p = lon - 2.0_RKIND*pii*t/test_period
+         u = kk * sin(lon_p)**2 * sin(2.0_RKIND*lat) * cos(pii*t/test_period) &
+             + 2.0_RKIND*pii*radius/test_period * cos(lat)
+         v = kk * sin(2.0_RKIND*lon_p) * cos(lat) * cos(pii*t/test_period)
+      end if
+   end subroutine test_wind
+
+
+   !> Unit vector p rotated by angle about the axis of the solid-body test flow.
+   pure function solid_rotate(p, angle) result(q)
+      real (kind=RKIND), intent(in) :: p(3), angle
+      real (kind=RKIND) :: q(3), a(3), axp(3)
+
+      a = (/ sqrt(0.5_RKIND), 0.0_RKIND, sqrt(0.5_RKIND) /)
+      axp(1) = a(2)*p(3) - a(3)*p(2)
+      axp(2) = a(3)*p(1) - a(1)*p(3)
+      axp(3) = a(1)*p(2) - a(2)*p(1)
+      q = p*cos(angle) + axp*sin(angle) + a*dot_product(a, p)*(1.0_RKIND - cos(angle))
+   end function solid_rotate
+
+
    !> Physical volume (m^3) of cell (k,iCell).
    pure real (kind=RKIND) function cell_volume(areaCell, rdzw, zz)
       real (kind=RKIND), intent(in) :: areaCell, rdzw, zz
@@ -438,13 +498,13 @@ contains
 
    subroutine pos_append(p, x)
       type (pos_t), intent(inout) :: p
-      real (kind=RKIND), intent(in) :: x(4)
+      real (kind=RKIND), intent(in) :: x(NPOS)
       real (kind=RKIND), allocatable :: tmp(:,:)
 
       if (.not. allocated(p % x)) then
-         allocate(p % x(4, 16))
+         allocate(p % x(NPOS, 16))
       else if (p % n == size(p % x, 2)) then
-         allocate(tmp(4, 2*p % n))
+         allocate(tmp(NPOS, 2*p % n))
          tmp(:, 1:p % n) = p % x(:, 1:p % n)
          call move_alloc(tmp, p % x)
       end if
@@ -527,7 +587,7 @@ contains
       real (kind=RKIND), dimension(:), pointer :: owner
       type(spec_file_t) :: file
       real (kind=dp), allocatable :: vols(:)
-      real (kind=RKIND) :: conc_tot, conc1, conc2, vol, f2, total, g_total, r_max, x(4), e1(3), e2(3), a, b, v(3)
+      real (kind=RKIND) :: conc_tot, conc1, conc2, vol, f2, total, g_total, r_max, x(NPOS), e1(3), e2(3), a, b, v(3)
       type(aero_particle_t) :: particle
 
       call read_settings()
@@ -700,6 +760,7 @@ contains
                      if (find_cell(x(1:3), iCell, nCells, nEdgesOnCell, cellsOnCell) == iCell) exit
                   end do
                   x(4) = zf(k) + pmc_random()*(zf(k+1) - zf(k))
+                  x(5:7) = x(1:3)
                   call pos_append(pos(k,iCell), x)
                end do
                cnt(1,k,iCell) = n
@@ -865,7 +926,9 @@ contains
       integer :: n_part_total, n_part_min, n_part_max, n_moved, n_over, n_copy_max, n_clamp, n_t, n_thin, g_n_thin
       integer :: g_n_part_total, g_n_part_min, g_n_part_max, g_n_moved, g_n_cells, g_n_over, g_n_copy_max, g_n_clamp
       integer :: counts(MAX_CLASS)
-      real (kind=RKIND) :: w_src, vol, m, x(4)
+      real (kind=RKIND) :: w_src, vol, m, x(NPOS), xe(3), d
+      real (kind=RKIND) :: terr(3), g_terr(3), terr_max, g_terr_max
+      real (kind=RKIND), dimension(:), pointer :: angleEdge, latEdge, lonEdge
       real (kind=RKIND) :: c_part, c_ref, c_new, v_part, c1_part, v1_part, c1_ref, c2_part, v2_part, c2_ref
       real (kind=RKIND) :: p_sum_max, lost, ratio_max, ratio_min, lev_mean, lev_worst, mass_dev
       real (kind=RKIND) :: g_p_sum_max, g_lost, g_ratio_max, g_ratio_min
@@ -942,7 +1005,7 @@ contains
                call pmc_mpi_unpack_integer(recv_buf(i_nbr)%data, recv_buf(i_nbr)%pos, dest_global)
                call pmc_mpi_unpack_integer(recv_buf(i_nbr)%data, recv_buf(i_nbr)%pos, k)
                if (pmc_mode == MODE_LAGR) then
-                  do i = 1, 4
+                  do i = 1, NPOS
                      call pmc_mpi_unpack_real(recv_buf(i_nbr)%data, recv_buf(i_nbr)%pos, x(i))
                   end do
                else
@@ -1080,6 +1143,35 @@ contains
             norm2_k(k) = norm2_k(k) + c_ref**2 * vol
          end do
       end do
+
+      if (do_diag .and. pmc_mode == MODE_LAGR .and. lagr_wind /= WIND_MODEL) then
+         ! distance of every particle from where it should be: the exact position for
+         ! solid-body rotation, the starting position for the reversing flow
+         terr = 0.0_RKIND
+         terr_max = 0.0_RKIND
+         do iCell = 1, nCellsSolve
+            do k = 1, nVertLevels
+               do i = 1, pos(k,iCell) % n
+                  if (lagr_wind == WIND_SOLID) then
+                     xe = solid_rotate(pos(k,iCell) % x(5:7,i), &
+                                       2.0_RKIND*pii/test_period * real(itimestep, kind=RKIND)*config_dt)
+                  else
+                     xe = pos(k,iCell) % x(5:7,i)
+                  end if
+                  d = 2.0_RKIND * radius * asin(min(1.0_RKIND, 0.5_RKIND*norm2(pos(k,iCell) % x(1:3,i) - xe)))
+                  terr(1) = terr(1) + d
+                  terr(2) = terr(2) + d*d
+                  terr(3) = terr(3) + 1.0_RKIND
+                  terr_max = max(terr_max, d)
+               end do
+            end do
+         end do
+         call mpas_dmpar_sum_real_array(domain % dminfo, 3, terr, g_terr)
+         call mpas_dmpar_max_real(domain % dminfo, terr_max, g_terr_max)
+         call mpas_log_write('PartMC trajectory test step $i: position error (km) mean = $r, rms = $r, max = $r', &
+                             intArgs=(/itimestep/), realArgs=(/1.0e-3_RKIND*g_terr(1)/g_terr(3), &
+                             1.0e-3_RKIND*sqrt(g_terr(2)/g_terr(3)), 1.0e-3_RKIND*g_terr_max/))
+      end if
 
       if (do_diag) then
          call mpas_dmpar_sum_real_array(domain % dminfo, 16, sums, g_sums)
@@ -1375,7 +1467,7 @@ contains
       !> Lagrangian mode: put a particle with position xp into owned cell (k_to, cell_to).
       subroutine deliver_lagr(part, xp, k_to, cell_to)
          type(aero_particle_t), intent(in) :: part
-         real (kind=RKIND), intent(in) :: xp(4)
+         real (kind=RKIND), intent(in) :: xp(NPOS)
          integer, intent(in) :: k_to, cell_to
 
          call aero_state_add_particle(aero_incoming(k_to,cell_to), part, aero_data)
@@ -1388,7 +1480,7 @@ contains
       subroutine lagr_velocities()
          type (field2DReal), pointer :: f_ux, f_uy, f_uz, f_om
          real (kind=RKIND), allocatable :: u_e(:,:), u_zonal(:,:), u_merid(:,:)
-         real (kind=RKIND) :: rho_e, rho_f
+         real (kind=RKIND) :: rho_e, rho_f, u_test, v_test
          integer :: iEdge, c1, c2, kk, ic
 
          call mpas_pool_get_array(diag, 'ruAvg', ruAvg)
@@ -1404,15 +1496,27 @@ contains
 
          allocate(u_e(nVertLevels, nEdges+1), u_zonal(nVertLevels, nCells+1), u_merid(nVertLevels, nCells+1))
          u_e = 0.0_RKIND
-         do iEdge = 1, nEdges
-            c1 = cellsOnEdge(1,iEdge)
-            c2 = cellsOnEdge(2,iEdge)
-            if (c1 < 1 .or. c1 > nCells .or. c2 < 1 .or. c2 > nCells) cycle
-            do kk = 1, nVertLevels
-               rho_e = 0.25_RKIND*(rho_zz_old(kk,c1) + rho_zz_new(kk,c1) + rho_zz_old(kk,c2) + rho_zz_new(kk,c2))
-               u_e(kk,iEdge) = ruAvg(kk,iEdge) / rho_e
+         if (lagr_wind /= WIND_MODEL) then
+            ! analytic horizontal wind at the middle of the step, as edge-normal components
+            call mpas_pool_get_array(mesh, 'angleEdge', angleEdge)
+            call mpas_pool_get_array(mesh, 'latEdge', latEdge)
+            call mpas_pool_get_array(mesh, 'lonEdge', lonEdge)
+            do iEdge = 1, nEdges
+               call test_wind(latEdge(iEdge), lonEdge(iEdge), (real(itimestep, kind=RKIND) - 0.5_RKIND)*config_dt, &
+                              u_test, v_test)
+               u_e(:,iEdge) = u_test*cos(angleEdge(iEdge)) + v_test*sin(angleEdge(iEdge))
             end do
-         end do
+         else
+            do iEdge = 1, nEdges
+               c1 = cellsOnEdge(1,iEdge)
+               c2 = cellsOnEdge(2,iEdge)
+               if (c1 < 1 .or. c1 > nCells .or. c2 < 1 .or. c2 > nCells) cycle
+               do kk = 1, nVertLevels
+                  rho_e = 0.25_RKIND*(rho_zz_old(kk,c1) + rho_zz_new(kk,c1) + rho_zz_old(kk,c2) + rho_zz_new(kk,c2))
+                  u_e(kk,iEdge) = ruAvg(kk,iEdge) / rho_e
+               end do
+            end do
+         end if
          call mpas_reconstruct(mesh, u_e, ux, uy, uz, u_zonal, u_merid)
          do ic = 1, nCellsSolve
             om(1,ic) = 0.0_RKIND
@@ -1423,6 +1527,7 @@ contains
                om(kk,ic) = wwAvg(kk,ic) / rho_f
             end do
          end do
+         if (lagr_wind /= WIND_MODEL) om = 0.0_RKIND
          call mpas_dmpar_exch_halo_field(f_ux)
          call mpas_dmpar_exch_halo_field(f_uy)
          call mpas_dmpar_exch_halo_field(f_uz)
@@ -1504,31 +1609,39 @@ contains
       end function triple
 
 
-      !> Lagrangian mode: advance every particle with a midpoint step.
+      !> Lagrangian mode: advance every particle with midpoint steps through the
+      !> step-averaged velocity field.
       subroutine lagr_move()
-         real (kind=RKIND) :: xo(4), xm(4), xn(4), vel(3), omega, z_lo, z_hi, dt
-         integer :: j, cell_n, k_n
+         real (kind=RKIND) :: xo(NPOS), xm(4), xn(NPOS), vel(3), omega, z_lo, z_hi, dt
+         integer :: j, cell_n, k_n, i_sub
+         logical :: clamped
 
-         dt = config_dt
+         dt = config_dt / real(lagr_substeps, kind=RKIND)
          z_lo = zf(1) + 1.0e-6_RKIND*(zf(2) - zf(1))
          z_hi = zf(nVertLevels+1) - 1.0e-6_RKIND*(zf(nVertLevels+1) - zf(nVertLevels))
          do iCell = 1, nCellsSolve
             do k = 1, nVertLevels
                do j = pos(k,iCell) % n, 1, -1
-                  xo = pos(k,iCell) % x(:,j)
-                  call lagr_vel(xo(1:3), xo(4), iCell, vel, omega)
-                  xm(1:3) = xo(1:3) + 0.5_RKIND*dt*vel/radius
-                  xm(1:3) = xm(1:3) / norm2(xm(1:3))
-                  xm(4) = min(z_hi, max(z_lo, xo(4) + 0.5_RKIND*dt*omega))
-                  call lagr_vel(xm(1:3), xm(4), iCell, vel, omega)
-                  xn(1:3) = xo(1:3) + dt*vel/radius
-                  xn(1:3) = xn(1:3) / norm2(xn(1:3))
-                  xn(4) = xo(4) + dt*omega
-                  if (xn(4) < z_lo .or. xn(4) > z_hi) then
-                     n_clamp = n_clamp + 1
-                     xn(4) = min(z_hi, max(z_lo, xn(4)))
-                  end if
-                  cell_n = find_cell(xn(1:3), iCell, nCells, nEdgesOnCell, cellsOnCell)
+                  xn = pos(k,iCell) % x(:,j)
+                  cell_n = iCell
+                  clamped = .false.
+                  do i_sub = 1, lagr_substeps
+                     xo = xn
+                     call lagr_vel(xo(1:3), xo(4), cell_n, vel, omega)
+                     xm(1:3) = xo(1:3) + 0.5_RKIND*dt*vel/radius
+                     xm(1:3) = xm(1:3) / norm2(xm(1:3))
+                     xm(4) = min(z_hi, max(z_lo, xo(4) + 0.5_RKIND*dt*omega))
+                     call lagr_vel(xm(1:3), xm(4), cell_n, vel, omega)
+                     xn(1:3) = xo(1:3) + dt*vel/radius
+                     xn(1:3) = xn(1:3) / norm2(xn(1:3))
+                     xn(4) = xo(4) + dt*omega
+                     if (xn(4) < z_lo .or. xn(4) > z_hi) then
+                        clamped = .true.
+                        xn(4) = min(z_hi, max(z_lo, xn(4)))
+                     end if
+                     cell_n = find_cell(xn(1:3), cell_n, nCells, nEdgesOnCell, cellsOnCell)
+                  end do
+                  if (clamped) n_clamp = n_clamp + 1
                   k_n = find_level(xn(4))
                   if (cell_n == iCell .and. k_n == k) then
                      pos(k,iCell) % x(:,j) = xn
@@ -1541,7 +1654,7 @@ contains
                   if (cell_n <= nCellsSolve) then
                      call deliver_lagr(particle, xn, k_n, cell_n)
                   else
-                     call send_particle(particle, k_n, cell_n, 4, xn)
+                     call send_particle(particle, k_n, cell_n, NPOS, xn)
                   end if
                end do
             end do
@@ -1638,7 +1751,7 @@ contains
       integer, dimension(:), pointer :: indexToCellID
       integer, pointer :: nCellsSolve, nVertLevels, index_qv, index_pmc_ref
       integer :: iCell, k, i_part, n_cell_out, n_part_out, ic, ip, n, i_spec, c
-      real (kind=RKIND), allocatable :: p_wt(:)
+      real (kind=RKIND), allocatable :: p_wt(:), p_lat(:), p_lon(:), p_zeta(:)
       real (kind=RKIND) :: wt
       integer :: g_n_cell_out, g_n_part_out, clock0, clock1, clock_rate
       integer :: ncid, d_cell, d_part, d_spec, varid, stat
@@ -1696,6 +1809,7 @@ contains
                   c_num(n_cell_out), c_numref(n_cell_out), c_temp(n_cell_out), c_pres(n_cell_out), &
                   c_qv(n_cell_out), c_rho(n_cell_out), c_mass(n_spec, n_cell_out))
          allocate(p_mass(n_spec, n_part_out), p_source(n_part_out), p_id(n_part_out), p_wt(n_part_out))
+         if (pmc_mode == MODE_LAGR) allocate(p_lat(n_part_out), p_lon(n_part_out), p_zeta(n_part_out))
 
          ic = 0
          ip = 0
@@ -1726,6 +1840,11 @@ contains
                   c = aero_states(k,iCell)%apa%particle(i_part)%weight_class
                   wt = aero_states(k,iCell)%awa%weight(1,c)%magnitude
                   p_wt(ip) = wt
+                  if (pmc_mode == MODE_LAGR) then
+                     p_lat(ip) = asin(max(-1.0_RKIND, min(1.0_RKIND, pos(k,iCell) % x(3,i_part))))
+                     p_lon(ip) = atan2(pos(k,iCell) % x(2,i_part), pos(k,iCell) % x(1,i_part))
+                     p_zeta(ip) = pos(k,iCell) % x(4,i_part)
+                  end if
                   c_num(ic) = c_num(ic) + wt
                   c_mass(:,ic) = c_mass(:,ic) + aero_states(k,iCell)%apa%particle(i_part)%vol * aero_data%density * wt
                   p_mass(:,ip) = real(aero_states(k,iCell)%apa%particle(i_part)%vol * aero_data%density, kind=R4KIND)
@@ -1788,6 +1907,19 @@ contains
                                     'number concentration represented by the computational particle'), 'att')
          call nc_check(nf90_put_att(ncid, varid, 'units', 'm-3'), 'att')
          if (n_part_out > 0) call nc_check(nf90_put_var(ncid, varid, p_wt), 'put part_num_conc')
+
+         if (pmc_mode == MODE_LAGR .and. n_part_out > 0) then
+            call nc_check(nf90_def_var(ncid, 'part_lat', NF90_DOUBLE, (/d_part/), varid), 'def part_lat')
+            call nc_check(nf90_put_att(ncid, varid, 'units', 'rad'), 'att')
+            call nc_check(nf90_put_var(ncid, varid, p_lat), 'put part_lat')
+            call nc_check(nf90_def_var(ncid, 'part_lon', NF90_DOUBLE, (/d_part/), varid), 'def part_lon')
+            call nc_check(nf90_put_att(ncid, varid, 'units', 'rad'), 'att')
+            call nc_check(nf90_put_var(ncid, varid, p_lon), 'put part_lon')
+            call nc_check(nf90_def_var(ncid, 'part_zeta', NF90_DOUBLE, (/d_part/), varid), 'def part_zeta')
+            call nc_check(nf90_put_att(ncid, varid, 'long_name', 'height coordinate zeta of the particle'), 'att')
+            call nc_check(nf90_put_att(ncid, varid, 'units', 'm'), 'att')
+            call nc_check(nf90_put_var(ncid, varid, p_zeta), 'put part_zeta')
+         end if
 
          call nc_check(nf90_def_var(ncid, 'part_source', NF90_BYTE, (/d_part/), varid), 'def part_source')
          call nc_check(nf90_put_att(ncid, varid, 'long_name', 'source of the particle, one-based index into sources'), 'att')

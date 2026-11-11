@@ -10,6 +10,8 @@
 !                     lagrangian: particles carry positions and follow the winds
 !   PMC_LAGR_CONTROL  lagrangian mode: 1 = keep the particle count per cell near PMC_N_PART by
 !                     splitting and thinning particles with power-of-two weights (default 0)
+!   PMC_NUM_SCALE     factor applied to the initial number mixing ratios (default 1)
+!   PMC_COAG          1 = PartMC Brownian coagulation in every cell each step (default 0)
 !   PMC_KZ_MAX        peak of a prescribed vertical diffusivity profile (m^2/s, default 0 = no
 !                     vertical mixing); applied to the Eulerian scalars and, in lagrangian
 !                     mode, to the particles. PMC_KZ_TOP is the height where it reaches zero.
@@ -131,6 +133,12 @@ module mpas_atm_partmc
    use pmc_rand
    use pmc_mpi
    use pmc_spec_file
+   use pmc_env_state
+   use pmc_coagulation
+   use pmc_coag_kernel
+   use pmc_aero_sorted
+   use pmc_aero_info_array
+   use pmc_bin_grid
    use netcdf
    use mpas_atm_partmc_comm
 #endif
@@ -139,7 +147,8 @@ module mpas_atm_partmc
    private
 
    public :: atm_partmc_init, atm_partmc_check, atm_partmc_particles_init, atm_partmc_particles_transport, &
-             atm_partmc_particles_to_scalar, atm_partmc_output, atm_partmc_vertical_mixing
+             atm_partmc_particles_to_scalar, atm_partmc_output, atm_partmc_vertical_mixing, &
+             atm_partmc_coagulation
 
    integer, parameter :: MODE_FLUX = 1, MODE_LAGR = 2
    integer, parameter :: MAX_CLASS = 2
@@ -150,8 +159,8 @@ module mpas_atm_partmc
    real (kind=RKIND), parameter :: test_period = 12.0_RKIND * 86400.0_RKIND
 
    !> Initial number mixing ratios (kg^-1) and shape of the blob.
-   real (kind=RKIND), parameter :: q_background = 1.0e8_RKIND
-   real (kind=RKIND), parameter :: q_blob = 1.0e9_RKIND
+   real (kind=RKIND) :: q_background = 1.0e8_RKIND
+   real (kind=RKIND) :: q_blob = 1.0e9_RKIND
    real (kind=RKIND), parameter :: blob_lat = 0.6981317_RKIND   ! 40 N
    real (kind=RKIND), parameter :: blob_lon = 1.5707963_RKIND   ! 90 E
    real (kind=RKIND), parameter :: blob_width = 0.25_RKIND      ! radians of arc
@@ -169,9 +178,10 @@ module mpas_atm_partmc
    !> Lagrangian mode: winds used (model, or an analytic test flow) and sub-steps per model step.
    integer :: lagr_wind = WIND_MODEL
    integer :: lagr_substeps = 1
-   !> Lagrangian mode: a particle in weight group g represents lagr_w * 2**(g - LAGR_G0) real
-   !> particles. With population control, cells split heavy particles and thin light ones to
-   !> stay near the target count.
+   !> Lagrangian mode: a particle in weight class g represents lagr_w * 2**(g - LAGR_G0) real
+   !> particles. (PartMC weight classes, not weight groups: PartMC treats the groups of a class
+   !> as one combined sample, so a group does not give a per-particle weight.) With population
+   !> control, cells split heavy particles and thin light ones to stay near the target count.
    integer, parameter :: LAGR_GROUPS = 64, LAGR_G0 = 45
    logical :: lagr_control = .false.
    !> Particles removed by thinning and added by splitting since the start of the run.
@@ -179,6 +189,9 @@ module mpas_atm_partmc
    !> Test vertical mixing: peak diffusivity (m^2/s, 0 = off) and the height where it reaches zero (m).
    real (kind=RKIND) :: pmc_kz_max = 0.0_RKIND, pmc_kz_top = 12000.0_RKIND
    integer :: n_mixed = 0
+   !> Brownian coagulation in every cell each step, and events so far.
+   logical :: pmc_coag = .false.
+   integer :: n_coag_total = 0
    !> Particle output: interval in steps (0 = off), fraction of cells written, directory.
    integer :: pmc_out_interval = 0
    real (kind=RKIND) :: pmc_out_frac = 1.0_RKIND
@@ -236,6 +249,7 @@ contains
    subroutine read_settings()
       character(len=256) :: envval
       integer :: stat
+      real (kind=RKIND) :: num_scale
 
       if (settings_read) return
       settings_read = .true.
@@ -256,6 +270,14 @@ contains
       end if
       call get_environment_variable('PMC_LAGR_CONTROL', envval, status=stat)
       if (stat == 0) lagr_control = (trim(envval) /= '0')
+      call get_environment_variable('PMC_NUM_SCALE', envval, status=stat)
+      if (stat == 0) then
+         read(envval, *) num_scale
+         q_background = q_background * num_scale
+         q_blob = q_blob * num_scale
+      end if
+      call get_environment_variable('PMC_COAG', envval, status=stat)
+      if (stat == 0) pmc_coag = (trim(envval) /= '0')
       call get_environment_variable('PMC_KZ_MAX', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_kz_max
       call get_environment_variable('PMC_KZ_TOP', envval, status=stat)
@@ -785,12 +807,12 @@ contains
             vol = cell_volume(areaCell(iCell), rdzw(k), zz(k,iCell))
 
             if (pmc_mode == MODE_LAGR) then
-               ! one weight per group, a factor of two apart
-               call aero_weight_array_set_sizes(aero_states(k,iCell)%awa, LAGR_GROUPS, 1)
+               ! one weight per class, a factor of two apart
+               call aero_weight_array_set_sizes(aero_states(k,iCell)%awa, 1, LAGR_GROUPS)
                aero_states(k,iCell)%awa%weight%type = AERO_WEIGHT_TYPE_NONE
                aero_states(k,iCell)%awa%weight%exponent = 0.0d0
                do g = 1, LAGR_GROUPS
-                  aero_states(k,iCell)%awa%weight(g,1)%magnitude = lagr_w * 2.0d0**(g - LAGR_G0) / vol
+                  aero_states(k,iCell)%awa%weight(1,g)%magnitude = lagr_w * 2.0d0**(g - LAGR_G0) / vol
                end do
                g = LAGR_G0
                if (lagr_control) then
@@ -803,9 +825,9 @@ contains
                if (pmc_random() < f2 - real(n, kind=RKIND)) n = n + 1
                do i = 1, n
                   if (pmc_random() < conc2/conc_tot) then
-                     call make_particle(2, 1, g)
+                     call make_particle(2, g, 1)
                   else
-                     call make_particle(1, 1, g)
+                     call make_particle(1, g, 1)
                   end if
                   call random_in_cell(iCell, k, nCells, nEdgesOnCell, cellsOnCell, x(1:4))
                   x(5:7) = x(1:3)
@@ -889,6 +911,7 @@ contains
             vols(i_oc) = 0.3d0 * vol_tot
          end if
          call aero_particle_set_component(particle, i_source, 0.0d0)
+         particle%n_primary_parts = 1
          call aero_particle_set_vols(particle, vols)
          call aero_particle_new_id(particle)
          call aero_particle_set_weight(particle, i_group, i_class)
@@ -1099,7 +1122,12 @@ contains
             call aero_state_zero(aero_incoming(k,iCell))
             call aero_state_set_weight(aero_incoming(k,iCell), aero_data, AERO_STATE_WEIGHT_FLAT_SPECIFIED)
 
-            call count_classes(aero_states(k,iCell), counts)
+            counts = 0
+            if (pmc_mode == MODE_FLUX) then
+               call count_classes(aero_states(k,iCell), counts)
+            else
+               counts(1) = aero_state_n_part(aero_states(k,iCell))
+            end if
             if (pmc_mode == MODE_FLUX .and. n_class > 1) then
                ! drop a class whose number here is negligible next to the largest class, so that
                ! particles are not spent on it
@@ -1133,6 +1161,8 @@ contains
                   end do
                end do
             end if
+            ! PartMC records every particle removed by halving; drop the records
+            call aero_info_array_zero(aero_states(k,iCell)%aero_info_array)
             cnt(:,k,iCell) = counts(1:n_class)
             cnt_in(:,k,iCell) = 0
 
@@ -1721,9 +1751,9 @@ contains
 
 #ifdef MPAS_PARTMC
    !> Lagrangian population control for cell (k,iCell). Too many particles: each particle of
-   !> the lightest group present is either removed or moved up one group (twice the weight),
+   !> the lightest class present is either removed or moved up one class (twice the weight),
    !> with equal probability, which keeps the expected number and mass. Too few: each particle
-   !> of the heaviest group present becomes two of the next group down (half the weight), which
+   !> of the heaviest class present becomes two of the next class down (half the weight), which
    !> is exact; the new one is placed at a random point of the cell.
    subroutine lagr_rebalance(k, iCell, nCells, nEdgesOnCell, cellsOnCell)
       integer, intent(in) :: k, iCell, nCells
@@ -1737,17 +1767,17 @@ contains
       do while (n > 2*pmc_n_part)
          g_sel = LAGR_GROUPS + 1
          do j = 1, n
-            g_sel = min(g_sel, aero_states(k,iCell)%apa%particle(j)%weight_group)
+            g_sel = min(g_sel, aero_states(k,iCell)%apa%particle(j)%weight_class)
          end do
          if (g_sel >= LAGR_GROUPS) exit
          do j = n, 1, -1
-            if (aero_states(k,iCell)%apa%particle(j)%weight_group /= g_sel) cycle
+            if (aero_states(k,iCell)%apa%particle(j)%weight_class /= g_sel) cycle
             if (pmc_random() < 0.5d0) then
                call aero_state_remove_particle_no_info(aero_states(k,iCell), j)
                call pos_remove(pos(k,iCell), j)
                n_thinned = n_thinned + 1
             else
-               aero_states(k,iCell)%apa%particle(j)%weight_group = g_sel + 1
+               aero_states(k,iCell)%apa%particle(j)%weight_class = g_sel + 1
             end if
          end do
          n = pos(k,iCell) % n
@@ -1755,12 +1785,12 @@ contains
       do while (n > 0 .and. n < pmc_n_part/2)
          g_sel = 0
          do j = 1, n
-            g_sel = max(g_sel, aero_states(k,iCell)%apa%particle(j)%weight_group)
+            g_sel = max(g_sel, aero_states(k,iCell)%apa%particle(j)%weight_class)
          end do
          if (g_sel <= 1) exit
          do j = 1, n
-            if (aero_states(k,iCell)%apa%particle(j)%weight_group /= g_sel) cycle
-            aero_states(k,iCell)%apa%particle(j)%weight_group = g_sel - 1
+            if (aero_states(k,iCell)%apa%particle(j)%weight_class /= g_sel) cycle
+            aero_states(k,iCell)%apa%particle(j)%weight_class = g_sel - 1
             twin = aero_states(k,iCell)%apa%particle(j)
             call aero_particle_new_id(twin)
             call aero_state_add_particle(aero_states(k,iCell), twin, aero_data)
@@ -1915,6 +1945,192 @@ contains
 #endif
 
    end subroutine atm_partmc_vertical_mixing
+
+
+   !> PartMC Brownian coagulation in every owned cell for one model time step.
+   !>
+   !> In Lagrangian mode the weight classes present in the cell are renumbered 1..m for the
+   !> call, so that PartMC does not loop over all the unused weight levels, and positions are
+   !> carried through by particle id. A particle with an id that was not there before (the
+   !> product of a coagulation) is placed at a random point of the cell.
+   subroutine atm_partmc_coagulation(domain, itimestep)
+
+      type (domain_type), intent(inout) :: domain
+      integer, intent(in) :: itimestep
+
+#ifdef MPAS_PARTMC
+      type (mpas_pool_type), pointer :: mesh, state, diag
+      real (kind=RKIND), dimension(:,:,:), pointer :: scalars
+      real (kind=RKIND), dimension(:,:), pointer :: theta_m, exner, pressure_p, pressure_base
+      real (kind=RKIND), pointer :: config_dt
+      integer, dimension(:,:), pointer :: cellsOnCell
+      integer, dimension(:), pointer :: nEdgesOnCell
+      integer, pointer :: nCells, nCellsSolve, nVertLevels, index_qv
+      integer :: iCell, k, j, jj, n0, n1, m, c, n_samp, n_coag, g_n_coag, n_new, g_n_new
+      integer :: map(LAGR_GROUPS), present(LAGR_GROUPS)
+      integer (kind=I8KIND), allocatable :: ids(:)
+      real (kind=RKIND), allocatable :: xs(:,:)
+      real (kind=RKIND) :: xp(NPOS)
+      type(env_state_t) :: env_state
+      type(aero_weight_array_t) :: awa_save
+      type(aero_sorted_t) :: empty_sorted
+      type(bin_grid_t) :: coag_grid
+      integer, parameter :: n_bin = 36
+      real (kind=dp), allocatable :: k_min_lev(:,:,:), k_max_lev(:,:,:), k_min(:,:), k_max(:,:)
+      real (kind=RKIND) :: t_lo, t_hi, p_lo, p_hi, temp, pres
+      integer :: i_env
+      real (kind=dp) :: del_t
+
+      if (.not. pmc_coag .or. pmc_n_part <= 0) return
+
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'state', state)
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'diag', diag)
+      call mpas_pool_get_config(domain % blocklist % configs, 'config_dt', config_dt)
+      call mpas_pool_get_dimension(mesh, 'nCells', nCells)
+      call mpas_pool_get_dimension(mesh, 'nCellsSolve', nCellsSolve)
+      call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
+      call mpas_pool_get_dimension(state, 'index_qv', index_qv)
+      call mpas_pool_get_array(mesh, 'nEdgesOnCell', nEdgesOnCell)
+      call mpas_pool_get_array(mesh, 'cellsOnCell', cellsOnCell)
+      call mpas_pool_get_array(state, 'scalars', scalars, 2)
+      call mpas_pool_get_array(state, 'theta_m', theta_m, 2)
+      call mpas_pool_get_array(diag, 'exner', exner)
+      call mpas_pool_get_array(diag, 'pressure_p', pressure_p)
+      call mpas_pool_get_array(diag, 'pressure_base', pressure_base)
+
+      del_t = config_dt
+      env_state%rel_humid = 0.0d0
+      n_new = 0
+
+      ! One size grid for all cells, and bounds on the kernel for each level that hold for the
+      ! range of temperature and pressure on that level. PartMC otherwise rebuilds both for
+      ! every cell, which costs far more than the coagulation itself.
+      call bin_grid_make(coag_grid, BIN_GRID_TYPE_LOG, n_bin, 1.0d-10, 1.0d-4)
+      allocate(k_min_lev(n_bin,n_bin,nVertLevels), k_max_lev(n_bin,n_bin,nVertLevels), &
+               k_min(n_bin,n_bin), k_max(n_bin,n_bin))
+      do k = 1, nVertLevels
+         t_lo = huge(1.0_RKIND)
+         t_hi = 0.0_RKIND
+         p_lo = huge(1.0_RKIND)
+         p_hi = 0.0_RKIND
+         do iCell = 1, nCellsSolve
+            temp = theta_m(k,iCell) / (1.0_RKIND + rvord*scalars(index_qv,k,iCell)) * exner(k,iCell)
+            pres = pressure_p(k,iCell) + pressure_base(k,iCell)
+            t_lo = min(t_lo, temp)
+            t_hi = max(t_hi, temp)
+            p_lo = min(p_lo, pres)
+            p_hi = max(p_hi, pres)
+         end do
+         k_min_lev(:,:,k) = huge(1.0d0)
+         k_max_lev(:,:,k) = 0.0d0
+         if (nCellsSolve == 0) cycle
+         do i_env = 1, 4
+            env_state%temp = merge(t_lo, t_hi, i_env <= 2)
+            env_state%pressure = merge(p_lo, p_hi, mod(i_env, 2) == 1)
+            call est_k_minmax_binned_unweighted(coag_grid, COAG_KERNEL_TYPE_BROWN, aero_data, env_state, k_min, k_max)
+            k_min_lev(:,:,k) = min(k_min_lev(:,:,k), k_min)
+            k_max_lev(:,:,k) = max(k_max_lev(:,:,k), k_max)
+         end do
+         k_min_lev(:,:,k) = k_min_lev(:,:,k) / 1.05d0
+         k_max_lev(:,:,k) = k_max_lev(:,:,k) * 1.05d0
+      end do
+      allocate(ids(4*pmc_n_part + 16), xs(NPOS, 4*pmc_n_part + 16))
+
+      do iCell = 1, nCellsSolve
+         do k = 1, nVertLevels
+            n0 = aero_state_n_part(aero_states(k,iCell))
+            if (n0 < 2) cycle
+            env_state%temp = theta_m(k,iCell) / (1.0_RKIND + rvord*scalars(index_qv,k,iCell)) * exner(k,iCell)
+            env_state%pressure = pressure_p(k,iCell) + pressure_base(k,iCell)
+
+            if (pmc_mode == MODE_LAGR) then
+               if (n0 > size(ids)) then
+                  deallocate(ids, xs)
+                  allocate(ids(2*n0), xs(NPOS, 2*n0))
+               end if
+               map = 0
+               m = 0
+               do j = 1, n0
+                  ids(j) = aero_states(k,iCell)%apa%particle(j)%id
+                  xs(:,j) = pos(k,iCell) % x(:,j)
+                  c = aero_states(k,iCell)%apa%particle(j)%weight_class
+                  if (map(c) == 0) then
+                     m = m + 1
+                     map(c) = m
+                     present(m) = c
+                  end if
+                  aero_states(k,iCell)%apa%particle(j)%weight_class = map(c)
+               end do
+               awa_save = aero_states(k,iCell)%awa
+               call aero_weight_array_set_sizes(aero_states(k,iCell)%awa, 1, m)
+               aero_states(k,iCell)%awa%weight%type = AERO_WEIGHT_TYPE_NONE
+               aero_states(k,iCell)%awa%weight%exponent = 0.0d0
+               do j = 1, m
+                  aero_states(k,iCell)%awa%weight(1,j)%magnitude = awa_save%weight(1,present(j))%magnitude
+               end do
+            end if
+
+            call aero_state_sort(aero_states(k,iCell), aero_data, bin_grid=coag_grid)
+            aero_states(k,iCell)%aero_sorted%coag_kernel_min = k_min_lev(:,:,k)
+            aero_states(k,iCell)%aero_sorted%coag_kernel_max = k_max_lev(:,:,k)
+            aero_states(k,iCell)%aero_sorted%coag_kernel_bounds_valid = .true.
+            call mc_coag(COAG_KERNEL_TYPE_BROWN, env_state, aero_data, aero_states(k,iCell), del_t, n_samp, n_coag)
+            n_coag_total = n_coag_total + n_coag
+
+            ! drop the sorting structures and removal records PartMC built, to save memory and so
+            ! that particles can again be removed by index
+            aero_states(k,iCell)%aero_sorted = empty_sorted
+            aero_states(k,iCell)%valid_sort = .false.
+            call aero_info_array_zero(aero_states(k,iCell)%aero_info_array)
+
+            n1 = aero_state_n_part(aero_states(k,iCell))
+            if (pmc_mode == MODE_LAGR) then
+               aero_states(k,iCell)%awa = awa_save
+               pos(k,iCell) % n = 0
+               do j = 1, n1
+                  aero_states(k,iCell)%apa%particle(j)%weight_class = &
+                       present(aero_states(k,iCell)%apa%particle(j)%weight_class)
+                  xp(1) = huge(1.0_RKIND)
+                  ! most particles are untouched and keep their index
+                  if (j <= n0) then
+                     if (ids(j) == aero_states(k,iCell)%apa%particle(j)%id) xp = xs(:,j)
+                  end if
+                  if (xp(1) > 2.0_RKIND) then
+                     do jj = 1, n0
+                        if (ids(jj) == aero_states(k,iCell)%apa%particle(j)%id) then
+                           xp = xs(:,jj)
+                           exit
+                        end if
+                     end do
+                  end if
+                  if (xp(1) > 2.0_RKIND) then
+                     call random_in_cell(iCell, k, nCells, nEdgesOnCell, cellsOnCell, xp(1:4))
+                     xp(5:7) = xp(1:3)
+                     n_new = n_new + 1
+                  end if
+                  call pos_append(pos(k,iCell), xp)
+               end do
+               if (lagr_control) call lagr_rebalance(k, iCell, nCells, nEdgesOnCell, cellsOnCell)
+            else
+               cnt(:,k,iCell) = 0
+               do j = 1, n1
+                  c = aero_states(k,iCell)%apa%particle(j)%weight_class
+                  cnt(c,k,iCell) = cnt(c,k,iCell) + 1
+               end do
+            end if
+         end do
+      end do
+
+      if (mod(itimestep, 12) == 0) then
+         call mpas_dmpar_sum_int(domain % dminfo, n_coag_total, g_n_coag)
+         call mpas_dmpar_sum_int(domain % dminfo, n_new, g_n_new)
+         call mpas_log_write('PartMC coagulation step $i: events so far = $i, particles placed at random this step = $i', &
+                             intArgs=(/itimestep, g_n_coag, g_n_new/))
+      end if
+#endif
+
+   end subroutine atm_partmc_coagulation
 
 
    !> Solve a tridiagonal system (Thomas algorithm).

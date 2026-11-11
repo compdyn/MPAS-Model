@@ -800,7 +800,7 @@ endif
 endif
 
 ifneq "$(PARTMC)" ""
-	FCINCLUDES += -I$(PARTMC)
+	FCINCLUDES += -I$(PARTMC) -I$(shell nf-config --includedir)
 	LIBS += -L$(PARTMC) -lpartmc -L$(shell nf-config --prefix)/lib -lnetcdff -L$(NETCDF)/lib -lnetcdf
 	override CPPFLAGS += -DMPAS_PARTMC
 endif

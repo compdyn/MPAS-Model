@@ -1708,6 +1708,9 @@
                         <var name="pmc_ref" array_group="pmc" units="kg^{-1}"
                              description="PartMC: Eulerian reference number mixing ratio, never reset from particles"/>
 
+                        <var name="pmc_ref_src2" array_group="pmc" units="kg^{-1}"
+                             description="PartMC: Eulerian reference number mixing ratio of particles from the second source"/>
+
                         <var name="qc" array_group="moist" units="kg kg^{-1}"
                              description="Cloud water mixing ratio"
                              packages="bl_mynn_in;bl_ysu_in;cu_ntiedtke_in;mp_kessler_in;mp_thompson_in;mp_thompson_aers_in;mp_wsm6_in"/>
@@ -2095,6 +2098,9 @@
 
                         <var name="tend_pmc_ref" name_in_code="pmc_ref" array_group="pmc" units="m^{-3} s^{-1}"
                              description="Tendency of PartMC Eulerian reference number per unit volume divided by d(zeta)/dz"/>
+
+                        <var name="tend_pmc_ref_src2" name_in_code="pmc_ref_src2" array_group="pmc" units="m^{-3} s^{-1}"
+                             description="Tendency of PartMC second-source reference number per unit volume divided by d(zeta)/dz"/>
 
                         <var name="tend_qc" name_in_code="qc" array_group="moist" units="kg m^{-3} s^{-1}"
                              description="Tendency of cloud water mass per unit volume divided by d(zeta)/dz"

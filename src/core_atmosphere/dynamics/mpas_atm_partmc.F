@@ -4,6 +4,92 @@
 ! time-integrated transport fluxes are captured in atm_advance_scalars_mono_work,
 ! and a check that those fluxes reproduce the scalar update.
 
+! Variable-length byte-buffer exchange between neighbouring MPI tasks, used to
+! move PartMC particles across block boundaries. Kept in its own module so that
+! the "mpi" module used here (and by PartMC) does not clash with "mpi_f08" in MPAS.
+module mpas_atm_partmc_comm
+
+#ifdef _MPI
+   use mpi
+#endif
+
+   implicit none
+   private
+
+   public :: pmc_buf_t, pmc_buf_reserve, pmc_comm_exchange
+
+   type pmc_buf_t
+      character, allocatable :: data(:)
+      integer :: pos = 0
+   end type pmc_buf_t
+
+contains
+
+   !> Make sure the buffer can take n_extra more bytes.
+   subroutine pmc_buf_reserve(buf, n_extra)
+      type(pmc_buf_t), intent(inout) :: buf
+      integer, intent(in) :: n_extra
+      character, allocatable :: tmp(:)
+      integer :: n_new
+
+      if (.not. allocated(buf%data)) then
+         allocate(buf%data(max(4096, 2*n_extra)))
+         buf%pos = 0
+      else if (buf%pos + n_extra > size(buf%data)) then
+         n_new = max(2*size(buf%data), buf%pos + 2*n_extra)
+         allocate(tmp(n_new))
+         tmp(1:buf%pos) = buf%data(1:buf%pos)
+         call move_alloc(tmp, buf%data)
+      end if
+   end subroutine pmc_buf_reserve
+
+
+   !> Send send(i) to task nbr_rank(i) and receive one buffer from each neighbour.
+   !> On return recv(i)%data has exactly the bytes received and recv(i)%pos = 0.
+   subroutine pmc_comm_exchange(comm, nbr_rank, send, recv)
+      integer, intent(in) :: comm
+      integer, intent(in) :: nbr_rank(:)
+      type(pmc_buf_t), intent(inout) :: send(:)
+      type(pmc_buf_t), intent(inout) :: recv(:)
+
+#ifdef _MPI
+      integer, parameter :: tag = 7701
+      integer :: i, n, ierr
+      integer :: status(MPI_STATUS_SIZE)
+      integer, allocatable :: req(:)
+
+      n = size(nbr_rank)
+      allocate(req(n))
+      do i = 1, n
+         if (.not. allocated(send(i)%data)) then
+            allocate(send(i)%data(1))
+            send(i)%pos = 0
+         end if
+         call MPI_Isend(send(i)%data, send(i)%pos, MPI_CHARACTER, nbr_rank(i), tag, comm, req(i), ierr)
+      end do
+      do i = 1, n
+         call MPI_Probe(nbr_rank(i), tag, comm, status, ierr)
+         if (allocated(recv(i)%data)) deallocate(recv(i)%data)
+         call MPI_Get_count(status, MPI_CHARACTER, recv(i)%pos, ierr)
+         allocate(recv(i)%data(max(1, recv(i)%pos)))
+         call MPI_Recv(recv(i)%data, recv(i)%pos, MPI_CHARACTER, nbr_rank(i), tag, comm, status, ierr)
+      end do
+      call MPI_Waitall(n, req, MPI_STATUSES_IGNORE, ierr)
+      do i = 1, n
+         ! recv(i)%pos temporarily held the byte count; keep it in the array size
+         if (recv(i)%pos < size(recv(i)%data)) then
+            deallocate(recv(i)%data)
+            allocate(recv(i)%data(0))
+         end if
+         recv(i)%pos = 0
+         send(i)%pos = 0
+      end do
+#endif
+   end subroutine pmc_comm_exchange
+
+end module mpas_atm_partmc_comm
+
+
 module mpas_atm_partmc
 
    use mpas_kind_types
@@ -19,6 +105,8 @@ module mpas_atm_partmc
    use pmc_aero_weight_array
    use pmc_fractal
    use pmc_rand
+   use pmc_mpi
+   use mpas_atm_partmc_comm
 #endif
 
    implicit none
@@ -35,6 +123,14 @@ module mpas_atm_partmc
    type(aero_state_t), allocatable :: aero_states(:,:)
    !> Particles arriving in each cell during the current transport step.
    type(aero_state_t), allocatable :: aero_incoming(:,:)
+   !> MPI tasks that own cells in this block's halo.
+   integer, allocatable :: nbr_rank(:)
+   !> For each local cell, position of its owner in nbr_rank (0 if owned here).
+   integer, allocatable :: nbr_of_cell(:)
+   !> Map from global cell ID to local owned-cell index (0 if not owned here).
+   integer, allocatable :: global_to_local(:)
+   !> Send and receive buffers, one per neighbouring task.
+   type(pmc_buf_t), allocatable :: send_buf(:), recv_buf(:)
 #endif
 
 contains
@@ -186,8 +282,12 @@ contains
       real (kind=RKIND), dimension(:,:,:), pointer :: scalars
       real (kind=RKIND), dimension(:,:), pointer :: rho_zz, zz
       integer, pointer :: index_pmc_num, nCells, nCellsSolve, nVertLevels
-      integer :: iCell, k, i, stat
+      integer :: iCell, k, i, stat, rank
       character(len=32) :: envval
+      type (mpas_pool_type), pointer :: diag
+      type (field1DReal), pointer :: owner_field
+      real (kind=RKIND), dimension(:), pointer :: owner
+      integer, dimension(:), pointer :: indexToCellID
       real (kind=RKIND) :: num_conc
       type(aero_particle_t) :: particle
 
@@ -196,10 +296,6 @@ contains
       if (pmc_n_part <= 0) then
          call mpas_log_write('PartMC: particles disabled (set PMC_N_PART > 0 to enable)')
          return
-      end if
-      if (domain % dminfo % nprocs > 1) then
-         call mpas_log_write('PartMC: particle transport is not yet implemented for more than one MPI task', &
-                             messageType=MPAS_LOG_CRIT)
       end if
 
       block => domain % blocklist
@@ -232,6 +328,33 @@ contains
       call fractal_set_spherical(aero_data%fractal)
 
       call pmc_srand(20261111, domain % dminfo % my_proc_id)
+
+      ! find which task owns each halo cell by exchanging a field holding the owner's rank
+      call mpas_pool_get_subpool(block % structs, 'diag', diag)
+      call mpas_pool_get_field(diag, 'pmc_owner', owner_field)
+      call mpas_pool_get_array(diag, 'pmc_owner', owner)
+      call mpas_pool_get_array(mesh, 'indexToCellID', indexToCellID)
+      owner(:) = -1.0_RKIND
+      owner(1:nCellsSolve) = real(domain % dminfo % my_proc_id, kind=RKIND)
+      call mpas_dmpar_exch_halo_field(owner_field)
+      allocate(nbr_of_cell(nCells))
+      allocate(nbr_rank(0))
+      nbr_of_cell = 0
+      do iCell = nCellsSolve + 1, nCells
+         rank = nint(owner(iCell))
+         if (rank < 0) call mpas_log_write('PartMC: halo cell $i has no owner', intArgs=(/iCell/), messageType=MPAS_LOG_CRIT)
+         do i = 1, size(nbr_rank)
+            if (nbr_rank(i) == rank) exit
+         end do
+         if (i > size(nbr_rank)) nbr_rank = [nbr_rank, rank]
+         nbr_of_cell(iCell) = i
+      end do
+      allocate(send_buf(size(nbr_rank)), recv_buf(size(nbr_rank)))
+      allocate(global_to_local(maxval(indexToCellID(1:nCells))))
+      global_to_local = 0
+      do iCell = 1, nCellsSolve
+         global_to_local(indexToCellID(iCell)) = iCell
+      end do
 
       allocate(aero_states(nVertLevels, nCellsSolve))
       allocate(aero_incoming(nVertLevels, nCellsSolve))
@@ -283,11 +406,15 @@ contains
       integer, dimension(:,:), pointer :: edgesOnCell, cellsOnCell
       integer, dimension(:), pointer :: nEdgesOnCell
       integer, pointer :: nCellsSolve, nVertLevels
-      integer :: iCell, k, i, iEdge, n_face, i_face, n_rem, n_move, i_move, i_part, n_copy, i_copy
+      integer :: iCell, k, i, iEdge, n_face, i_face, n_rem, n_move, i_move, i_part
       integer :: dest_cell(MAX_FACES), dest_k(MAX_FACES)
-      real (kind=RKIND) :: prob(MAX_FACES), p_rem, ratio, w_src, w_dst
+      real (kind=RKIND) :: prob(MAX_FACES), p_rem, w_src
       real (kind=RKIND) :: c_part, err2, norm2, tot_part, tot_euler, vol
       integer :: n_part_total, n_part_min, n_part_max, n_moved
+      integer :: g_n_part_total, g_n_part_min, g_n_part_max, g_n_moved, g_n_cells
+      real (kind=RKIND) :: g_err2, g_norm2, g_tot_part, g_tot_euler
+      integer :: i_nbr, n_bytes, dest_global, comm
+      integer, dimension(:), pointer :: indexToCellID
       type(aero_particle_t) :: particle
 
       if (pmc_n_part <= 0) return
@@ -309,6 +436,7 @@ contains
       call mpas_pool_get_array(diag, 'pmc_flux_v', flux_v)
       call mpas_pool_get_array(diag, 'pmc_content_old', c_old)
       call mpas_pool_get_array(diag, 'pmc_content_new', c_new)
+      call mpas_pool_get_array(mesh, 'indexToCellID', indexToCellID)
 
       n_moved = 0
       do iCell = 1, nCellsSolve
@@ -347,25 +475,53 @@ contains
                n_move = rand_binomial(n_rem, min(1.0_RKIND, prob(i_face)/p_rem))
                p_rem = max(p_rem - prob(i_face), 1.0e-300_RKIND)
                if (n_move == 0) cycle
-               w_dst = aero_states(dest_k(i_face),dest_cell(i_face))%awa%weight(1,1)%magnitude &
-                     * cell_volume(areaCell(dest_cell(i_face)), rdzw(dest_k(i_face)), zz(dest_k(i_face),dest_cell(i_face)))
-               ratio = w_src / w_dst
+               i_nbr = nbr_of_cell(dest_cell(i_face))
                do i_move = 1, n_move
                   i_part = pmc_rand_int(n_rem)
                   particle = aero_states(k,iCell)%apa%particle(i_part)
                   call aero_state_remove_particle_no_info(aero_states(k,iCell), i_part)
                   n_rem = n_rem - 1
-                  n_copy = int(ratio)
-                  if (pmc_random() < ratio - real(n_copy, kind=RKIND)) n_copy = n_copy + 1
-                  do i_copy = 1, n_copy
-                     if (i_copy > 1) call aero_particle_new_id(particle)
-                     call aero_state_add_particle(aero_incoming(dest_k(i_face),dest_cell(i_face)), particle, aero_data)
-                  end do
+                  if (i_nbr == 0) then
+                     call deliver(particle, w_src, dest_k(i_face), dest_cell(i_face))
+                  else
+                     ! destination cell is owned by another task: pack for sending
+                     n_bytes = 2*pmc_mpi_pack_size_integer(1) + pmc_mpi_pack_size_real(w_src) &
+                             + pmc_mpi_pack_size_aero_particle(particle)
+                     call pmc_buf_reserve(send_buf(i_nbr), n_bytes)
+                     call pmc_mpi_pack_integer(send_buf(i_nbr)%data, send_buf(i_nbr)%pos, indexToCellID(dest_cell(i_face)))
+                     call pmc_mpi_pack_integer(send_buf(i_nbr)%data, send_buf(i_nbr)%pos, dest_k(i_face))
+                     call pmc_mpi_pack_real(send_buf(i_nbr)%data, send_buf(i_nbr)%pos, w_src)
+                     call pmc_mpi_pack_aero_particle(send_buf(i_nbr)%data, send_buf(i_nbr)%pos, particle)
+                  end if
                end do
                n_moved = n_moved + n_move
             end do
          end do
       end do
+
+      ! exchange particles that crossed into cells owned by other tasks
+      if (size(nbr_rank) > 0) then
+#ifdef MPAS_USE_MPI_F08
+         comm = domain % dminfo % comm % MPI_VAL
+#else
+         comm = domain % dminfo % comm
+#endif
+         call pmc_comm_exchange(comm, nbr_rank, send_buf, recv_buf)
+         do i_nbr = 1, size(nbr_rank)
+            do while (recv_buf(i_nbr)%pos < size(recv_buf(i_nbr)%data))
+               call pmc_mpi_unpack_integer(recv_buf(i_nbr)%data, recv_buf(i_nbr)%pos, dest_global)
+               call pmc_mpi_unpack_integer(recv_buf(i_nbr)%data, recv_buf(i_nbr)%pos, k)
+               call pmc_mpi_unpack_real(recv_buf(i_nbr)%data, recv_buf(i_nbr)%pos, w_src)
+               ! pmc_mpi_unpack_aero_particle allocates component without checking
+               if (allocated(particle%component)) deallocate(particle%component)
+               call pmc_mpi_unpack_aero_particle(recv_buf(i_nbr)%data, recv_buf(i_nbr)%pos, particle)
+               iCell = global_to_local(dest_global)
+               if (iCell == 0) call mpas_log_write('PartMC: received particle for cell $i not owned here', &
+                                                   intArgs=(/dest_global/), messageType=MPAS_LOG_CRIT)
+               call deliver(particle, w_src, k, iCell)
+            end do
+         end do
+      end if
 
       ! merge arrivals, rebalance, and compare with the Eulerian field
       err2 = 0.0_RKIND
@@ -404,13 +560,47 @@ contains
       end do
 
       if (mod(itimestep, 12) == 0 .or. itimestep <= 2) then
+         call mpas_dmpar_sum_real(domain % dminfo, err2, g_err2)
+         call mpas_dmpar_sum_real(domain % dminfo, norm2, g_norm2)
+         call mpas_dmpar_sum_real(domain % dminfo, tot_part, g_tot_part)
+         call mpas_dmpar_sum_real(domain % dminfo, tot_euler, g_tot_euler)
+         call mpas_dmpar_sum_int(domain % dminfo, n_part_total, g_n_part_total)
+         call mpas_dmpar_sum_int(domain % dminfo, n_moved, g_n_moved)
+         call mpas_dmpar_sum_int(domain % dminfo, nCellsSolve*nVertLevels, g_n_cells)
+         call mpas_dmpar_min_int(domain % dminfo, n_part_min, g_n_part_min)
+         call mpas_dmpar_max_int(domain % dminfo, n_part_max, g_n_part_max)
          call mpas_log_write('PartMC particles step $i: L2 rel err = $r, total rel diff = $r, moved frac = $r', &
                              intArgs=(/itimestep/), &
-                             realArgs=(/sqrt(err2/norm2), (tot_part - tot_euler)/tot_euler, &
-                                        real(n_moved, kind=RKIND)/real(max(1,n_part_total), kind=RKIND)/))
+                             realArgs=(/sqrt(g_err2/g_norm2), (g_tot_part - g_tot_euler)/g_tot_euler, &
+                                        real(g_n_moved, kind=RKIND)/real(max(1,g_n_part_total), kind=RKIND)/))
          call mpas_log_write('PartMC particles step $i: n_part per cell mean/min/max = $i $i $i', &
-                             intArgs=(/itimestep, n_part_total/(nCellsSolve*nVertLevels), n_part_min, n_part_max/))
+                             intArgs=(/itimestep, g_n_part_total/g_n_cells, g_n_part_min, g_n_part_max/))
       end if
+
+   contains
+
+      !> Put a particle that represented w_from real particles into owned cell (k_to, cell_to),
+      !> duplicating or thinning it to match the weight there.
+      subroutine deliver(part, w_from, k_to, cell_to)
+         type(aero_particle_t), intent(inout) :: part
+         real (kind=RKIND), intent(in) :: w_from
+         integer, intent(in) :: k_to, cell_to
+         real (kind=RKIND) :: r
+         integer :: n, j
+
+         r = w_from / (aero_states(k_to,cell_to)%awa%weight(1,1)%magnitude &
+                       * cell_volume(areaCell(cell_to), rdzw(k_to), zz(k_to,cell_to)))
+         n = int(r)
+         if (pmc_random() < r - real(n, kind=RKIND)) n = n + 1
+         do j = 1, n
+            if (j > 1) call aero_particle_new_id(part)
+            call aero_state_add_particle(aero_incoming(k_to,cell_to), part, aero_data)
+         end do
+      end subroutine deliver
+#else
+   contains
+      subroutine deliver_unused()
+      end subroutine deliver_unused
 #endif
 
    end subroutine atm_partmc_particles_transport

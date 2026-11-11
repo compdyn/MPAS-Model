@@ -1944,6 +1944,9 @@
                 <var name="wwAvg" type="real" dimensions="nVertLevelsP1 nCells Time" units="kg m^{-2} s^{-1}"
                      description="time-averaged rho*omega/zz used in scalar transport"/>
 
+                <var name="pmc_owner" type="real" dimensions="nCells Time" units="-"
+                     description="PartMC: MPI task that owns each cell"/>
+
                 <var name="pmc_flux_h" type="real" dimensions="nVertLevels nEdges Time" units="m^{-1}"
                      description="PartMC: time-integrated horizontal number flux through each edge from monotonic scalar transport"/>
 

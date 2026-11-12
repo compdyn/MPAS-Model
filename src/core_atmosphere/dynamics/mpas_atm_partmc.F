@@ -256,6 +256,10 @@ module mpas_atm_partmc
    !> probability, vertical Courant number of rising air, share in rising air, number of
    !> adjacent removing layers, and the share in runs of 1, 2-3, 4-7 and 8 or more layers.
    real (kind=RKIND) :: wet_where(8) = 0.0_RKIND
+   !> Number removed from the reference (1) and expected from the particles present (2), by
+   !> class: runs of 1, 2-3, 4-7, 8+ removing layers; rising, sinking air; lowest layer of its
+   !> run, other layers.
+   real (kind=RKIND) :: wet_cls(2,8) = 0.0_RKIND
    !> Sulfate (mol) in particles removed by dry and wet deposition, by this task so far.
    real (kind=RKIND) :: part_s_removed = 0.0_RKIND
    !> Repeat sample cells' chemistry after another cell to check MOSAIC carries nothing over.
@@ -3032,8 +3036,8 @@ contains
       real (kind=RKIND), allocatable :: amount(:)
       type(env_state_t) :: env_state
       logical :: removed
-      integer :: k1, k2, n_run
-      real (kind=RKIND) :: amt, cn, wsum(8), g_wsum(8)
+      integer :: k1, k2, n_run, i_cls(3), ic
+      real (kind=RKIND) :: amt, cn, wsum(8), g_wsum(8), csum(16), g_csum(16), amt_p
 #ifdef MPAS_PARTMC_MOSAIC
       type(spec_file_t) :: file
       type(gas_state_t), save :: gas_wet
@@ -3133,14 +3137,28 @@ contains
             end if
             wet_where(4) = wet_where(4) + amt * real(n_run, kind=RKIND)
             if (n_run == 1) then
-               wet_where(5) = wet_where(5) + amt
+               i_cls(1) = 1
             else if (n_run <= 3) then
-               wet_where(6) = wet_where(6) + amt
+               i_cls(1) = 2
             else if (n_run <= 7) then
-               wet_where(7) = wet_where(7) + amt
+               i_cls(1) = 3
             else
-               wet_where(8) = wet_where(8) + amt
+               i_cls(1) = 4
             end if
+            wet_where(4 + i_cls(1)) = wet_where(4 + i_cls(1)) + amt
+            i_cls(2) = merge(5, 6, cn > 0.0_RKIND)
+            i_cls(3) = merge(7, 8, k == k1)
+            amt_p = 0.0_RKIND
+            if (pmc_n_part > 0 .and. pmc_mode == MODE_LAGR) then
+               do j = 1, pos(k,iCell) % n
+                  g = aero_states(k,iCell)%apa%particle(j)%weight_class
+                  amt_p = amt_p + p * lagr_w * 2.0_RKIND**(g - LAGR_G0)
+               end do
+            end if
+            do ic = 1, 3
+               wet_cls(1,i_cls(ic)) = wet_cls(1,i_cls(ic)) + amt
+               wet_cls(2,i_cls(ic)) = wet_cls(2,i_cls(ic)) + amt_p
+            end do
             do i_s = 1, 4
                scalars(idx(i_s),k,iCell) = scalars(idx(i_s),k,iCell) * (1.0_RKIND - p)
             end do
@@ -3197,6 +3215,15 @@ contains
                                 intArgs=(/itimestep/), &
                                 realArgs=(/g_wsum(1)/g_sums(1), g_wsum(2)/max(g_wsum(3), 1.0e-30_RKIND), &
                                            g_wsum(3)/g_sums(1), g_wsum(4)/g_sums(1), g_wsum(5:8)/g_sums(1)/))
+            csum = reshape(wet_cls, (/16/))
+            call mpas_dmpar_sum_real_array(domain % dminfo, 16, csum, g_csum)
+            call mpas_log_write('PartMC wet removal step $i: particles expected / reference by class: runs of 1, ' &
+                                // '2-3, 4-7, 8+ layers = $r $r $r $r; rising, sinking air = $r $r; lowest layer of ' &
+                                // 'its run, other layers = $r $r', intArgs=(/itimestep/), &
+                                realArgs=g_csum(2:16:2) / max(g_csum(1:15:2), 1.0e-30_RKIND))
+            call mpas_log_write('PartMC wet removal step $i: share of the reference removal: rising air = $r, ' &
+                                // 'lowest layer of its run = $r', intArgs=(/itimestep/), &
+                                realArgs=(/g_csum(9)/g_sums(1), g_csum(13)/g_sums(1)/))
          end if
       end if
 #endif

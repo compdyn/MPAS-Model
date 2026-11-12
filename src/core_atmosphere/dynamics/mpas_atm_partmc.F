@@ -2709,6 +2709,7 @@ contains
       integer :: kk, jc, n_test, g_n_test, i_box
       integer, dimension(:), pointer :: indexToCellID
       character(len=64) :: box_prefix
+      type(aero_data_t) :: aero_data_box
 
       if (.not. pmc_chem .or. pmc_n_part <= 0) return
 
@@ -2822,13 +2823,20 @@ contains
                end if
                if (i_box > 0) then
                   write(box_prefix, '(a,i0,a,i0)') 'box/c', box_id(i_box), '_k', k
-                  call output_state(trim(box_prefix) // '_pre', OUTPUT_TYPE_DIST, aero_data, aero_states(k,iCell), &
+                  ! PartMC's file format wants a name for each weight class
+                  aero_data_box = aero_data
+                  if (allocated(aero_data_box%weight_class_name)) deallocate(aero_data_box%weight_class_name)
+                  allocate(aero_data_box%weight_class_name(size(aero_states(k,iCell)%awa%weight, 2)))
+                  do j = 1, size(aero_data_box%weight_class_name)
+                     write(aero_data_box%weight_class_name(j), '(a,i0)') 'w', j
+                  end do
+                  call output_state(trim(box_prefix) // '_pre', OUTPUT_TYPE_DIST, aero_data_box, aero_states(k,iCell), &
                                     gas_data, gas_state, env_state, itimestep, env_state%elapsed_time, del_t, 1, &
                                     .false., .false., uuid)
                end if
                call mosaic_timestep(env_state, aero_data, aero_states(k,iCell), gas_data, gas_state, .false., uuid)
                if (i_box > 0) then
-                  call output_state(trim(box_prefix) // '_post', OUTPUT_TYPE_DIST, aero_data, aero_states(k,iCell), &
+                  call output_state(trim(box_prefix) // '_post', OUTPUT_TYPE_DIST, aero_data_box, aero_states(k,iCell), &
                                     gas_data, gas_state, env_state, itimestep, env_state%elapsed_time, del_t, 1, &
                                     .false., .false., uuid)
                end if

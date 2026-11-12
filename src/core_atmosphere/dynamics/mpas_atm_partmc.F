@@ -2743,7 +2743,7 @@ contains
                zalt_m = env_state%altitude
                gas_state%mix_rat = gas_mix(:,k,iCell)
                n_before = aero_state_n_part(aero_states(k,iCell))
-               if (pmc_chem_selftest .and. mod(iCell, 500) == 0 .and. mod(k, 9) == 1) then
+               if (pmc_chem_selftest .and. mod(iCell, 97) == 0 .and. mod(k, 9) == 1) then
                   state_pre = aero_states(k,iCell)
                   gas_pre = gas_state%mix_rat
                   rh_in = env_state%rel_humid
@@ -2756,7 +2756,7 @@ contains
                gas_mix(:,k,iCell) = gas_state%mix_rat
                n_cells = n_cells + 1
 
-               if (pmc_chem_selftest .and. mod(iCell, 500) == 0 .and. mod(k, 9) == 1) then
+               if (pmc_chem_selftest .and. mod(iCell, 97) == 0 .and. mod(k, 9) == 1) then
                   ! Repeat this cell's step from the saved state after MOSAIC has worked on a
                   ! different cell: MOSAIC keeps its working state in module variables, so this
                   ! checks that nothing carries over from one cell to the next.

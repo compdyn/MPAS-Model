@@ -229,9 +229,6 @@ module mpas_atm_partmc
    !> Cells (global cell ID and level) whose state is saved in PartMC's own file format before
    !> and after each chemistry step, for replaying the step with the standalone PartMC program.
    integer :: n_box = 0, box_id(16), box_k(16), box_steps = 60
-   !> Reallocate MOSAIC's working arrays before the step of a saved cell, so that nothing in
-   !> them is left from the cell before (a diagnostic for dependence on that).
-   logical :: box_reset = .false.
 #ifdef MPAS_PARTMC_MOSAIC
    type(gas_data_t) :: gas_data
 #endif
@@ -373,8 +370,6 @@ contains
          n_box = min(n_box, size(box_id))
          read(envval, *) (box_id(i), box_k(i), i = 1, n_box)
       end if
-      call get_environment_variable('PMC_CHEM_BOX_RESET', envval, status=stat)
-      if (stat == 0) box_reset = (trim(envval) /= '0')
       call get_environment_variable('PMC_CHEM_BOX_STEPS', envval, status=stat)
       if (stat == 0) read(envval, *) box_steps
       call get_environment_variable('PMC_GAS_DATA', envval, status=stat)
@@ -2723,7 +2718,6 @@ contains
       integer, dimension(:), pointer :: indexToCellID
       character(len=64) :: box_prefix
       type(aero_data_t) :: aero_data_box
-      external :: AllocateMemory, DeallocateMemory
 
       if (.not. pmc_chem .or. pmc_n_part <= 0) return
 
@@ -2847,10 +2841,6 @@ contains
                   call output_state(trim(box_prefix) // '_pre', OUTPUT_TYPE_DIST, aero_data_box, aero_states(k,iCell), &
                                     gas_data, gas_state, env_state, itimestep, env_state%elapsed_time, del_t, 1, &
                                     .false., .false., uuid)
-                  if (box_reset) then
-                     call DeallocateMemory()
-                     call AllocateMemory()
-                  end if
                end if
                call mosaic_timestep(env_state, aero_data, aero_states(k,iCell), gas_data, gas_state, .false., uuid)
                if (i_box > 0) then

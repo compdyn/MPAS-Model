@@ -219,7 +219,7 @@ module mpas_atm_partmc
    logical :: pmc_conv = .false.
    !> MOSAIC chemistry: switch, gas files, top altitude (m), per-cell gas mixing ratios (ppb)
    !> as (species, level, cell), and the initial global sulfur (mol).
-   logical :: pmc_mosaic = .false.
+   logical :: pmc_chem = .false.
    character(len=256) :: gas_data_file = 'gas_data.dat', gas_init_file = 'gas_init.dat'
    real (kind=RKIND) :: pmc_chem_top = 1.0e9_RKIND, chem_s0 = 0.0_RKIND
    real (kind=dp), allocatable :: gas_mix(:,:,:)
@@ -342,7 +342,7 @@ contains
       call get_environment_variable('PMC_LAGR_UCONST', envval, status=stat)
       if (stat == 0) lagr_u_const = (trim(envval) /= '0')
       call get_environment_variable('PMC_MOSAIC', envval, status=stat)
-      if (stat == 0) pmc_mosaic = (trim(envval) /= '0')
+      if (stat == 0) pmc_chem = (trim(envval) /= '0')
       call get_environment_variable('PMC_GAS_DATA', envval, status=stat)
       if (stat == 0) gas_data_file = envval
       call get_environment_variable('PMC_GAS_INIT', envval, status=stat)
@@ -2650,7 +2650,7 @@ contains
       real (kind=RKIND) :: qv, vol, sums(3), g_sums(3), t0, t1, t_local, t_max
       real (kind=dp) :: del_t, e_s
 
-      if (.not. pmc_mosaic .or. pmc_n_part <= 0) return
+      if (.not. pmc_chem .or. pmc_n_part <= 0) return
 
       call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
       call mpas_pool_get_subpool(domain % blocklist % structs, 'state', state)

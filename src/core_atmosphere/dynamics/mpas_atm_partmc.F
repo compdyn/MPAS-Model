@@ -1014,6 +1014,9 @@ contains
       ! 10 total from particles, 11 total reference, 12 one-step err2, 13 source-2 particles, 14 source-2 reference
       real (kind=RKIND) :: sums(16), g_sums(16), pruned, g_pruned
       real (kind=RKIND), allocatable :: err2_k(:), norm2_k(:), g_err2_k(:), g_norm2_k(:), mass_total(:)
+      real (kind=RKIND), allocatable :: lev_sums(:,:), g_lev_sums(:,:)
+      real (kind=RKIND) :: bias, bias_worst, bias_sigma, lev_all
+      integer :: k_bias
       logical :: do_diag
       type(aero_particle_t) :: particle
 
@@ -1112,6 +1115,8 @@ contains
       allocate(err2_k(nVertLevels), norm2_k(nVertLevels), g_err2_k(nVertLevels), g_norm2_k(nVertLevels))
       err2_k = 0.0_RKIND
       norm2_k = 0.0_RKIND
+      allocate(lev_sums(nVertLevels,3), g_lev_sums(nVertLevels,3))
+      lev_sums = 0.0_RKIND
       n_t = pmc_n_part / n_class
       do iCell = 1, nCellsSolve
          do k = 1, nVertLevels
@@ -1228,6 +1233,10 @@ contains
             sums(16) = sums(16) + (c2_part**2 - v2_part) / rho_zz_new(k,iCell) * zz(k,iCell) * vol
             err2_k(k) = err2_k(k) + (c_part - c_ref)**2 * vol
             norm2_k(k) = norm2_k(k) + c_ref**2 * vol
+            ! level totals of the particles and the reference, and the sampling variance of the first
+            lev_sums(k,1) = lev_sums(k,1) + c_part * zz(k,iCell) * vol
+            lev_sums(k,2) = lev_sums(k,2) + c_ref * zz(k,iCell) * vol
+            lev_sums(k,3) = lev_sums(k,3) + v_part * (zz(k,iCell) * vol)**2
          end do
       end do
 
@@ -1305,6 +1314,28 @@ contains
          end do
          call mpas_log_write('PartMC particles step $i: per-level L2 rel err mean = $r, worst = $r at level $i', &
                              intArgs=(/itimestep, k_worst/), realArgs=(/lev_mean, lev_worst/))
+         ! bias of each level's total against the reference, over levels holding at least 0.1% of
+         ! the total, with the sampling standard deviation of the worst one
+         call mpas_dmpar_sum_real_array(domain % dminfo, 3*nVertLevels, lev_sums, g_lev_sums)
+         lev_all = sum(g_lev_sums(:,2))
+         bias_worst = 0.0_RKIND
+         bias_sigma = 0.0_RKIND
+         k_bias = 0
+         do k = 1, nVertLevels
+            if (g_lev_sums(k,2) < 1.0e-3_RKIND*lev_all) cycle
+            bias = g_lev_sums(k,1)/g_lev_sums(k,2) - 1.0_RKIND
+            if (abs(bias) > abs(bias_worst)) then
+               bias_worst = bias
+               bias_sigma = sqrt(g_lev_sums(k,3))/g_lev_sums(k,2)
+               k_bias = k
+            end if
+            if (mod(itimestep, 60) == 0) then
+               call mpas_log_write('PartMC level step $i: level $i total rel diff = $r, share of total = $r', &
+                                   intArgs=(/itimestep, k/), realArgs=(/bias, g_lev_sums(k,2)/lev_all/))
+            end if
+         end do
+         call mpas_log_write('PartMC particles step $i: worst level total rel diff = $r at level $i, ' &
+                             // 'sampling std = $r', intArgs=(/itimestep, k_bias/), realArgs=(/bias_worst, bias_sigma/))
          allocate(mass_total(n_spec))
          call species_mass_totals(domain, mass_total)
          mass_dev = 0.0_RKIND

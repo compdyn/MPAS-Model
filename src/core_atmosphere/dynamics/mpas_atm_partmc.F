@@ -307,6 +307,14 @@ module mpas_atm_partmc
 
 contains
 
+   !> A name padded to the length PartMC reads from it.
+   function pad_name(name)
+      character(len=*), intent(in) :: name
+      character(len=AERO_SOURCE_NAME_LEN) :: pad_name
+      pad_name = name
+   end function pad_name
+
+
    subroutine read_settings()
       character(len=256) :: envval
       integer :: stat, i
@@ -881,13 +889,13 @@ contains
       call spec_file_read_aero_data(file, aero_data)
       call spec_file_close(file)
       call fractal_set_spherical(aero_data%fractal)
-      i_src = aero_data_source_by_name(aero_data, 'background')
-      i_src = aero_data_source_by_name(aero_data, 'blob')
+      i_src = aero_data_source_by_name(aero_data, pad_name('background'))
+      i_src = aero_data_source_by_name(aero_data, pad_name('blob'))
       if (n_class == 1) then
          i_src = aero_data_weight_class_by_name(aero_data, 'all')
       else
-         i_src = aero_data_weight_class_by_name(aero_data, 'background')
-         i_src = aero_data_weight_class_by_name(aero_data, 'blob')
+         i_src = aero_data_weight_class_by_name(aero_data, pad_name('background'))
+         i_src = aero_data_weight_class_by_name(aero_data, pad_name('blob'))
       end if
       n_spec = aero_data_n_spec(aero_data)
       i_so4 = aero_data_spec_by_name(aero_data, 'SO4')

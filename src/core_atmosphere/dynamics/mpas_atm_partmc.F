@@ -15,6 +15,8 @@
 !   PMC_KZ_MAX        peak of a prescribed vertical diffusivity profile (m^2/s, default 0 = no
 !                     vertical mixing); applied to the Eulerian scalars and, in lagrangian
 !                     mode, to the particles. PMC_KZ_TOP is the height where it reaches zero.
+!   PMC_CONV          1 = convective transport of tracers and particles with the cu_ntiedtke
+!                     scheme's mass fluxes (default 0)
 !   PMC_KZ_PHYS       1 = vertical mixing with the boundary-layer scheme's heat diffusivity
 !                     (kzh) in place of the prescribed profile (default 0)
 !   PMC_LAGR_SUBSTEPS lagrangian mode: trajectory sub-steps per model step (default 1)
@@ -157,6 +159,7 @@ module mpas_atm_partmc
 
    public :: atm_partmc_init, atm_partmc_check, atm_partmc_particles_init, atm_partmc_particles_transport, &
              atm_partmc_particles_to_scalar, atm_partmc_output, atm_partmc_vertical_mixing, &
+             atm_partmc_convection, &
              atm_partmc_coagulation
 
    integer, parameter :: MODE_FLUX = 1, MODE_LAGR = 2
@@ -199,6 +202,9 @@ module mpas_atm_partmc
    real (kind=RKIND) :: pmc_kz_max = 0.0_RKIND, pmc_kz_top = 12000.0_RKIND
    !> Vertical mixing with the boundary-layer scheme's diffusivity (kzh) instead of the test profile.
    logical :: pmc_kz_phys = .false.
+   !> Convective transport with the cumulus scheme's mass fluxes, and particle layer changes so far.
+   logical :: pmc_conv = .false.
+   integer :: n_conv = 0
    !> Lagrangian mode: horizontal velocity constant within each layer.
    logical :: lagr_u_const = .false.
    !> Lagrangian mode: velocity from each cell's own mass fluxes.
@@ -307,6 +313,8 @@ contains
       if (stat == 0) read(envval, *) lagr_flux_vel
       call get_environment_variable('PMC_LAGR_UCONST', envval, status=stat)
       if (stat == 0) lagr_u_const = (trim(envval) /= '0')
+      call get_environment_variable('PMC_CONV', envval, status=stat)
+      if (stat == 0) pmc_conv = (trim(envval) /= '0')
       call get_environment_variable('PMC_KZ_PHYS', envval, status=stat)
       if (stat == 0) pmc_kz_phys = (trim(envval) /= '0')
       call get_environment_variable('PMC_LAGR_SUBSTEPS', envval, status=stat)
@@ -2174,41 +2182,7 @@ contains
             tmat(:,j) = tmat(:,j) / sum(tmat(:,j))
          end do
 
-         do k = 1, nz
-            if (tmat(k,k) >= 1.0_RKIND) cycle
-            do j = pos(k,iCell) % n, 1, -1
-               u = pmc_random()
-               ! try the particle's own layer first, since that is the usual outcome
-               if (u < tmat(k,k)) cycle
-               cum = tmat(k,k)
-               do kk = 1, nz
-                  if (kk == k) cycle
-                  cum = cum + tmat(kk,k)
-                  if (u < cum) exit
-               end do
-               kk = min(kk, nz)
-               if (kk == k) cycle
-               particle = aero_states(k,iCell)%apa%particle(j)
-               xp = pos(k,iCell) % x(:,j)
-               xp(4) = zf(kk) + pmc_random()*(zf(kk+1) - zf(kk))
-               call aero_state_remove_particle_no_info(aero_states(k,iCell), j)
-               call pos_remove(pos(k,iCell), j)
-               call aero_state_add_particle(aero_incoming(kk,iCell), particle, aero_data)
-               call pos_append(pos_in(kk,iCell), xp)
-               n_mixed = n_mixed + 1
-            end do
-         end do
-         do k = 1, nz
-            do j = 1, pos_in(k,iCell) % n
-               call aero_state_add_particle(aero_states(k,iCell), aero_incoming(k,iCell)%apa%particle(j), aero_data)
-               call pos_append(pos(k,iCell), pos_in(k,iCell) % x(:,j))
-            end do
-            if (pos_in(k,iCell) % n > 0) then
-               pos_in(k,iCell) % n = 0
-               call aero_state_zero(aero_incoming(k,iCell))
-            end if
-            if (lagr_control) call lagr_rebalance(k, iCell, nCells, nEdgesOnCell, cellsOnCell)
-         end do
+         call column_jump(iCell, nz, tmat, n_mixed, nCells, nEdgesOnCell, cellsOnCell)
       end do
 
       call mpas_pool_get_field(state, 'scalars', scalars_field, 2)
@@ -2222,6 +2196,239 @@ contains
 #endif
 
    end subroutine atm_partmc_vertical_mixing
+
+
+   !> Move the particles of one column between layers: a particle in layer j goes to layer i
+   !> with probability tmat(i,j), to a random height in that layer (Lagrangian mode only).
+   subroutine column_jump(iCell, nz, tmat, n_jump, nCells, nEdgesOnCell, cellsOnCell)
+
+      integer, intent(in) :: iCell, nz, nCells
+      real (kind=RKIND), intent(in) :: tmat(nz,nz)
+      integer, intent(inout) :: n_jump
+      integer, intent(in) :: nEdgesOnCell(:), cellsOnCell(:,:)
+
+#ifdef MPAS_PARTMC
+      integer :: k, kk, j
+      real (kind=RKIND) :: u, cum, xp(NPOS)
+      type(aero_particle_t) :: particle
+
+      do k = 1, nz
+         if (tmat(k,k) >= 1.0_RKIND) cycle
+         do j = pos(k,iCell) % n, 1, -1
+            u = pmc_random()
+            ! try the particle's own layer first, since that is the usual outcome
+            if (u < tmat(k,k)) cycle
+            cum = tmat(k,k)
+            do kk = 1, nz
+               if (kk == k) cycle
+               cum = cum + tmat(kk,k)
+               if (u < cum) exit
+            end do
+            kk = min(kk, nz)
+            if (kk == k) cycle
+            particle = aero_states(k,iCell)%apa%particle(j)
+            xp = pos(k,iCell) % x(:,j)
+            xp(4) = zf(kk) + pmc_random()*(zf(kk+1) - zf(kk))
+            call aero_state_remove_particle_no_info(aero_states(k,iCell), j)
+            call pos_remove(pos(k,iCell), j)
+            call aero_state_add_particle(aero_incoming(kk,iCell), particle, aero_data)
+            call pos_append(pos_in(kk,iCell), xp)
+            n_jump = n_jump + 1
+         end do
+      end do
+      do k = 1, nz
+         do j = 1, pos_in(k,iCell) % n
+            call aero_state_add_particle(aero_states(k,iCell), aero_incoming(k,iCell)%apa%particle(j), aero_data)
+            call pos_append(pos(k,iCell), pos_in(k,iCell) % x(:,j))
+         end do
+         if (pos_in(k,iCell) % n > 0) then
+            pos_in(k,iCell) % n = 0
+            call aero_state_zero(aero_incoming(k,iCell))
+         end if
+         if (lagr_control) call lagr_rebalance(k, iCell, nCells, nEdgesOnCell, cellsOnCell)
+      end do
+#endif
+
+   end subroutine column_jump
+
+
+   !> Convective transport of the tracers and particles with the cumulus scheme's mass fluxes.
+   !>
+   !> Each column gets a transfer matrix for the step from a bulk-plume picture: every layer
+   !> gives air to the updraft and the downdraft at their entrainment rates; that air leaves
+   !> the plume in the layers above (below) in proportion to the plume's detrainment there;
+   !> and the environment moves between neighbouring layers to balance the plumes' mass flux
+   !> (compensating subsidence). Entrainment is the scheme's detrainment plus the change of
+   !> the mass flux across the layer, so every layer's air mass is unchanged and a uniform
+   !> mixing ratio stays uniform. The matrix is applied to the Eulerian scalars and, in
+   !> Lagrangian mode, sampled by the particles.
+   subroutine atm_partmc_convection(domain, itimestep)
+
+      type (domain_type), intent(inout) :: domain
+      integer, intent(in) :: itimestep
+
+#ifdef MPAS_PARTMC
+      type (mpas_pool_type), pointer :: mesh, state, diag_physics
+      type (field3DReal), pointer :: scalars_field
+      real (kind=RKIND), dimension(:,:,:), pointer :: scalars
+      real (kind=RKIND), dimension(:,:), pointer :: rho_zz, cu_mfu, cu_mfd, cu_ude, cu_dde
+      real (kind=RKIND), dimension(:), pointer :: rdzw
+      real (kind=RKIND), pointer :: config_dt
+      integer, dimension(:,:), pointer :: cellsOnCell
+      integer, dimension(:), pointer :: nEdgesOnCell
+      integer, pointer :: nCells, nCellsSolve, nVertLevels, index_pmc_num, index_pmc_num2, index_ref, index_src2
+      integer :: iCell, k, j, i_s, nz, idx(4), n_sub, i_sub, n_col, g_n_col, g_n_conv
+      real (kind=RKIND), allocatable :: m(:), mu_top(:), mu_bot(:), dn_top(:), dn_bot(:), e_u(:), d_u(:), &
+                                        e_d(:), d_d(:), f_u(:), f_d(:), s_top(:), out(:), tsub(:,:), tmat(:,:), &
+                                        tnew(:,:), col(:)
+      real (kind=RKIND) :: dt, pass, o_max, g_o_max
+      real (kind=RKIND), save :: o_max_seen = 0.0_RKIND
+
+      if (.not. pmc_conv) return
+
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'state', state)
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'diag_physics', diag_physics)
+      call mpas_pool_get_config(domain % blocklist % configs, 'config_dt', config_dt)
+      call mpas_pool_get_dimension(mesh, 'nCells', nCells)
+      call mpas_pool_get_dimension(mesh, 'nCellsSolve', nCellsSolve)
+      call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
+      call mpas_pool_get_dimension(state, 'index_pmc_num', index_pmc_num)
+      call mpas_pool_get_dimension(state, 'index_pmc_num2', index_pmc_num2)
+      call mpas_pool_get_dimension(state, 'index_pmc_ref', index_ref)
+      call mpas_pool_get_dimension(state, 'index_pmc_ref_src2', index_src2)
+      call mpas_pool_get_array(mesh, 'rdzw', rdzw)
+      call mpas_pool_get_array(mesh, 'nEdgesOnCell', nEdgesOnCell)
+      call mpas_pool_get_array(mesh, 'cellsOnCell', cellsOnCell)
+      call mpas_pool_get_array(state, 'scalars', scalars, 2)
+      call mpas_pool_get_array(state, 'rho_zz', rho_zz, 2)
+      nullify(cu_mfu)
+      call mpas_pool_get_array(diag_physics, 'cu_mfu', cu_mfu)
+      call mpas_pool_get_array(diag_physics, 'cu_mfd', cu_mfd)
+      call mpas_pool_get_array(diag_physics, 'cu_ude', cu_ude)
+      call mpas_pool_get_array(diag_physics, 'cu_dde', cu_dde)
+      if (.not. associated(cu_mfu)) then
+         call mpas_log_write('PartMC: PMC_CONV needs the cu_ntiedtke convection scheme', messageType=MPAS_LOG_CRIT)
+      end if
+      idx = (/ index_pmc_num, index_pmc_num2, index_ref, index_src2 /)
+      nz = nVertLevels
+      allocate(m(nz), mu_top(nz), mu_bot(nz), dn_top(nz), dn_bot(nz), e_u(nz), d_u(nz), e_d(nz), d_d(nz), &
+               f_u(nz), f_d(nz), s_top(nz), out(nz), tsub(nz,nz), tmat(nz,nz), tnew(nz,nz), col(nz))
+      n_col = 0
+      o_max = 0.0_RKIND
+
+      do iCell = 1, nCellsSolve
+         if (maxval(cu_mfu(:,iCell)) <= 1.0e-8_RKIND) cycle
+         n_col = n_col + 1
+         do k = 1, nz
+            m(k) = rho_zz(k,iCell) / rdzw(k)
+            mu_top(k) = max(0.0_RKIND, cu_mfu(k,iCell))
+            dn_top(k) = max(0.0_RKIND, -cu_mfd(k,iCell))
+         end do
+         mu_top(nz) = 0.0_RKIND
+         dn_top(nz) = 0.0_RKIND
+         mu_bot(1) = 0.0_RKIND
+         dn_bot(1) = 0.0_RKIND
+         mu_bot(2:nz) = mu_top(1:nz-1)
+         dn_bot(2:nz) = dn_top(1:nz-1)
+         do k = 1, nz
+            ! updraft: in at the bottom, out at the top
+            d_u(k) = max(0.0_RKIND, cu_ude(k,iCell))
+            e_u(k) = mu_top(k) - mu_bot(k) + d_u(k)
+            if (e_u(k) < 0.0_RKIND) then
+               d_u(k) = d_u(k) - e_u(k)
+               e_u(k) = 0.0_RKIND
+            end if
+            pass = mu_bot(k) + e_u(k)
+            f_u(k) = 1.0_RKIND
+            if (pass > 0.0_RKIND) f_u(k) = min(1.0_RKIND, d_u(k)/pass)
+            ! downdraft: in at the top, out at the bottom
+            d_d(k) = max(0.0_RKIND, cu_dde(k,iCell))
+            e_d(k) = dn_bot(k) - dn_top(k) + d_d(k)
+            if (e_d(k) < 0.0_RKIND) then
+               d_d(k) = d_d(k) - e_d(k)
+               e_d(k) = 0.0_RKIND
+            end if
+            pass = dn_top(k) + e_d(k)
+            f_d(k) = 1.0_RKIND
+            if (pass > 0.0_RKIND) f_d(k) = min(1.0_RKIND, d_d(k)/pass)
+            ! environment mass flux through the top of the layer, upward positive
+            s_top(k) = dn_top(k) - mu_top(k)
+         end do
+
+         ! fraction of each layer that leaves it in the step sets the number of sub-steps
+         do k = 1, nz
+            out(k) = e_u(k) + e_d(k) + max(0.0_RKIND, s_top(k))
+            if (k > 1) out(k) = out(k) + max(0.0_RKIND, -s_top(k-1))
+            out(k) = out(k) * config_dt / m(k)
+         end do
+         o_max = max(o_max, maxval(out))
+         n_sub = max(1, ceiling(maxval(out) / 0.5_RKIND))
+         dt = config_dt / real(n_sub, kind=RKIND)
+
+         ! one sub-step: column j holds where the air of layer j goes
+         tsub = 0.0_RKIND
+         do j = 1, nz
+            tsub(j,j) = 1.0_RKIND - out(j)/real(n_sub, kind=RKIND)
+            if (e_u(j) > 0.0_RKIND) then
+               pass = e_u(j) * dt / m(j)
+               do k = j, nz
+                  tsub(k,j) = tsub(k,j) + pass*f_u(k)
+                  pass = pass*(1.0_RKIND - f_u(k))
+                  if (pass <= 0.0_RKIND) exit
+               end do
+            end if
+            if (e_d(j) > 0.0_RKIND) then
+               pass = e_d(j) * dt / m(j)
+               do k = j, 1, -1
+                  tsub(k,j) = tsub(k,j) + pass*f_d(k)
+                  pass = pass*(1.0_RKIND - f_d(k))
+                  if (pass <= 0.0_RKIND) exit
+               end do
+            end if
+            if (j < nz) then
+               if (s_top(j) > 0.0_RKIND) tsub(j+1,j) = tsub(j+1,j) + s_top(j)*dt/m(j)
+            end if
+            if (j > 1) then
+               if (s_top(j-1) < 0.0_RKIND) tsub(j-1,j) = tsub(j-1,j) - s_top(j-1)*dt/m(j)
+            end if
+         end do
+         tmat = tsub
+         do i_sub = 2, n_sub
+            tnew = matmul(tsub, tmat)
+            tmat = tnew
+         end do
+
+         ! Eulerian scalars: the mass of tracer in layer i is the sum over j of tmat(i,j) times
+         ! the mass that was in layer j
+         do i_s = 1, 4
+            col = scalars(idx(i_s),:,iCell) * m
+            scalars(idx(i_s),:,iCell) = matmul(tmat, col) / m
+         end do
+
+         if (pmc_n_part <= 0 .or. pmc_mode /= MODE_LAGR) cycle
+         do j = 1, nz
+            tmat(:,j) = max(0.0_RKIND, tmat(:,j))
+            tmat(:,j) = tmat(:,j) / sum(tmat(:,j))
+         end do
+         call column_jump(iCell, nz, tmat, n_conv, nCells, nEdgesOnCell, cellsOnCell)
+      end do
+
+      call mpas_pool_get_field(state, 'scalars', scalars_field, 2)
+      call mpas_dmpar_exch_halo_field(scalars_field)
+
+      call mpas_dmpar_max_real(domain % dminfo, o_max, g_o_max)
+      o_max_seen = max(o_max_seen, g_o_max)
+      if (mod(itimestep, 12) == 0) then
+         call mpas_dmpar_sum_int(domain % dminfo, n_col, g_n_col)
+         call mpas_dmpar_sum_int(domain % dminfo, n_conv, g_n_conv)
+         call mpas_log_write('PartMC convection step $i: convective columns = $i, particle layer changes so far = $i, ' &
+                             // 'largest layer outflow fraction so far = $r', &
+                             intArgs=(/itimestep, g_n_col, g_n_conv/), realArgs=(/o_max_seen/))
+      end if
+#endif
+
+   end subroutine atm_partmc_convection
 
 
    !> PartMC Brownian coagulation in every owned cell for one model time step.

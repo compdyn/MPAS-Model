@@ -442,6 +442,11 @@
  character(len=StrKIND):: errmsg
  integer:: errflg
 
+!convective mass fluxes and detrainment rates for tracer transport (PartMC coupling):
+ integer:: k
+ real(kind=RKIND),dimension(:,:),pointer:: cu_mfu,cu_mfd,cu_ude,cu_dde
+ real(kind=RKIND),dimension(:,:,:),allocatable:: cu_mfu_p,cu_mfd_p,cu_ude_p,cu_dde_p
+
 !-----------------------------------------------------------------------------------------------------------------
 !call mpas_log_write('')
 !call mpas_log_write('--- enter subroutine driver_convection:')
@@ -578,6 +583,8 @@
        call mpas_timer_stop('Tiedtke')
 
     case("cu_ntiedtke")
+       allocate(cu_mfu_p(ims:ime,kms:kme,jms:jme),cu_mfd_p(ims:ime,kms:kme,jms:jme), &
+                cu_ude_p(ims:ime,kms:kme,jms:jme),cu_dde_p(ims:ime,kms:kme,jms:jme))
        call mpas_timer_start('cu_ntiedtke')
        call cu_ntiedtke_driver( &
              pcps     = pres_hyd_p , p8w         = pres2_hyd_p ,                     &
@@ -603,9 +610,24 @@
              errmsg   = errmsg     , errflg      = errflg      ,                     &
              ids = ids , ide = ide , jds = jds , jde = jde , kds = kds , kde = kde , &
              ims = ims , ime = ime , jms = jms , jme = jme , kms = kds , kme = kme , &
-             its = its , ite = ite , jts = jts , jte = jte , kts = kts , kte = kte   &
+             its = its , ite = ite , jts = jts , jte = jte , kts = kts , kte = kte , &
+             cu_mfu = cu_mfu_p , cu_mfd = cu_mfd_p , cu_ude = cu_ude_p , cu_dde = cu_dde_p &
                               )
        call mpas_timer_stop('cu_ntiedtke')
+       call mpas_pool_get_array(diag_physics,'cu_mfu',cu_mfu)
+       call mpas_pool_get_array(diag_physics,'cu_mfd',cu_mfd)
+       call mpas_pool_get_array(diag_physics,'cu_ude',cu_ude)
+       call mpas_pool_get_array(diag_physics,'cu_dde',cu_dde)
+       do j = jts,jte
+       do k = kts,kte
+       do i = its,ite
+          cu_mfu(k,i) = cu_mfu_p(i,k,j)
+          cu_mfd(k,i) = cu_mfd_p(i,k,j)
+          cu_ude(k,i) = cu_ude_p(i,k,j)
+          cu_dde(k,i) = cu_dde_p(i,k,j)
+       enddo
+       enddo
+       enddo
 
     case default
 

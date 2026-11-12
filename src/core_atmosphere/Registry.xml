@@ -2821,6 +2821,22 @@
                      description="Planetary Boundary Layer (PBL) height"
                      packages="bl_mynn_in;bl_ysu_in;sfclayer"/>
 
+		<var name="cu_mfu" type="real" dimensions="nVertLevels nCells Time" units="kg m^{-2} s^{-1}"
+                     description="convective updraft mass flux at the top of each layer"
+                     packages="cu_ntiedtke_in"/>
+
+		<var name="cu_mfd" type="real" dimensions="nVertLevels nCells Time" units="kg m^{-2} s^{-1}"
+                     description="convective downdraft mass flux at the top of each layer (negative)"
+                     packages="cu_ntiedtke_in"/>
+
+		<var name="cu_ude" type="real" dimensions="nVertLevels nCells Time" units="kg m^{-2} s^{-1}"
+                     description="convective updraft detrainment rate of each layer"
+                     packages="cu_ntiedtke_in"/>
+
+		<var name="cu_dde" type="real" dimensions="nVertLevels nCells Time" units="kg m^{-2} s^{-1}"
+                     description="convective downdraft detrainment rate of each layer"
+                     packages="cu_ntiedtke_in"/>
+
 		<var name="kzh" type="real" dimensions="nVertLevels nCells Time" units="m^{2} s^{-1}"
                      description="vertical diffusion coefficient of potential temperature"
                      packages="bl_mynn_in;bl_ysu_in"/>

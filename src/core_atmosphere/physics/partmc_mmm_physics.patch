@@ -1,0 +1,80 @@
+diff --git a/cu_ntiedtke.F90 b/cu_ntiedtke.F90
+index e1d266d..72b4957 100644
+--- a/cu_ntiedtke.F90
++++ b/cu_ntiedtke.F90
+@@ -146,7 +146,8 @@
+ !!
+ !     level 1 subroutine 'cu_ntiedkte_run'
+       subroutine cu_ntiedtke_run(pu,pv,pt,pqv,pqc,pqi,pqvf,ptf,poz,pzz,pomg, &
+-     &         pap,paph,evap,hfx,zprecc,lndj,lq,km,km1,dt,dx,errmsg,errflg)
++     &         pap,paph,evap,hfx,zprecc,lndj,lq,km,km1,dt,dx,errmsg,errflg,  &
++     &         pmfu_o,pmfd_o,pude_o,pdde_o)
+ !=================================================================================================================
+ !     this is the interface between the model and the mass flux convection module
+ !     m.tiedtke      e.c.m.w.f.      1989
+@@ -203,8 +204,12 @@
+ !--- output arguments:
+       character(len=*),intent(out):: errmsg
+       integer,intent(out):: errflg
++!     updraft and downdraft mass fluxes at the top of each layer and detrainment rates of
++!     each layer (kg m-2 s-1), top-down, zero where there is no convection:
++      real(kind=kind_phys),intent(out),dimension(:,:),optional:: pmfu_o,pmfd_o,pude_o,pdde_o
+ 
+ !--- local variables and arrays:
++      real(kind=kind_phys),dimension(lq,km):: zude,zdde
+       logical,dimension(lq):: locum
+       integer:: i,j,k
+       integer,dimension(lq):: icbot,ictop,ktype
+@@ -280,6 +285,8 @@
+ !-----------------------------------------------------------------------
+ !*    2.     call 'cumastrn'(master-routine for cumulus parameterization)
+ !
++      zude = 0.
++      zdde = 0.
+       call cumastrn        &
+      &    (lq,       km,       km1,      km-1,    ztp1,  &
+      &     zqp1,     pum1,     pvm1,     pverv,   zqsat, &
+@@ -289,7 +296,24 @@
+      &     ktype,    icbot,    ictop,    ztu,     zqu,   &
+      &     zlu,      zlude,    zmfu,     zmfd,    zrain, &
+      &     pcte,     phhfl,    lndj,     pgeoh,   dx,    &
+-     &     scale_fac, scale_fac2)
++     &     scale_fac, scale_fac2, zude, zdde)
++
++      if(present(pmfu_o)) then
++        do k=1,km
++        do j=1,lq
++          pmfu_o(j,k) = 0.
++          pmfd_o(j,k) = 0.
++          pude_o(j,k) = 0.
++          pdde_o(j,k) = 0.
++          if(locum(j)) then
++            pmfu_o(j,k) = zmfu(j,k)
++            pmfd_o(j,k) = zmfd(j,k)
++            pude_o(j,k) = zude(j,k)
++            pdde_o(j,k) = zdde(j,k)
++          end if
++        end do
++        end do
++      end if
+ !
+ !     to include the cloud water and cloud ice detrained from convection
+ !
+@@ -348,7 +372,7 @@
+      &     ktype,    kcbot,    kctop,    ptu,      pqu,   &
+      &     plu,      plude,    pmfu,     pmfd,     prain, &
+      &     pcte,     phhfl,    lndj,     zgeoh,    dx,    &
+-     &     scale_fac,  scale_fac2)
++     &     scale_fac,  scale_fac2, pmfude_rate, pmfdde_rate)
+       implicit none
+ !
+ !***cumastrn*  master routine for cumulus massflux-scheme
+@@ -454,7 +478,7 @@
+       real(kind=kind_phys),dimension(klon):: zmfuvb,zsum12,zsum22
+       real(kind=kind_phys),dimension(klon):: zrfl
+       real(kind=kind_phys),dimension(klev):: pmean
+-      real(kind=kind_phys),dimension(klon,klev):: pmfude_rate,pmfdde_rate
++      real(kind=kind_phys),intent(inout),dimension(klon,klev):: pmfude_rate,pmfdde_rate
+       real(kind=kind_phys),dimension(klon,klev):: zdpmel
+       real(kind=kind_phys),dimension(klon,klev):: zmfuus,zmfdus,zuv2,ztenu,ztenv
+       real(kind=kind_phys),dimension(klon,klev):: ztenh,zqenh,zqsenh,ztd,zqd

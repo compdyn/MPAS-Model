@@ -30,7 +30,8 @@
                 ,ids,ide,jds,jde,kds,kde                 &
                 ,ims,ime,jms,jme,kms,kme                 &
                 ,its,ite,jts,jte,kts,kte                 &
-                ,errmsg,errflg)
+                ,errmsg,errflg                           &
+                ,cu_mfu,cu_mfd,cu_ude,cu_dde)
 !=================================================================================================================
 !-- u3d         3d u-velocity interpolated to theta points (m/s)
 !-- v3d         3d v-velocity interpolated to theta points (m/s)
@@ -116,6 +117,11 @@
     w
 
 !--- inout arguments:
+!--- optional output: updraft and downdraft mass fluxes at the top of each layer and the
+!    detrainment rates of each layer (kg m-2 s-1), in model level order:
+ real(kind=kind_phys),intent(out),dimension(ims:ime,kms:kme,jms:jme),optional:: cu_mfu,cu_mfd,cu_ude,cu_dde
+ real(kind=kind_phys),dimension(its:ite,kts:kte):: mfu_hv,mfd_hv,ude_hv,dde_hv
+
  logical,intent(inout),dimension(ims:ime,jms:jme):: cu_act_flag
 
  real(kind=kind_phys),intent(inout),dimension(ims:ime,jms:jme):: raincv, pratec
@@ -223,8 +229,22 @@
                      poz  = ghtl   , pzz  = ghti   , pomg   = omg     , pap    = prsl    , &
                      paph = prsi   , evap = qfx_hv , hfx    = hfx_hv  , zprecc = rn      , &
                      lndj = slimsk , lq   = im     , km     = kx      , km1    = kx1     , &
-                     dt   = delt   , dx   = dx_hv  , errmsg = errmsg  , errflg = errflg    &
+                     dt   = delt   , dx   = dx_hv  , errmsg = errmsg  , errflg = errflg  , &
+                     pmfu_o = mfu_hv , pmfd_o = mfd_hv , pude_o = ude_hv , pdde_o = dde_hv   &
                         )
+    if(present(cu_mfu)) then
+       ! the scheme's levels run from the top down; its downdraft detrainment at index
+       ! jk belongs to the layer above
+       do k = kts,kte
+          do i = its,ite
+             cu_mfu(i,k,j) = mfu_hv(i,kte+kts-k)
+             cu_mfd(i,k,j) = mfd_hv(i,kte+kts-k)
+             cu_ude(i,k,j) = ude_hv(i,kte+kts-k)
+             cu_dde(i,k,j) = 0.
+             if(k > kts) cu_dde(i,k,j) = dde_hv(i,kte+kts-k+1)
+          enddo
+       enddo
+    endif
 
     call cu_ntiedtke_post_run( &
                      its      = its         , ite      = ite         , kts      = kts         , kte      = kte         , &

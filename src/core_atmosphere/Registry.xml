@@ -1714,6 +1714,237 @@
                         <var name="pmc_ref_src2" array_group="pmc" units="kg^{-1}"
                              description="PartMC: Eulerian reference number mixing ratio of particles from the second source"/>
 
+                        <var name="gas_H2SO4" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas H2SO4: nmol per mol of dry air"/>
+
+                        <var name="gas_HNO3" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas HNO3: nmol per mol of dry air"/>
+
+                        <var name="gas_HCl" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas HCl: nmol per mol of dry air"/>
+
+                        <var name="gas_NH3" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas NH3: nmol per mol of dry air"/>
+
+                        <var name="gas_NO" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas NO: nmol per mol of dry air"/>
+
+                        <var name="gas_NO2" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas NO2: nmol per mol of dry air"/>
+
+                        <var name="gas_NO3" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas NO3: nmol per mol of dry air"/>
+
+                        <var name="gas_N2O5" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas N2O5: nmol per mol of dry air"/>
+
+                        <var name="gas_HONO" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas HONO: nmol per mol of dry air"/>
+
+                        <var name="gas_HNO4" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas HNO4: nmol per mol of dry air"/>
+
+                        <var name="gas_O3" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas O3: nmol per mol of dry air"/>
+
+                        <var name="gas_O1D" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas O1D: nmol per mol of dry air"/>
+
+                        <var name="gas_O3P" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas O3P: nmol per mol of dry air"/>
+
+                        <var name="gas_OH" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas OH: nmol per mol of dry air"/>
+
+                        <var name="gas_HO2" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas HO2: nmol per mol of dry air"/>
+
+                        <var name="gas_H2O2" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas H2O2: nmol per mol of dry air"/>
+
+                        <var name="gas_CO" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas CO: nmol per mol of dry air"/>
+
+                        <var name="gas_SO2" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas SO2: nmol per mol of dry air"/>
+
+                        <var name="gas_CH4" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas CH4: nmol per mol of dry air"/>
+
+                        <var name="gas_C2H6" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas C2H6: nmol per mol of dry air"/>
+
+                        <var name="gas_CH3O2" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas CH3O2: nmol per mol of dry air"/>
+
+                        <var name="gas_ETHP" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas ETHP: nmol per mol of dry air"/>
+
+                        <var name="gas_HCHO" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas HCHO: nmol per mol of dry air"/>
+
+                        <var name="gas_CH3OH" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas CH3OH: nmol per mol of dry air"/>
+
+                        <var name="gas_ANOL" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas ANOL: nmol per mol of dry air"/>
+
+                        <var name="gas_CH3OOH" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas CH3OOH: nmol per mol of dry air"/>
+
+                        <var name="gas_ETHOOH" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas ETHOOH: nmol per mol of dry air"/>
+
+                        <var name="gas_ALD2" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas ALD2: nmol per mol of dry air"/>
+
+                        <var name="gas_HCOOH" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas HCOOH: nmol per mol of dry air"/>
+
+                        <var name="gas_RCOOH" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas RCOOH: nmol per mol of dry air"/>
+
+                        <var name="gas_C2O3" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas C2O3: nmol per mol of dry air"/>
+
+                        <var name="gas_PAN" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas PAN: nmol per mol of dry air"/>
+
+                        <var name="gas_ARO1" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas ARO1: nmol per mol of dry air"/>
+
+                        <var name="gas_ARO2" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas ARO2: nmol per mol of dry air"/>
+
+                        <var name="gas_ALK1" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas ALK1: nmol per mol of dry air"/>
+
+                        <var name="gas_OLE1" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas OLE1: nmol per mol of dry air"/>
+
+                        <var name="gas_API1" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas API1: nmol per mol of dry air"/>
+
+                        <var name="gas_API2" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas API2: nmol per mol of dry air"/>
+
+                        <var name="gas_LIM1" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas LIM1: nmol per mol of dry air"/>
+
+                        <var name="gas_LIM2" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas LIM2: nmol per mol of dry air"/>
+
+                        <var name="gas_PAR" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas PAR: nmol per mol of dry air"/>
+
+                        <var name="gas_AONE" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas AONE: nmol per mol of dry air"/>
+
+                        <var name="gas_MGLY" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas MGLY: nmol per mol of dry air"/>
+
+                        <var name="gas_ETH" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas ETH: nmol per mol of dry air"/>
+
+                        <var name="gas_OLET" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas OLET: nmol per mol of dry air"/>
+
+                        <var name="gas_OLEI" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas OLEI: nmol per mol of dry air"/>
+
+                        <var name="gas_TOL" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas TOL: nmol per mol of dry air"/>
+
+                        <var name="gas_XYL" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas XYL: nmol per mol of dry air"/>
+
+                        <var name="gas_CRES" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas CRES: nmol per mol of dry air"/>
+
+                        <var name="gas_TO2" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas TO2: nmol per mol of dry air"/>
+
+                        <var name="gas_CRO" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas CRO: nmol per mol of dry air"/>
+
+                        <var name="gas_OPEN" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas OPEN: nmol per mol of dry air"/>
+
+                        <var name="gas_ONIT" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas ONIT: nmol per mol of dry air"/>
+
+                        <var name="gas_ROOH" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas ROOH: nmol per mol of dry air"/>
+
+                        <var name="gas_RO2" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas RO2: nmol per mol of dry air"/>
+
+                        <var name="gas_ANO2" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas ANO2: nmol per mol of dry air"/>
+
+                        <var name="gas_NAP" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas NAP: nmol per mol of dry air"/>
+
+                        <var name="gas_XO2" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas XO2: nmol per mol of dry air"/>
+
+                        <var name="gas_XPAR" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas XPAR: nmol per mol of dry air"/>
+
+                        <var name="gas_ISOP" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas ISOP: nmol per mol of dry air"/>
+
+                        <var name="gas_ISOPRD" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas ISOPRD: nmol per mol of dry air"/>
+
+                        <var name="gas_ISOPP" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas ISOPP: nmol per mol of dry air"/>
+
+                        <var name="gas_ISOPN" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas ISOPN: nmol per mol of dry air"/>
+
+                        <var name="gas_ISOPO2" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas ISOPO2: nmol per mol of dry air"/>
+
+                        <var name="gas_API" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas API: nmol per mol of dry air"/>
+
+                        <var name="gas_LIM" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas LIM: nmol per mol of dry air"/>
+
+                        <var name="gas_DMS" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas DMS: nmol per mol of dry air"/>
+
+                        <var name="gas_MSA" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas MSA: nmol per mol of dry air"/>
+
+                        <var name="gas_DMSO" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas DMSO: nmol per mol of dry air"/>
+
+                        <var name="gas_DMSO2" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas DMSO2: nmol per mol of dry air"/>
+
+                        <var name="gas_CH3SO2H" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas CH3SO2H: nmol per mol of dry air"/>
+
+                        <var name="gas_CH3SCH2OO" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas CH3SCH2OO: nmol per mol of dry air"/>
+
+                        <var name="gas_CH3SO2" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas CH3SO2: nmol per mol of dry air"/>
+
+                        <var name="gas_CH3SO3" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas CH3SO3: nmol per mol of dry air"/>
+
+                        <var name="gas_CH3SO2OO" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas CH3SO2OO: nmol per mol of dry air"/>
+
+                        <var name="gas_CH3SO2CH2OO" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas CH3SO2CH2OO: nmol per mol of dry air"/>
+
+                        <var name="gas_SULFHOX" array_group="gas" units="ppb"
+                             description="PartMC/MOSAIC gas SULFHOX: nmol per mol of dry air"/>
+
                         <var name="qc" array_group="moist" units="kg kg^{-1}"
                              description="Cloud water mixing ratio"
                              packages="bl_mynn_in;bl_ysu_in;cu_ntiedtke_in;mp_kessler_in;mp_thompson_in;mp_thompson_aers_in;mp_wsm6_in"/>
@@ -2134,6 +2365,237 @@
 
                         <var name="tend_pmc_ref_src2" name_in_code="pmc_ref_src2" array_group="pmc" units="m^{-3} s^{-1}"
                              description="Tendency of PartMC second-source reference number per unit volume divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_H2SO4" name_in_code="gas_H2SO4" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas H2SO4 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_HNO3" name_in_code="gas_HNO3" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas HNO3 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_HCl" name_in_code="gas_HCl" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas HCl times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_NH3" name_in_code="gas_NH3" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas NH3 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_NO" name_in_code="gas_NO" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas NO times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_NO2" name_in_code="gas_NO2" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas NO2 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_NO3" name_in_code="gas_NO3" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas NO3 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_N2O5" name_in_code="gas_N2O5" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas N2O5 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_HONO" name_in_code="gas_HONO" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas HONO times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_HNO4" name_in_code="gas_HNO4" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas HNO4 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_O3" name_in_code="gas_O3" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas O3 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_O1D" name_in_code="gas_O1D" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas O1D times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_O3P" name_in_code="gas_O3P" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas O3P times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_OH" name_in_code="gas_OH" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas OH times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_HO2" name_in_code="gas_HO2" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas HO2 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_H2O2" name_in_code="gas_H2O2" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas H2O2 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_CO" name_in_code="gas_CO" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas CO times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_SO2" name_in_code="gas_SO2" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas SO2 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_CH4" name_in_code="gas_CH4" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas CH4 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_C2H6" name_in_code="gas_C2H6" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas C2H6 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_CH3O2" name_in_code="gas_CH3O2" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas CH3O2 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_ETHP" name_in_code="gas_ETHP" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas ETHP times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_HCHO" name_in_code="gas_HCHO" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas HCHO times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_CH3OH" name_in_code="gas_CH3OH" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas CH3OH times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_ANOL" name_in_code="gas_ANOL" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas ANOL times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_CH3OOH" name_in_code="gas_CH3OOH" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas CH3OOH times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_ETHOOH" name_in_code="gas_ETHOOH" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas ETHOOH times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_ALD2" name_in_code="gas_ALD2" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas ALD2 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_HCOOH" name_in_code="gas_HCOOH" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas HCOOH times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_RCOOH" name_in_code="gas_RCOOH" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas RCOOH times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_C2O3" name_in_code="gas_C2O3" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas C2O3 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_PAN" name_in_code="gas_PAN" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas PAN times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_ARO1" name_in_code="gas_ARO1" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas ARO1 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_ARO2" name_in_code="gas_ARO2" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas ARO2 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_ALK1" name_in_code="gas_ALK1" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas ALK1 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_OLE1" name_in_code="gas_OLE1" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas OLE1 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_API1" name_in_code="gas_API1" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas API1 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_API2" name_in_code="gas_API2" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas API2 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_LIM1" name_in_code="gas_LIM1" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas LIM1 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_LIM2" name_in_code="gas_LIM2" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas LIM2 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_PAR" name_in_code="gas_PAR" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas PAR times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_AONE" name_in_code="gas_AONE" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas AONE times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_MGLY" name_in_code="gas_MGLY" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas MGLY times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_ETH" name_in_code="gas_ETH" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas ETH times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_OLET" name_in_code="gas_OLET" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas OLET times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_OLEI" name_in_code="gas_OLEI" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas OLEI times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_TOL" name_in_code="gas_TOL" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas TOL times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_XYL" name_in_code="gas_XYL" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas XYL times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_CRES" name_in_code="gas_CRES" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas CRES times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_TO2" name_in_code="gas_TO2" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas TO2 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_CRO" name_in_code="gas_CRO" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas CRO times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_OPEN" name_in_code="gas_OPEN" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas OPEN times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_ONIT" name_in_code="gas_ONIT" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas ONIT times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_ROOH" name_in_code="gas_ROOH" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas ROOH times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_RO2" name_in_code="gas_RO2" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas RO2 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_ANO2" name_in_code="gas_ANO2" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas ANO2 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_NAP" name_in_code="gas_NAP" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas NAP times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_XO2" name_in_code="gas_XO2" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas XO2 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_XPAR" name_in_code="gas_XPAR" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas XPAR times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_ISOP" name_in_code="gas_ISOP" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas ISOP times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_ISOPRD" name_in_code="gas_ISOPRD" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas ISOPRD times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_ISOPP" name_in_code="gas_ISOPP" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas ISOPP times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_ISOPN" name_in_code="gas_ISOPN" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas ISOPN times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_ISOPO2" name_in_code="gas_ISOPO2" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas ISOPO2 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_API" name_in_code="gas_API" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas API times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_LIM" name_in_code="gas_LIM" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas LIM times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_DMS" name_in_code="gas_DMS" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas DMS times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_MSA" name_in_code="gas_MSA" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas MSA times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_DMSO" name_in_code="gas_DMSO" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas DMSO times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_DMSO2" name_in_code="gas_DMSO2" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas DMSO2 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_CH3SO2H" name_in_code="gas_CH3SO2H" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas CH3SO2H times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_CH3SCH2OO" name_in_code="gas_CH3SCH2OO" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas CH3SCH2OO times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_CH3SO2" name_in_code="gas_CH3SO2" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas CH3SO2 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_CH3SO3" name_in_code="gas_CH3SO3" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas CH3SO3 times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_CH3SO2OO" name_in_code="gas_CH3SO2OO" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas CH3SO2OO times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_CH3SO2CH2OO" name_in_code="gas_CH3SO2CH2OO" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas CH3SO2CH2OO times dry air density divided by d(zeta)/dz"/>
+
+                        <var name="tend_gas_SULFHOX" name_in_code="gas_SULFHOX" array_group="gas" units="ppb kg m^{-3} s^{-1}"
+                             description="Tendency of gas SULFHOX times dry air density divided by d(zeta)/dz"/>
 
                         <var name="tend_qc" name_in_code="qc" array_group="moist" units="kg m^{-3} s^{-1}"
                              description="Tendency of cloud water mass per unit volume divided by d(zeta)/dz"

@@ -217,12 +217,12 @@ module mpas_atm_partmc
    logical :: pmc_kz_phys = .false.
    !> Convective transport with the cumulus scheme's mass fluxes, and particle layer changes so far.
    logical :: pmc_conv = .false.
-   !> MOSAIC chemistry: switch, gas files, top altitude (m), per-cell gas mixing ratios (ppb)
-   !> as (species, level, cell), and the initial global sulfur (mol).
+   !> MOSAIC chemistry: switch, gas files, top altitude (m), the model scalar index of each
+   !> PartMC gas species, and the initial global sulfur (mol).
    logical :: pmc_chem = .false.
    character(len=256) :: gas_data_file = 'gas_data.dat', gas_init_file = 'gas_init.dat'
    real (kind=RKIND) :: pmc_chem_top = 1.0e9_RKIND, chem_s0 = 0.0_RKIND
-   real (kind=dp), allocatable :: gas_mix(:,:,:)
+   integer, allocatable :: gas_idx(:)
    !> Repeat sample cells' chemistry after another cell to check MOSAIC carries nothing over.
    logical :: pmc_chem_selftest = .false.
 #ifdef MPAS_PARTMC_MOSAIC
@@ -2150,7 +2150,8 @@ contains
       integer, dimension(:,:), pointer :: cellsOnCell
       integer, dimension(:), pointer :: nEdgesOnCell
       integer, pointer :: nCells, nCellsSolve, nVertLevels, index_pmc_num, index_pmc_num2, index_ref, index_src2
-      integer :: iCell, k, kk, j, i_s, nz, idx(4)
+      integer :: iCell, k, kk, j, i_s, nz
+      integer, allocatable :: idx(:)
       real (kind=RKIND), allocatable :: d_mass(:), e(:), lower(:), diag_a(:), upper(:), rhs(:), sol(:), tmat(:,:)
       real (kind=RKIND) :: s_h, kz, rho_f, dz_c, u, cum, xp(NPOS)
       type(aero_particle_t) :: particle
@@ -2184,7 +2185,7 @@ contains
       call mpas_pool_get_array(mesh, 'cellsOnCell', cellsOnCell)
       call mpas_pool_get_array(state, 'scalars', scalars, 2)
       call mpas_pool_get_array(state, 'rho_zz', rho_zz, 2)
-      idx = (/ index_pmc_num, index_pmc_num2, index_ref, index_src2 /)
+      call mixed_scalars(state, idx)
       nz = nVertLevels
       allocate(d_mass(nz), e(nz+1), lower(nz), diag_a(nz), upper(nz), rhs(nz), sol(nz), tmat(nz,nz))
 
@@ -2211,7 +2212,7 @@ contains
          end do
 
          ! Eulerian scalars
-         do i_s = 1, 4
+         do i_s = 1, size(idx)
             rhs = scalars(idx(i_s),:,iCell)
             call tridiag_solve(nz, lower, diag_a, upper, rhs, sol)
             scalars(idx(i_s),:,iCell) = sol
@@ -2242,6 +2243,32 @@ contains
 #endif
 
    end subroutine atm_partmc_vertical_mixing
+
+
+   !> Indices of the scalars that vertical mixing and convection act on: the particle number
+   !> scalars and, when chemistry is on, the gas tracers.
+   subroutine mixed_scalars(state, idx)
+      type (mpas_pool_type), intent(in) :: state
+      integer, allocatable, intent(out) :: idx(:)
+      integer, pointer :: i1, i2, i3, i4, gas_start, gas_end
+      integer :: i, n_gas_t
+
+      call mpas_pool_get_dimension(state, 'index_pmc_num', i1)
+      call mpas_pool_get_dimension(state, 'index_pmc_num2', i2)
+      call mpas_pool_get_dimension(state, 'index_pmc_ref', i3)
+      call mpas_pool_get_dimension(state, 'index_pmc_ref_src2', i4)
+      n_gas_t = 0
+      if (pmc_chem) then
+         call mpas_pool_get_dimension(state, 'gas_start', gas_start)
+         call mpas_pool_get_dimension(state, 'gas_end', gas_end)
+         n_gas_t = gas_end - gas_start + 1
+      end if
+      allocate(idx(4 + n_gas_t))
+      idx(1:4) = (/ i1, i2, i3, i4 /)
+      do i = 1, n_gas_t
+         idx(4+i) = gas_start + i - 1
+      end do
+   end subroutine mixed_scalars
 
 
    !> Move the particles of one column between layers: a particle in layer j goes to layer i
@@ -2323,7 +2350,8 @@ contains
       integer, dimension(:,:), pointer :: cellsOnCell
       integer, dimension(:), pointer :: nEdgesOnCell
       integer, pointer :: nCells, nCellsSolve, nVertLevels, index_pmc_num, index_pmc_num2, index_ref, index_src2
-      integer :: iCell, k, j, i_s, nz, idx(4), n_sub, i_sub, n_col, g_n_col, g_n_conv
+      integer :: iCell, k, j, i_s, nz, n_sub, i_sub, n_col, g_n_col, g_n_conv
+      integer, allocatable :: idx(:)
       real (kind=RKIND), allocatable :: m(:), mu_top(:), mu_bot(:), dn_top(:), dn_bot(:), e_u(:), d_u(:), &
                                         e_d(:), d_d(:), f_u(:), f_d(:), s_top(:), out(:), tsub(:,:), tmat(:,:), &
                                         tnew(:,:), col(:)
@@ -2356,7 +2384,7 @@ contains
       if (.not. associated(cu_mfu)) then
          call mpas_log_write('PartMC: PMC_CONV needs the cu_ntiedtke convection scheme', messageType=MPAS_LOG_CRIT)
       end if
-      idx = (/ index_pmc_num, index_pmc_num2, index_ref, index_src2 /)
+      call mixed_scalars(state, idx)
       nz = nVertLevels
       allocate(m(nz), mu_top(nz), mu_bot(nz), dn_top(nz), dn_bot(nz), e_u(nz), d_u(nz), e_d(nz), d_d(nz), &
                f_u(nz), f_d(nz), s_top(nz), out(nz), tsub(nz,nz), tmat(nz,nz), tnew(nz,nz), col(nz))
@@ -2447,7 +2475,7 @@ contains
 
          ! Eulerian scalars: the mass of tracer in layer i is the sum over j of tmat(i,j) times
          ! the mass that was in layer j
-         do i_s = 1, 4
+         do i_s = 1, size(idx)
             col = scalars(idx(i_s),:,iCell) * m
             scalars(idx(i_s),:,iCell) = matmul(tmat, col) / m
          end do
@@ -2623,11 +2651,12 @@ contains
    !> Gas chemistry and gas-particle partitioning with MOSAIC (CBM-Z, ASTEM, MESA) in every
    !> owned cell, through PartMC's interface.
    !>
-   !> Each cell has its own gas state (mixing ratios in ppb), kept in this module. It starts
-   !> from one PartMC gas_init file everywhere and is NOT transported, mixed, emitted or
-   !> deposited yet: this step only puts the chemistry call in place. Temperature, pressure
-   !> and relative humidity come from the model state; latitude, longitude, altitude and time
-   !> are set for MOSAIC's solar zenith angle.
+   !> The gases are model scalars gas_<name> (nmol per mol of dry air), so they are advected by
+   !> the model and mixed and convected with the particle number scalars. They start from one
+   !> PartMC gas_init file everywhere; there are no gas emissions or deposition yet. MOSAIC
+   !> works with mixing ratios relative to moist air, so values are converted on the way in and
+   !> out. Temperature, pressure and relative humidity come from the model state; latitude,
+   !> longitude, altitude and time are set for MOSAIC's solar zenith angle.
    subroutine atm_partmc_chemistry(domain, itimestep)
 
 #ifdef MPAS_PARTMC_MOSAIC
@@ -2651,7 +2680,10 @@ contains
       type(env_state_t) :: env_state
       type(gas_state_t) :: gas_state
       character(len=PMC_UUID_LEN) :: uuid
-      real (kind=RKIND) :: qv, vol, sums(3), g_sums(3), t0, t1, t_local, t_max
+      real (kind=RKIND) :: qv, vol, sums(3), g_sums(3), t0, t1, t_local, t_max, moist_fac, ch4_min, ch4_max
+      real (kind=RKIND), dimension(:,:), pointer :: rho_zz
+      type (field3DReal), pointer :: scalars_field
+      integer, pointer :: i_ptr
       real (kind=dp) :: del_t, e_s, doy, decl, hour_angle, cos_ref, rh_in
       real (kind=dp), allocatable :: gas_a(:), gas_pre(:)
       type(aero_state_t) :: state_a, state_b, state_pre
@@ -2677,6 +2709,7 @@ contains
       call mpas_pool_get_array(mesh, 'zz', zz)
       call mpas_pool_get_array(state, 'scalars', scalars, 2)
       call mpas_pool_get_array(state, 'theta_m', theta_m, 2)
+      call mpas_pool_get_array(state, 'rho_zz', rho_zz, 2)
       call mpas_pool_get_array(diag, 'exner', exner)
       call mpas_pool_get_array(diag, 'pressure_p', pressure_p)
       call mpas_pool_get_array(diag, 'pressure_base', pressure_base)
@@ -2689,7 +2722,7 @@ contains
       env_state%start_time = real(hr*3600 + mi*60 + sc, kind=dp)
       env_state%elapsed_time = real(itimestep - 1, kind=dp) * del_t
 
-      if (.not. allocated(gas_mix)) then
+      if (.not. allocated(gas_idx)) then
          call spec_file_open(trim(gas_data_file), file)
          call spec_file_read_gas_data(file, gas_data)
          call spec_file_close(file)
@@ -2697,12 +2730,23 @@ contains
          call spec_file_read_gas_state(file, gas_data, gas_state)
          call spec_file_close(file)
          n_gas = gas_data_n_spec(gas_data)
-         allocate(gas_mix(n_gas, nVertLevels, nCellsSolve))
-         do iCell = 1, nCellsSolve
-            do k = 1, nVertLevels
-               gas_mix(:,k,iCell) = gas_state%mix_rat
-            end do
+         allocate(gas_idx(n_gas))
+         do j = 1, n_gas
+            nullify(i_ptr)
+            call mpas_pool_get_dimension(state, 'index_gas_' // trim(gas_data%name(j)), i_ptr)
+            if (.not. associated(i_ptr)) then
+               call mpas_log_write('PartMC: no model scalar for gas ' // trim(gas_data%name(j)), &
+                                   messageType=MPAS_LOG_CRIT)
+            end if
+            gas_idx(j) = i_ptr
          end do
+         if (maxval(scalars(gas_idx,:,1:nCellsSolve)) <= 0.0_RKIND) then
+            do iCell = 1, nCellsSolve
+               do k = 1, nVertLevels
+                  scalars(gas_idx,k,iCell) = gas_state%mix_rat
+               end do
+            end do
+         end if
          env_state%temp = 288.0d0
          env_state%pressure = 1.0d5
          env_state%rel_humid = 0.5d0
@@ -2736,12 +2780,14 @@ contains
             env_state%latitude = latCell(iCell) * 180.0d0 / pii
             env_state%longitude = lonCell(iCell) * 180.0d0 / pii
             env_state%altitude = 0.5d0*(zgrid(k,iCell) + zgrid(k+1,iCell))
+            ! moles of moist air per mole of dry air
+            moist_fac = 1.0_RKIND + rvord*qv
 
             if (env_state%altitude < pmc_chem_top) then
                rlat = latCell(iCell)
                rlon = lonCell(iCell)
                zalt_m = env_state%altitude
-               gas_state%mix_rat = gas_mix(:,k,iCell)
+               gas_state%mix_rat = scalars(gas_idx,k,iCell) / moist_fac
                n_before = aero_state_n_part(aero_states(k,iCell))
                if (pmc_chem_selftest .and. mod(iCell, 97) == 0 .and. mod(k, 9) == 1) then
                   state_pre = aero_states(k,iCell)
@@ -2753,7 +2799,7 @@ contains
                   call mpas_log_write('PartMC: MOSAIC changed the number of particles in a cell', &
                                       messageType=MPAS_LOG_CRIT)
                end if
-               gas_mix(:,k,iCell) = gas_state%mix_rat
+               scalars(gas_idx,k,iCell) = gas_state%mix_rat * moist_fac
                n_cells = n_cells + 1
 
                if (pmc_chem_selftest .and. mod(iCell, 97) == 0 .and. mod(k, 9) == 1) then
@@ -2779,7 +2825,7 @@ contains
                   rlat = latCell(jc)
                   rlon = lonCell(jc)
                   state_b = aero_states(kk,jc)
-                  gas_state%mix_rat = gas_mix(:,kk,jc)
+                  gas_state%mix_rat = scalars(gas_idx,kk,jc)
                   call mosaic_timestep(env_b, aero_data, state_b, gas_data, gas_state, .false., uuid)
                   env_b = env_state
                   env_b%rel_humid = rh_in
@@ -2801,8 +2847,8 @@ contains
 
             if (mod(itimestep, 12) == 0 .or. itimestep == 1) then
                ! sulfur (mol): gas, then particles
-               sums(1) = sums(1) + (gas_mix(i_so2,k,iCell) + gas_mix(i_h2so4,k,iCell)) * 1.0d-9 &
-                                   * env_state_air_molar_den(env_state) * vol
+               sums(1) = sums(1) + (scalars(gas_idx(i_so2),k,iCell) + scalars(gas_idx(i_h2so4),k,iCell)) * 1.0d-9 &
+                                   * rho_zz(k,iCell) * zz(k,iCell) * vol / 0.028966_RKIND
                do j = 1, aero_state_n_part(aero_states(k,iCell))
                   sums(2) = sums(2) + aero_states(k,iCell)%apa%particle(j)%vol(i_so4) &
                                       * aero_data%density(i_so4) / aero_data%molec_weight(i_so4) &
@@ -2817,6 +2863,8 @@ contains
          end do
       end do
       call cpu_time(t1)
+      call mpas_pool_get_field(state, 'scalars', scalars_field, 2)
+      call mpas_dmpar_exch_halo_field(scalars_field)
 
       if (pmc_chem_selftest) then
          call mpas_dmpar_max_real_array(domain % dminfo, 3, test_sums, g_test)
@@ -2831,6 +2879,14 @@ contains
          call mpas_dmpar_sum_int(domain % dminfo, n_cells, g_n_cells)
          call mpas_dmpar_max_real(domain % dminfo, t_local, t_max)
          if (chem_s0 <= 0.0_RKIND) chem_s0 = g_sums(1) + g_sums(2)
+         ! range of a long-lived gas, which transport alone must leave uniform
+         j = gas_idx(gas_data_spec_by_name(gas_data, 'CH4'))
+         t_local = minval(scalars(j,:,1:nCellsSolve))
+         call mpas_dmpar_min_real(domain % dminfo, t_local, ch4_min)
+         t_local = maxval(scalars(j,:,1:nCellsSolve))
+         call mpas_dmpar_max_real(domain % dminfo, t_local, ch4_max)
+         call mpas_log_write('PartMC chemistry step $i: CH4 tracer min = $r, max = $r ppb', &
+                             intArgs=(/itimestep/), realArgs=(/ch4_min, ch4_max/))
          call mpas_log_write('PartMC chemistry step $i: cells = $i, sulfur (mol) gas = $r, particles = $r, ' &
                              // 'total rel change = $r, particle water (kg) = $r, slowest task = $r s', &
                              intArgs=(/itimestep, g_n_cells/), &

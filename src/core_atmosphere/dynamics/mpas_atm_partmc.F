@@ -158,7 +158,7 @@ module mpas_atm_partmc
    use pmc_gas_data
    use pmc_gas_state
    use pmc_mosaic
-   use pmc_output, only : output_state, OUTPUT_TYPE_SINGLE
+   use pmc_output, only : output_state, OUTPUT_TYPE_DIST
 #endif
    use pmc_coag_kernel
    use pmc_aero_sorted
@@ -2822,13 +2822,13 @@ contains
                end if
                if (i_box > 0) then
                   write(box_prefix, '(a,i0,a,i0)') 'box/c', box_id(i_box), '_k', k
-                  call output_state(trim(box_prefix) // '_pre', OUTPUT_TYPE_SINGLE, aero_data, aero_states(k,iCell), &
+                  call output_state(trim(box_prefix) // '_pre', OUTPUT_TYPE_DIST, aero_data, aero_states(k,iCell), &
                                     gas_data, gas_state, env_state, itimestep, env_state%elapsed_time, del_t, 1, &
                                     .false., .false., uuid)
                end if
                call mosaic_timestep(env_state, aero_data, aero_states(k,iCell), gas_data, gas_state, .false., uuid)
                if (i_box > 0) then
-                  call output_state(trim(box_prefix) // '_post', OUTPUT_TYPE_SINGLE, aero_data, aero_states(k,iCell), &
+                  call output_state(trim(box_prefix) // '_post', OUTPUT_TYPE_DIST, aero_data, aero_states(k,iCell), &
                                     gas_data, gas_state, env_state, itimestep, env_state%elapsed_time, del_t, 1, &
                                     .false., .false., uuid)
                end if

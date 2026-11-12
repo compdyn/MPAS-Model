@@ -258,8 +258,9 @@ module mpas_atm_partmc
    real (kind=RKIND) :: wet_where(8) = 0.0_RKIND
    !> Number removed from the reference (1) and expected from the particles present (2), by
    !> class: runs of 1, 2-3, 4-7, 8+ removing layers; rising, sinking air; lowest layer of its
-   !> run, other layers.
-   real (kind=RKIND) :: wet_cls(2,8) = 0.0_RKIND
+   !> run, other layers; share of the horizontal inflow of air that comes from neighbours that
+   !> are not removing in this layer: none, up to half, more than half.
+   real (kind=RKIND) :: wet_cls(2,11) = 0.0_RKIND
    !> Sulfate (mol) in particles removed by dry and wet deposition, by this task so far.
    real (kind=RKIND) :: part_s_removed = 0.0_RKIND
    !> Repeat sample cells' chemistry after another cell to check MOSAIC carries nothing over.
@@ -3037,8 +3038,12 @@ contains
       real (kind=RKIND), allocatable :: amount(:)
       type(env_state_t) :: env_state
       logical :: removed
-      integer :: k1, k2, n_run, i_cls(3), ic
-      real (kind=RKIND) :: amt, cn, wsum(8), g_wsum(8), csum(16), g_csum(16), amt_p
+      integer :: k1, k2, n_run, i_cls(4), ic, iEdge, jCell
+      real (kind=RKIND) :: amt, cn, wsum(8), g_wsum(8), csum(22), g_csum(22), amt_p, f_in, f_clean, fl
+      real (kind=RKIND), dimension(:,:), pointer :: ruAvg, edgesOnCell_sign
+      real (kind=RKIND), dimension(:), pointer :: dvEdge
+      integer, dimension(:,:), pointer :: edgesOnCell
+      type (field2DReal), pointer :: rainprod_field
 #ifdef MPAS_PARTMC_MOSAIC
       type(spec_file_t) :: file
       type(gas_state_t), save :: gas_wet
@@ -3070,6 +3075,10 @@ contains
       call mpas_pool_get_array(state, 'theta_m', theta_m, 2)
       call mpas_pool_get_array(diag, 'exner', exner)
       call mpas_pool_get_array(diag, 'wwAvg', wwAvg)
+      call mpas_pool_get_array(diag, 'ruAvg', ruAvg)
+      call mpas_pool_get_array(mesh, 'edgesOnCell', edgesOnCell)
+      call mpas_pool_get_array(mesh, 'edgesOnCell_sign', edgesOnCell_sign)
+      call mpas_pool_get_array(mesh, 'dvEdge', dvEdge)
       nullify(rainprod)
       nullify(rainncv)
       call mpas_pool_get_array(diag_physics, 'rainprod', rainprod)
@@ -3079,6 +3088,9 @@ contains
                              messageType=MPAS_LOG_CRIT)
       end if
       idx = (/ index_pmc_num, index_pmc_num2, index_ref, index_src2 /)
+      ! neighbours' production is needed for the diagnostics
+      call mpas_pool_get_field(diag_physics, 'rainprod', rainprod_field)
+      call mpas_dmpar_exch_halo_field(rainprod_field)
 
       n_gas = 0
 #ifdef MPAS_PARTMC_MOSAIC
@@ -3149,6 +3161,25 @@ contains
             wet_where(4 + i_cls(1)) = wet_where(4 + i_cls(1)) + amt
             i_cls(2) = merge(5, 6, cn > 0.0_RKIND)
             i_cls(3) = merge(7, 8, k == k1)
+            ! horizontal inflow of air to the cell in this layer, and the part from neighbours
+            ! without production
+            f_in = 0.0_RKIND
+            f_clean = 0.0_RKIND
+            do ic = 1, nEdgesOnCell(iCell)
+               iEdge = edgesOnCell(ic,iCell)
+               jCell = cellsOnCell(ic,iCell)
+               fl = -edgesOnCell_sign(ic,iCell) * ruAvg(k,iEdge) * dvEdge(iEdge)
+               if (fl <= 0.0_RKIND) cycle
+               f_in = f_in + fl
+               if (rainprod(k,jCell) <= 0.0_RKIND) f_clean = f_clean + fl
+            end do
+            if (f_clean <= 0.0_RKIND) then
+               i_cls(4) = 9
+            else if (f_clean <= 0.5_RKIND * f_in) then
+               i_cls(4) = 10
+            else
+               i_cls(4) = 11
+            end if
             amt_p = 0.0_RKIND
             if (pmc_n_part > 0 .and. pmc_mode == MODE_LAGR) then
                do j = 1, pos(k,iCell) % n
@@ -3156,7 +3187,7 @@ contains
                   amt_p = amt_p + p * lagr_w * 2.0_RKIND**(g - LAGR_G0)
                end do
             end if
-            do ic = 1, 3
+            do ic = 1, 4
                wet_cls(1,i_cls(ic)) = wet_cls(1,i_cls(ic)) + amt
                wet_cls(2,i_cls(ic)) = wet_cls(2,i_cls(ic)) + amt_p
             end do
@@ -3220,8 +3251,8 @@ contains
                                 intArgs=(/itimestep/), &
                                 realArgs=(/g_wsum(1)/g_sums(1), g_wsum(2)/max(g_wsum(3), 1.0e-30_RKIND), &
                                            g_wsum(3)/g_sums(1), g_wsum(4)/g_sums(1), g_wsum(5:8)/g_sums(1)/))
-            csum = reshape(wet_cls, (/16/))
-            call mpas_dmpar_sum_real_array(domain % dminfo, 16, csum, g_csum)
+            csum = reshape(wet_cls, (/22/))
+            call mpas_dmpar_sum_real_array(domain % dminfo, 22, csum, g_csum)
             call mpas_log_write('PartMC wet removal step $i: particles expected / reference by class: runs of 1, ' &
                                 // '2-3, 4-7, 8+ layers = $r $r $r $r; rising, sinking air = $r $r; lowest layer of ' &
                                 // 'its run, other layers = $r $r', intArgs=(/itimestep/), &
@@ -3229,6 +3260,11 @@ contains
             call mpas_log_write('PartMC wet removal step $i: share of the reference removal: rising air = $r, ' &
                                 // 'lowest layer of its run = $r', intArgs=(/itimestep/), &
                                 realArgs=(/g_csum(9)/g_sums(1), g_csum(13)/g_sums(1)/))
+            call mpas_log_write('PartMC wet removal step $i: by share of horizontal inflow from neighbours that are ' &
+                                // 'not removing (none, up to half, more than half): particles expected / reference ' &
+                                // '= $r $r $r; share of the reference removal = $r $r $r', intArgs=(/itimestep/), &
+                                realArgs=(/g_csum(18:22:2) / max(g_csum(17:21:2), 1.0e-30_RKIND), &
+                                           g_csum(17:21:2) / g_sums(1)/))
          end if
       end if
 #endif

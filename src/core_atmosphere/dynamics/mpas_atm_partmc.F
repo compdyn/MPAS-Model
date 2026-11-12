@@ -2569,7 +2569,8 @@ contains
       type (field3DReal), pointer :: scalars_field
       real (kind=RKIND), dimension(:,:,:), pointer :: scalars
       real (kind=RKIND), dimension(:,:), pointer :: rho_zz, zz
-      real (kind=RKIND), dimension(:), pointer :: rdzw, areaCell, xland
+      real (kind=RKIND), dimension(:), pointer :: rdzw, areaCell
+      integer, dimension(:), pointer :: landmask
       real (kind=RKIND), pointer :: config_dt
       integer, dimension(:,:), pointer :: cellsOnCell
       integer, dimension(:), pointer :: nEdgesOnCell
@@ -2599,8 +2600,9 @@ contains
       call mpas_pool_get_array(mesh, 'cellsOnCell', cellsOnCell)
       call mpas_pool_get_array(state, 'scalars', scalars, 2)
       call mpas_pool_get_array(state, 'rho_zz', rho_zz, 2)
-      nullify(xland)
-      call mpas_pool_get_array(sfc_input, 'xland', xland)
+      ! landmask, not xland: the physics sets xland to land where there is sea ice
+      nullify(landmask)
+      call mpas_pool_get_array(sfc_input, 'landmask', landmask)
       idx = (/ index_pmc_num, index_pmc_num2, index_ref, index_src2 /)
       i_oc = aero_data_spec_by_name(aero_data, 'OC')
       i_bc = aero_data_spec_by_name(aero_data, 'BC')
@@ -2628,8 +2630,8 @@ contains
             end if
          end if
 
-         if (pmc_emit_flux > 0.0_RKIND .and. associated(xland)) then
-            if (nint(xland(iCell)) == 1) then
+         if (pmc_emit_flux > 0.0_RKIND .and. associated(landmask)) then
+            if (landmask(iCell) == 1) then
                ! spread over the lowest layers in proportion to their air mass
                m_emit = 0.0_RKIND
                do k = 1, pmc_emit_levels
@@ -2809,7 +2811,8 @@ contains
       type (field3DReal), pointer :: scalars_field
       real (kind=RKIND), dimension(:,:,:), pointer :: scalars
       real (kind=RKIND), dimension(:,:), pointer :: rho_zz, zz
-      real (kind=RKIND), dimension(:), pointer :: rdzw, areaCell, xland
+      real (kind=RKIND), dimension(:), pointer :: rdzw, areaCell
+      integer, dimension(:), pointer :: landmask
       real (kind=RKIND), pointer :: config_dt
       integer, pointer :: nCellsSolve
       integer :: iCell, k, j, n_gas, j_e, j_d
@@ -2838,8 +2841,9 @@ contains
       call mpas_pool_get_array(mesh, 'areaCell', areaCell)
       call mpas_pool_get_array(state, 'scalars', scalars, 2)
       call mpas_pool_get_array(state, 'rho_zz', rho_zz, 2)
-      nullify(xland)
-      call mpas_pool_get_array(sfc_input, 'xland', xland)
+      ! landmask, not xland: the physics sets xland to land where there is sea ice
+      nullify(landmask)
+      call mpas_pool_get_array(sfc_input, 'landmask', landmask)
 
       if (.not. allocated(gas_emitted)) then
          allocate(gas_emitted(n_gas), gas_deposited(n_gas), gas_content0(n_gas))
@@ -2879,8 +2883,8 @@ contains
             scalars(gas_idx,1,iCell) = scalars(gas_idx,1,iCell) - amount
             gas_deposited = gas_deposited + amount * 1.0e-9_RKIND * air1 * areaCell(iCell)
          end if
-         if (allocated(gas_emit_states) .and. associated(xland)) then
-            if (nint(xland(iCell)) == 1) then
+         if (allocated(gas_emit_states) .and. associated(landmask)) then
+            if (landmask(iCell) == 1) then
                air_emit = 0.0_RKIND
                do k = 1, pmc_emit_levels
                   air_emit = air_emit + rho_zz(k,iCell) / rdzw(k) / 0.028966_RKIND

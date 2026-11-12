@@ -18,6 +18,8 @@
 !   PMC_KZ_PHYS       1 = vertical mixing with the boundary-layer scheme's heat diffusivity
 !                     (kzh) in place of the prescribed profile (default 0)
 !   PMC_LAGR_SUBSTEPS lagrangian mode: trajectory sub-steps per model step (default 1)
+!   PMC_LAGR_UCONST   lagrangian mode: 1 = horizontal velocity constant within a layer instead of
+!                     linear between layer centres (default 0)
 !   PMC_TEST_WIND     lagrangian mode: replace the model winds by an analytic flow with a
 !                     12-day period: solid (tilted solid-body rotation) or deform
 !                     (Nair and Lauritzen 2010 reversing deformational flow)
@@ -192,6 +194,8 @@ module mpas_atm_partmc
    real (kind=RKIND) :: pmc_kz_max = 0.0_RKIND, pmc_kz_top = 12000.0_RKIND
    !> Vertical mixing with the boundary-layer scheme's diffusivity (kzh) instead of the test profile.
    logical :: pmc_kz_phys = .false.
+   !> Lagrangian mode: horizontal velocity constant within each layer.
+   logical :: lagr_u_const = .false.
    integer :: n_mixed = 0
    !> Brownian coagulation in every cell each step, and events so far.
    logical :: pmc_coag = .false.
@@ -286,6 +290,8 @@ contains
       if (stat == 0) read(envval, *) pmc_kz_max
       call get_environment_variable('PMC_KZ_TOP', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_kz_top
+      call get_environment_variable('PMC_LAGR_UCONST', envval, status=stat)
+      if (stat == 0) lagr_u_const = (trim(envval) /= '0')
       call get_environment_variable('PMC_KZ_PHYS', envval, status=stat)
       if (stat == 0) pmc_kz_phys = (trim(envval) /= '0')
       call get_environment_variable('PMC_LAGR_SUBSTEPS', envval, status=stat)
@@ -1711,6 +1717,12 @@ contains
          end if
          kf = find_level(zp)
          ff = (zp - zf(kf)) / (zf(kf+1) - zf(kf))
+         if (lagr_u_const) then
+            ! the layer's own velocity, whose divergence is what the layer's omega difference balances
+            k1 = kf
+            k2 = kf
+            f = 0.0_RKIND
+         end if
 
          vel = 0.0_RKIND
          omega = 0.0_RKIND

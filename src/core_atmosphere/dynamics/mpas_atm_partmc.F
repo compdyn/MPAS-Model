@@ -15,6 +15,8 @@
 !   PMC_KZ_MAX        peak of a prescribed vertical diffusivity profile (m^2/s, default 0 = no
 !                     vertical mixing); applied to the Eulerian scalars and, in lagrangian
 !                     mode, to the particles. PMC_KZ_TOP is the height where it reaches zero.
+!   PMC_KZ_PHYS       1 = vertical mixing with the boundary-layer scheme's heat diffusivity
+!                     (kzh) in place of the prescribed profile (default 0)
 !   PMC_LAGR_SUBSTEPS lagrangian mode: trajectory sub-steps per model step (default 1)
 !   PMC_TEST_WIND     lagrangian mode: replace the model winds by an analytic flow with a
 !                     12-day period: solid (tilted solid-body rotation) or deform
@@ -188,6 +190,8 @@ module mpas_atm_partmc
    integer :: n_thinned = 0, n_split = 0
    !> Test vertical mixing: peak diffusivity (m^2/s, 0 = off) and the height where it reaches zero (m).
    real (kind=RKIND) :: pmc_kz_max = 0.0_RKIND, pmc_kz_top = 12000.0_RKIND
+   !> Vertical mixing with the boundary-layer scheme's diffusivity (kzh) instead of the test profile.
+   logical :: pmc_kz_phys = .false.
    integer :: n_mixed = 0
    !> Brownian coagulation in every cell each step, and events so far.
    logical :: pmc_coag = .false.
@@ -282,6 +286,8 @@ contains
       if (stat == 0) read(envval, *) pmc_kz_max
       call get_environment_variable('PMC_KZ_TOP', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_kz_top
+      call get_environment_variable('PMC_KZ_PHYS', envval, status=stat)
+      if (stat == 0) pmc_kz_phys = (trim(envval) /= '0')
       call get_environment_variable('PMC_LAGR_SUBSTEPS', envval, status=stat)
       if (stat == 0) read(envval, *) lagr_substeps
       call get_environment_variable('PMC_N_CLASS', envval, status=stat)
@@ -1822,10 +1828,10 @@ contains
       integer, intent(in) :: itimestep
 
 #ifdef MPAS_PARTMC
-      type (mpas_pool_type), pointer :: mesh, state
+      type (mpas_pool_type), pointer :: mesh, state, diag_physics
       type (field3DReal), pointer :: scalars_field
       real (kind=RKIND), dimension(:,:,:), pointer :: scalars
-      real (kind=RKIND), dimension(:,:), pointer :: rho_zz, zz, zgrid
+      real (kind=RKIND), dimension(:,:), pointer :: rho_zz, zz, zgrid, kzh
       real (kind=RKIND), dimension(:), pointer :: rdzw
       real (kind=RKIND), pointer :: config_dt
       integer, dimension(:,:), pointer :: cellsOnCell
@@ -1836,7 +1842,17 @@ contains
       real (kind=RKIND) :: s_h, kz, rho_f, dz_c, u, cum, xp(NPOS)
       type(aero_particle_t) :: particle
 
-      if (pmc_kz_max <= 0.0_RKIND) return
+      if (pmc_kz_max <= 0.0_RKIND .and. .not. pmc_kz_phys) return
+
+      nullify(kzh)
+      if (pmc_kz_phys) then
+         call mpas_pool_get_subpool(domain % blocklist % structs, 'diag_physics', diag_physics)
+         call mpas_pool_get_array(diag_physics, 'kzh', kzh)
+         if (.not. associated(kzh)) then
+            call mpas_log_write('PartMC: PMC_KZ_PHYS needs a boundary-layer scheme that provides kzh', &
+                                messageType=MPAS_LOG_CRIT)
+         end if
+      end if
 
       call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
       call mpas_pool_get_subpool(domain % blocklist % structs, 'state', state)
@@ -1869,6 +1885,8 @@ contains
             s_h = zgrid(k,iCell) / pmc_kz_top
             kz = 0.0_RKIND
             if (s_h < 1.0_RKIND) kz = pmc_kz_max * 6.75_RKIND * s_h * (1.0_RKIND - s_h)**2
+            ! the scheme's kzh(k) is at the face below layer k
+            if (pmc_kz_phys) kz = kzh(k,iCell)
             rho_f = 0.5_RKIND*(rho_zz(k,iCell)*zz(k,iCell) + rho_zz(k-1,iCell)*zz(k-1,iCell))
             dz_c = 0.5_RKIND*(zgrid(k+1,iCell) - zgrid(k-1,iCell))
             e(k) = config_dt * rho_f * kz / dz_c

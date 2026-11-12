@@ -18,6 +18,9 @@
 !   PMC_KZ_PHYS       1 = vertical mixing with the boundary-layer scheme's heat diffusivity
 !                     (kzh) in place of the prescribed profile (default 0)
 !   PMC_LAGR_SUBSTEPS lagrangian mode: trajectory sub-steps per model step (default 1)
+!   PMC_LAGR_FLUXVEL  lagrangian mode: 1 = velocity built in each cell from its own edge and face
+!                     mass fluxes, so that its divergence is the model's discrete one, instead
+!                     of interpolating reconstructed cell-centre winds (default 0)
 !   PMC_LAGR_UCONST   lagrangian mode: 1 = horizontal velocity constant within a layer instead of
 !                     linear between layer centres (default 0)
 !   PMC_TEST_WIND     lagrangian mode: replace the model winds by an analytic flow with a
@@ -196,6 +199,8 @@ module mpas_atm_partmc
    logical :: pmc_kz_phys = .false.
    !> Lagrangian mode: horizontal velocity constant within each layer.
    logical :: lagr_u_const = .false.
+   !> Lagrangian mode: velocity from each cell's own mass fluxes.
+   logical :: lagr_flux_vel = .false.
    integer :: n_mixed = 0
    !> Brownian coagulation in every cell each step, and events so far.
    logical :: pmc_coag = .false.
@@ -290,6 +295,8 @@ contains
       if (stat == 0) read(envval, *) pmc_kz_max
       call get_environment_variable('PMC_KZ_TOP', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_kz_top
+      call get_environment_variable('PMC_LAGR_FLUXVEL', envval, status=stat)
+      if (stat == 0) lagr_flux_vel = (trim(envval) /= '0')
       call get_environment_variable('PMC_LAGR_UCONST', envval, status=stat)
       if (stat == 0) lagr_u_const = (trim(envval) /= '0')
       call get_environment_variable('PMC_KZ_PHYS', envval, status=stat)
@@ -998,7 +1005,7 @@ contains
       type (mpas_pool_type), pointer :: mesh, diag, state
       type (flux_set_t) :: fs(MAX_CLASS)
       real (kind=RKIND), dimension(:,:), pointer :: edgesOnCell_sign, zz, rho_zz_new, rho_zz_old
-      real (kind=RKIND), dimension(:,:), pointer :: ux, uy, uz, om, ruAvg, wwAvg
+      real (kind=RKIND), dimension(:,:), pointer :: ux, uy, uz, om, ruAvg, wwAvg, hdiv
       real (kind=RKIND), dimension(:,:,:), pointer :: scalars_new
       real (kind=RKIND), dimension(:), pointer :: invAreaCell, areaCell, rdzw, fzm, fzp
       real (kind=RKIND), pointer :: config_dt
@@ -1605,10 +1612,12 @@ contains
       !> Step-averaged transport velocity: Cartesian horizontal velocity at cell centres
       !> and d(zeta)/dt at cell faces, from the mass fluxes used for scalar transport.
       subroutine lagr_velocities()
-         type (field2DReal), pointer :: f_ux, f_uy, f_uz, f_om
+         type (field2DReal), pointer :: f_ux, f_uy, f_uz, f_om, f_div
          real (kind=RKIND), allocatable :: u_e(:,:), u_zonal(:,:), u_merid(:,:)
-         real (kind=RKIND) :: rho_e, rho_f, u_test, v_test
-         integer :: iEdge, c1, c2, kk, ic
+         real (kind=RKIND), dimension(:), pointer :: xEdge, yEdge, zEdge, dvEdge, areaCell_l
+         integer, dimension(:,:), pointer :: edgesOnCell_l
+         real (kind=RKIND) :: rho_e, rho_f, u_test, v_test, xe(3), flux, sgn
+         integer :: iEdge, c1, c2, kk, ic, je
 
          call mpas_pool_get_array(diag, 'ruAvg', ruAvg)
          call mpas_pool_get_array(diag, 'wwAvg', wwAvg)
@@ -1620,6 +1629,50 @@ contains
          uy => f_uy % array
          uz => f_uz % array
          om => f_om % array
+
+         if (lagr_flux_vel .and. lagr_wind == WIND_MODEL) then
+            ! Mass-flux vector and half the mass divergence of every layer of every cell, from the
+            ! cell's own edge fluxes: m(x) = M + (D/2)(x - x_c) has divergence D, and M is the
+            ! area-weighted reconstruction sum over edges of (x_e - x_c) * outward flux.
+            ! The vertical mass flux is kept at the faces.
+            call mpas_pool_get_field(diag, 'pmc_div', f_div)
+            hdiv => f_div % array
+            call mpas_pool_get_array(mesh, 'xEdge', xEdge)
+            call mpas_pool_get_array(mesh, 'yEdge', yEdge)
+            call mpas_pool_get_array(mesh, 'zEdge', zEdge)
+            call mpas_pool_get_array(mesh, 'dvEdge', dvEdge)
+            call mpas_pool_get_array(mesh, 'areaCell', areaCell_l)
+            call mpas_pool_get_array(mesh, 'edgesOnCell', edgesOnCell_l)
+            do ic = 1, nCellsSolve
+               ux(:,ic) = 0.0_RKIND
+               uy(:,ic) = 0.0_RKIND
+               uz(:,ic) = 0.0_RKIND
+               hdiv(:,ic) = 0.0_RKIND
+               do je = 1, nEdgesOnCell(ic)
+                  iEdge = edgesOnCell_l(je,ic)
+                  sgn = 1.0_RKIND
+                  if (cellsOnEdge(2,iEdge) == ic) sgn = -1.0_RKIND
+                  xe = (/ xEdge(iEdge), yEdge(iEdge), zEdge(iEdge) /)
+                  xe = radius * (xe / norm2(xe) - cxyz(:,ic))
+                  do kk = 1, nVertLevels
+                     flux = sgn * ruAvg(kk,iEdge) * dvEdge(iEdge) / areaCell_l(ic)
+                     ux(kk,ic) = ux(kk,ic) + xe(1)*flux
+                     uy(kk,ic) = uy(kk,ic) + xe(2)*flux
+                     uz(kk,ic) = uz(kk,ic) + xe(3)*flux
+                     hdiv(kk,ic) = hdiv(kk,ic) + 0.5_RKIND*flux
+                  end do
+               end do
+               om(1,ic) = 0.0_RKIND
+               om(nVertLevels+1,ic) = 0.0_RKIND
+               om(2:nVertLevels,ic) = wwAvg(2:nVertLevels,ic)
+            end do
+            call mpas_dmpar_exch_halo_field(f_ux)
+            call mpas_dmpar_exch_halo_field(f_uy)
+            call mpas_dmpar_exch_halo_field(f_uz)
+            call mpas_dmpar_exch_halo_field(f_om)
+            call mpas_dmpar_exch_halo_field(f_div)
+            return
+         end if
 
          allocate(u_e(nVertLevels, nEdges+1), u_zonal(nVertLevels, nCells+1), u_merid(nVertLevels, nCells+1))
          u_e = 0.0_RKIND
@@ -1672,6 +1725,18 @@ contains
          real (kind=RKIND) :: wt(3), best_wt(3), best_min, det, a(3), b(3), cc3(3), f, ff
 
          cell = find_cell(p, cell_hint, nCells, nEdgesOnCell, cellsOnCell)
+         if (lagr_flux_vel .and. lagr_wind == WIND_MODEL) then
+            kf = find_level(zp)
+            ff = (zp - zf(kf)) / (zf(kf+1) - zf(kf))
+            f = 2.0_RKIND / (rho_zz_old(kf,cell) + rho_zz_new(kf,cell))
+            a = radius * (p - cxyz(:,cell))
+            vel(1) = f * (ux(kf,cell) + hdiv(kf,cell)*a(1))
+            vel(2) = f * (uy(kf,cell) + hdiv(kf,cell)*a(2))
+            vel(3) = f * (uz(kf,cell) + hdiv(kf,cell)*a(3))
+            vel = vel - sum(vel*p)*p
+            omega = f * ((1.0_RKIND - ff)*om(kf,cell) + ff*om(kf+1,cell))
+            return
+         end if
          best_min = -huge(1.0_RKIND)
          best_tri = cell
          best_wt = (/ 1.0_RKIND, 0.0_RKIND, 0.0_RKIND /)

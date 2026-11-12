@@ -1992,6 +1992,9 @@
                 <var name="pmc_omega" type="real" dimensions="nVertLevelsP1 nCells Time" units="m s^{-1}"
                      description="PartMC: step-averaged rate of change of zeta at cell faces"/>
 
+                <var name="pmc_div" type="real" dimensions="nVertLevels nCells Time" units="kg m^{-3} s^{-1}"
+                     description="PartMC: half the step-averaged horizontal mass divergence of each cell"/>
+
                 <var name="ruAvg_split" type="real" dimensions="nVertLevels nEdges Time" units="kg m^{-2} s^{-1}"
                      description="time-averaged rho*u/zz used in scalar transport"/>
 

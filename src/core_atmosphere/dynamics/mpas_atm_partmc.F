@@ -19,6 +19,14 @@
 !                     (needs a build with MOSAIC; default 0). PMC_GAS_DATA and PMC_GAS_INIT
 !                     name the PartMC gas files (gas_data.dat, gas_init.dat); PMC_CHEM_TOP
 !                     is the altitude (m) above which chemistry is skipped.
+!   PMC_CHEM_BOX      "id:level,id:level": save these cells (global cell ID and level) before and
+!                     after each of the first PMC_CHEM_BOX_STEPS (60) chemistry steps in
+!                     PartMC's output format, in the directory box/
+!   PMC_GAS_EMIT      PartMC gas emissions file (times, rate scale, mol m^-2 s^-1 per species),
+!                     applied over land to the lowest PMC_EMIT_LEVELS layers and multiplied by
+!                     PMC_GAS_EMIT_SCALE (default 1). Needs PMC_MOSAIC=1.
+!   PMC_GAS_DRYDEP    file of gas dry deposition velocities (species name, m/s), applied to the
+!                     lowest layer. Needs PMC_MOSAIC=1.
 !   PMC_EMIT_FLUX     number flux (m^-2 s^-1) of soot-like particles emitted over land (default 0)
 !   PMC_EMIT_LEVELS   number of lowest layers the emission is spread over, uniformly in mixing
 !                     ratio (default 1)
@@ -173,7 +181,7 @@ module mpas_atm_partmc
 
    public :: atm_partmc_init, atm_partmc_check, atm_partmc_particles_init, atm_partmc_particles_transport, &
              atm_partmc_particles_to_scalar, atm_partmc_output, atm_partmc_vertical_mixing, &
-             atm_partmc_convection, atm_partmc_surface, atm_partmc_chemistry, &
+             atm_partmc_convection, atm_partmc_surface, atm_partmc_gas_surface, atm_partmc_chemistry, &
              atm_partmc_coagulation
 
    integer, parameter :: MODE_FLUX = 1, MODE_LAGR = 2
@@ -224,6 +232,11 @@ module mpas_atm_partmc
    character(len=256) :: gas_data_file = 'gas_data.dat', gas_init_file = 'gas_init.dat'
    real (kind=RKIND) :: pmc_chem_top = 1.0e9_RKIND, chem_s0 = 0.0_RKIND
    integer, allocatable :: gas_idx(:)
+   !> Gas emission and dry deposition: files, scale, and the amounts (mol) emitted and
+   !> deposited by this task so far for each species.
+   character(len=256) :: gas_emit_file = '', gas_drydep_file = ''
+   real (kind=RKIND) :: gas_emit_scale = 1.0_RKIND
+   real (kind=RKIND), allocatable :: gas_emitted(:), gas_deposited(:), gas_content0(:)
    !> Repeat sample cells' chemistry after another cell to check MOSAIC carries nothing over.
    logical :: pmc_chem_selftest = .false.
    !> Cells (global cell ID and level) whose state is saved in PartMC's own file format before
@@ -378,6 +391,12 @@ contains
       if (stat == 0) gas_init_file = envval
       call get_environment_variable('PMC_CHEM_TOP', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_chem_top
+      call get_environment_variable('PMC_GAS_EMIT', envval, status=stat)
+      if (stat == 0) gas_emit_file = envval
+      call get_environment_variable('PMC_GAS_EMIT_SCALE', envval, status=stat)
+      if (stat == 0) read(envval, *) gas_emit_scale
+      call get_environment_variable('PMC_GAS_DRYDEP', envval, status=stat)
+      if (stat == 0) gas_drydep_file = envval
       call get_environment_variable('PMC_EMIT_FLUX', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_emit_flux
       call get_environment_variable('PMC_EMIT_LEVELS', envval, status=stat)
@@ -2673,12 +2692,241 @@ contains
    end subroutine atm_partmc_surface
 
 
+   !> Read the gas species and initial state, find each species' model scalar, set gases that
+   !> are still zero everywhere to the initial state, and initialise MOSAIC. Does this once.
+   subroutine gas_setup(domain)
+
+      type (domain_type), intent(inout) :: domain
+
+#ifdef MPAS_PARTMC_MOSAIC
+      type (mpas_pool_type), pointer :: mesh, state
+      real (kind=RKIND), dimension(:,:,:), pointer :: scalars
+      real (kind=RKIND), pointer :: config_dt
+      integer, pointer :: nCellsSolve, nVertLevels, i_ptr
+      integer :: iCell, k, j, n_gas
+      type(spec_file_t) :: file
+      type(env_state_t) :: env_state
+      type(gas_state_t) :: gas_state
+      real (kind=dp) :: del_t
+
+      if (allocated(gas_idx)) return
+
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'state', state)
+      call mpas_pool_get_config(domain % blocklist % configs, 'config_dt', config_dt)
+      call mpas_pool_get_dimension(mesh, 'nCellsSolve', nCellsSolve)
+      call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
+      call mpas_pool_get_array(state, 'scalars', scalars, 2)
+      del_t = config_dt
+
+      if (.not. allocated(gas_idx)) then
+         call spec_file_open(trim(gas_data_file), file)
+         call spec_file_read_gas_data(file, gas_data)
+         call spec_file_close(file)
+         call spec_file_open(trim(gas_init_file), file)
+         call spec_file_read_gas_state(file, gas_data, gas_state)
+         call spec_file_close(file)
+         n_gas = gas_data_n_spec(gas_data)
+         allocate(gas_idx(n_gas))
+         do j = 1, n_gas
+            nullify(i_ptr)
+            call mpas_pool_get_dimension(state, 'index_gas_' // trim(gas_data%name(j)), i_ptr)
+            if (.not. associated(i_ptr)) then
+               call mpas_log_write('PartMC: no model scalar for gas ' // trim(gas_data%name(j)), &
+                                   messageType=MPAS_LOG_CRIT)
+            end if
+            gas_idx(j) = i_ptr
+         end do
+         if (maxval(scalars(gas_idx,:,1:nCellsSolve)) <= 0.0_RKIND) then
+            do iCell = 1, nCellsSolve
+               do k = 1, nVertLevels
+                  scalars(gas_idx,k,iCell) = gas_state%mix_rat
+               end do
+            end do
+         end if
+         env_state%temp = 288.0d0
+         env_state%pressure = 1.0d5
+         env_state%rel_humid = 0.5d0
+         env_state%latitude = 0.0d0
+         env_state%longitude = 0.0d0
+         env_state%altitude = 0.0d0
+         call mosaic_init(env_state, aero_data, del_t, .false.)
+         call mpas_log_write('PartMC: MOSAIC with $i gas species from ' // trim(gas_data_file) // ', initial state ' &
+                             // trim(gas_init_file) // ', below $r m', intArgs=(/n_gas/), realArgs=(/pmc_chem_top/))
+      end if
+#endif
+
+   end subroutine gas_setup
+
+
+   !> Global content (mol) of each gas species, summed over this task's cells.
+   subroutine gas_content(domain, content)
+
+      type (domain_type), intent(inout) :: domain
+      real (kind=RKIND), intent(out) :: content(:)
+
+      type (mpas_pool_type), pointer :: mesh, state
+      real (kind=RKIND), dimension(:,:,:), pointer :: scalars
+      real (kind=RKIND), dimension(:,:), pointer :: rho_zz
+      real (kind=RKIND), dimension(:), pointer :: rdzw, areaCell
+      integer, pointer :: nCellsSolve, nVertLevels
+      integer :: iCell, k
+
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'state', state)
+      call mpas_pool_get_dimension(mesh, 'nCellsSolve', nCellsSolve)
+      call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
+      call mpas_pool_get_array(mesh, 'rdzw', rdzw)
+      call mpas_pool_get_array(mesh, 'areaCell', areaCell)
+      call mpas_pool_get_array(state, 'scalars', scalars, 2)
+      call mpas_pool_get_array(state, 'rho_zz', rho_zz, 2)
+      content = 0.0_RKIND
+      do iCell = 1, nCellsSolve
+         do k = 1, nVertLevels
+            ! mol of dry air in the cell times the mixing ratio
+            content = content + scalars(gas_idx,k,iCell) * 1.0e-9_RKIND &
+                                * rho_zz(k,iCell) / rdzw(k) * areaCell(iCell) / 0.028966_RKIND
+         end do
+      end do
+
+   end subroutine gas_content
+
+
+   !> Surface emission and dry deposition of the gas tracers.
+   !>
+   !> Emission: the fluxes of a PartMC gas emissions file (mol m^-2 s^-1, with its time profile
+   !> read against the time since the start of the run) over land, added to the lowest
+   !> PMC_EMIT_LEVELS layers uniformly in mixing ratio. Dry deposition: a deposition velocity v
+   !> for each species acts on the lowest layer of depth dz, removing the fraction
+   !> 1 - exp(-v dt / dz). The amounts emitted and deposited are accumulated for a budget.
+   subroutine atm_partmc_gas_surface(domain, itimestep)
+
+      type (domain_type), intent(inout) :: domain
+      integer, intent(in) :: itimestep
+
+#ifdef MPAS_PARTMC_MOSAIC
+      type (mpas_pool_type), pointer :: mesh, state, sfc_input
+      type (field3DReal), pointer :: scalars_field
+      real (kind=RKIND), dimension(:,:,:), pointer :: scalars
+      real (kind=RKIND), dimension(:,:), pointer :: rho_zz, zz
+      real (kind=RKIND), dimension(:), pointer :: rdzw, areaCell, xland
+      real (kind=RKIND), pointer :: config_dt
+      integer, pointer :: nCellsSolve
+      integer :: iCell, k, j, n_gas, j_e, j_d
+      real (kind=RKIND) :: dz, air1, air_emit
+      real (kind=RKIND), allocatable :: local(:), g_content(:), g_emit(:), g_dep(:), frac(:), amount(:)
+      type(spec_file_t) :: file
+      type(gas_state_t), save :: gas_drydep, emis
+      type(gas_state_t), allocatable, save :: gas_emit_states(:)
+      real (kind=dp), allocatable, save :: gas_emit_time(:), gas_emit_rate(:)
+      real (kind=dp) :: rate
+
+      if (.not. pmc_chem .or. pmc_n_part <= 0) return
+      if (len_trim(gas_emit_file) == 0 .and. len_trim(gas_drydep_file) == 0) return
+
+      call gas_setup(domain)
+      n_gas = gas_data_n_spec(gas_data)
+      allocate(local(n_gas), g_content(n_gas), g_emit(n_gas), g_dep(n_gas), frac(n_gas), amount(n_gas))
+
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'state', state)
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'sfc_input', sfc_input)
+      call mpas_pool_get_config(domain % blocklist % configs, 'config_dt', config_dt)
+      call mpas_pool_get_dimension(mesh, 'nCellsSolve', nCellsSolve)
+      call mpas_pool_get_array(mesh, 'rdzw', rdzw)
+      call mpas_pool_get_array(mesh, 'zz', zz)
+      call mpas_pool_get_array(mesh, 'areaCell', areaCell)
+      call mpas_pool_get_array(state, 'scalars', scalars, 2)
+      call mpas_pool_get_array(state, 'rho_zz', rho_zz, 2)
+      nullify(xland)
+      call mpas_pool_get_array(sfc_input, 'xland', xland)
+
+      if (.not. allocated(gas_emitted)) then
+         allocate(gas_emitted(n_gas), gas_deposited(n_gas), gas_content0(n_gas))
+         gas_emitted = 0.0_RKIND
+         gas_deposited = 0.0_RKIND
+         call gas_content(domain, local)
+         call mpas_dmpar_sum_real_array(domain % dminfo, n_gas, local, gas_content0)
+         if (len_trim(gas_emit_file) > 0) then
+            call spec_file_open(trim(gas_emit_file), file)
+            call spec_file_read_gas_states_times_rates(file, gas_data, gas_emit_time, gas_emit_rate, gas_emit_states)
+            call spec_file_close(file)
+            call mpas_log_write('PartMC: gas emissions from ' // trim(gas_emit_file) // ' times $r over land', &
+                                realArgs=(/gas_emit_scale/))
+         end if
+         if (len_trim(gas_drydep_file) > 0) then
+            call spec_file_open(trim(gas_drydep_file), file)
+            call spec_file_read_gas_state(file, gas_data, gas_drydep)
+            call spec_file_close(file)
+            call mpas_log_write('PartMC: gas dry deposition velocities from ' // trim(gas_drydep_file) &
+                                // ', largest $r m/s', realArgs=(/real(maxval(gas_drydep%mix_rat), kind=RKIND)/))
+         end if
+      end if
+
+      if (allocated(gas_emit_states)) then
+         ! mol m^-2 s^-1 in emis%mix_rat, times rate
+         call gas_state_interp_1d(gas_emit_states, gas_emit_time, gas_emit_rate, &
+                                  real(itimestep - 1, kind=dp) * real(config_dt, kind=dp), emis, rate)
+      end if
+
+      do iCell = 1, nCellsSolve
+         ! mol of dry air per area in the lowest layer
+         air1 = rho_zz(1,iCell) / rdzw(1) / 0.028966_RKIND
+         if (allocated(gas_drydep%mix_rat)) then
+            dz = 1.0_RKIND / (rdzw(1) * zz(1,iCell))
+            frac = 1.0_RKIND - exp(-gas_drydep%mix_rat * config_dt / dz)
+            amount = frac * scalars(gas_idx,1,iCell)
+            scalars(gas_idx,1,iCell) = scalars(gas_idx,1,iCell) - amount
+            gas_deposited = gas_deposited + amount * 1.0e-9_RKIND * air1 * areaCell(iCell)
+         end if
+         if (allocated(gas_emit_states) .and. associated(xland)) then
+            if (nint(xland(iCell)) == 1) then
+               air_emit = 0.0_RKIND
+               do k = 1, pmc_emit_levels
+                  air_emit = air_emit + rho_zz(k,iCell) / rdzw(k) / 0.028966_RKIND
+               end do
+               ! mol per area this step
+               amount = emis%mix_rat * rate * gas_emit_scale * config_dt
+               do k = 1, pmc_emit_levels
+                  scalars(gas_idx,k,iCell) = scalars(gas_idx,k,iCell) + amount / air_emit * 1.0e9_RKIND
+               end do
+               gas_emitted = gas_emitted + amount * areaCell(iCell)
+            end if
+         end if
+      end do
+
+      call mpas_pool_get_field(state, 'scalars', scalars_field, 2)
+      call mpas_dmpar_exch_halo_field(scalars_field)
+
+      if (mod(itimestep, 12) == 0 .or. itimestep == 1) then
+         call gas_content(domain, local)
+         call mpas_dmpar_sum_real_array(domain % dminfo, n_gas, local, g_content)
+         call mpas_dmpar_sum_real_array(domain % dminfo, n_gas, gas_emitted, g_emit)
+         call mpas_dmpar_sum_real_array(domain % dminfo, n_gas, gas_deposited, g_dep)
+         ! the species with the most emitted and the most deposited so far
+         j_e = maxloc(g_emit, dim=1)
+         j_d = maxloc(g_dep, dim=1)
+         do j = 1, n_gas
+            if (j /= j_e .and. j /= j_d) cycle
+            call mpas_log_write('PartMC gas surface step $i: ' // trim(gas_data%name(j)) // ' (mol) content = $r, ' &
+                                // 'at start = $r, emitted = $r, deposited = $r, budget residual / content = $r', &
+                                intArgs=(/itimestep/), &
+                                realArgs=(/g_content(j), gas_content0(j), g_emit(j), g_dep(j), &
+                                           (g_content(j) - gas_content0(j) - g_emit(j) + g_dep(j)) &
+                                           / max(g_content(j), 1.0e-30_RKIND)/))
+         end do
+      end if
+#endif
+
+   end subroutine atm_partmc_gas_surface
+
+
    !> Gas chemistry and gas-particle partitioning with MOSAIC (CBM-Z, ASTEM, MESA) in every
    !> owned cell, through PartMC's interface.
    !>
    !> The gases are model scalars gas_<name> (nmol per mol of dry air), so they are advected by
    !> the model and mixed and convected with the particle number scalars. They start from one
-   !> PartMC gas_init file everywhere; there are no gas emissions or deposition yet. MOSAIC
+   !> PartMC gas_init file everywhere; atm_partmc_gas_surface does emission and deposition. MOSAIC
    !> works with mixing ratios relative to moist air, so values are converted on the way in and
    !> out. Temperature, pressure and relative humidity come from the model state; latitude,
    !> longitude, altitude and time are set for MOSAIC's solar zenith angle.
@@ -2705,7 +2953,7 @@ contains
       type(env_state_t) :: env_state
       type(gas_state_t) :: gas_state
       character(len=PMC_UUID_LEN) :: uuid
-      real (kind=RKIND) :: qv, vol, sums(3), g_sums(3), t0, t1, t_local, t_max, moist_fac, ch4_min, ch4_max
+      real (kind=RKIND) :: qv, vol, sums(4), g_sums(4), t0, t1, t_local, t_max, moist_fac, ch4_min, ch4_max
       real (kind=RKIND), dimension(:,:), pointer :: rho_zz
       type (field3DReal), pointer :: scalars_field
       integer, pointer :: i_ptr
@@ -2751,41 +2999,7 @@ contains
       env_state%start_time = real(hr*3600 + mi*60 + sc, kind=dp)
       env_state%elapsed_time = real(itimestep - 1, kind=dp) * del_t
 
-      if (.not. allocated(gas_idx)) then
-         call spec_file_open(trim(gas_data_file), file)
-         call spec_file_read_gas_data(file, gas_data)
-         call spec_file_close(file)
-         call spec_file_open(trim(gas_init_file), file)
-         call spec_file_read_gas_state(file, gas_data, gas_state)
-         call spec_file_close(file)
-         n_gas = gas_data_n_spec(gas_data)
-         allocate(gas_idx(n_gas))
-         do j = 1, n_gas
-            nullify(i_ptr)
-            call mpas_pool_get_dimension(state, 'index_gas_' // trim(gas_data%name(j)), i_ptr)
-            if (.not. associated(i_ptr)) then
-               call mpas_log_write('PartMC: no model scalar for gas ' // trim(gas_data%name(j)), &
-                                   messageType=MPAS_LOG_CRIT)
-            end if
-            gas_idx(j) = i_ptr
-         end do
-         if (maxval(scalars(gas_idx,:,1:nCellsSolve)) <= 0.0_RKIND) then
-            do iCell = 1, nCellsSolve
-               do k = 1, nVertLevels
-                  scalars(gas_idx,k,iCell) = gas_state%mix_rat
-               end do
-            end do
-         end if
-         env_state%temp = 288.0d0
-         env_state%pressure = 1.0d5
-         env_state%rel_humid = 0.5d0
-         env_state%latitude = 0.0d0
-         env_state%longitude = 0.0d0
-         env_state%altitude = 0.0d0
-         call mosaic_init(env_state, aero_data, del_t, .false.)
-         call mpas_log_write('PartMC: MOSAIC with $i gas species from ' // trim(gas_data_file) // ', initial state ' &
-                             // trim(gas_init_file) // ', below $r m', intArgs=(/n_gas/), realArgs=(/pmc_chem_top/))
-      end if
+      call gas_setup(domain)
       n_gas = gas_data_n_spec(gas_data)
       call gas_state_set_size(gas_state, n_gas)
       i_so2 = gas_data_spec_by_name(gas_data, 'SO2')
@@ -2928,10 +3142,14 @@ contains
       end if
       if (mod(itimestep, 12) == 0 .or. itimestep == 1) then
          t_local = t1 - t0
-         call mpas_dmpar_sum_real_array(domain % dminfo, 3, sums, g_sums)
+         ! net sulfur (mol) put in at the surface so far
+         if (allocated(gas_emitted)) then
+            sums(4) = gas_emitted(i_so2) + gas_emitted(i_h2so4) - gas_deposited(i_so2) - gas_deposited(i_h2so4)
+         end if
+         call mpas_dmpar_sum_real_array(domain % dminfo, 4, sums, g_sums)
          call mpas_dmpar_sum_int(domain % dminfo, n_cells, g_n_cells)
          call mpas_dmpar_max_real(domain % dminfo, t_local, t_max)
-         if (chem_s0 <= 0.0_RKIND) chem_s0 = g_sums(1) + g_sums(2)
+         if (chem_s0 <= 0.0_RKIND) chem_s0 = g_sums(1) + g_sums(2) - g_sums(4)
          ! range of a long-lived gas, which transport alone must leave uniform
          j = gas_idx(gas_data_spec_by_name(gas_data, 'CH4'))
          t_local = minval(scalars(j,:,1:nCellsSolve))
@@ -2941,9 +3159,10 @@ contains
          call mpas_log_write('PartMC chemistry step $i: CH4 tracer min = $r, max = $r ppb', &
                              intArgs=(/itimestep/), realArgs=(/ch4_min, ch4_max/))
          call mpas_log_write('PartMC chemistry step $i: cells = $i, sulfur (mol) gas = $r, particles = $r, ' &
-                             // 'total rel change = $r, particle water (kg) = $r, slowest task = $r s', &
+                             // 'total less net surface input, rel change = $r, particle water (kg) = $r, ' &
+                             // 'slowest task = $r s', &
                              intArgs=(/itimestep, g_n_cells/), &
-                             realArgs=(/g_sums(1), g_sums(2), (g_sums(1) + g_sums(2))/chem_s0 - 1.0_RKIND, &
+                             realArgs=(/g_sums(1), g_sums(2), (g_sums(1) + g_sums(2) - g_sums(4))/chem_s0 - 1.0_RKIND, &
                                         g_sums(3), t_max/))
       end if
 #endif

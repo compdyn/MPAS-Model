@@ -28,7 +28,7 @@
 !   PMC_GAS_DRYDEP    file of gas dry deposition velocities (species name, m/s), applied to the
 !                     lowest layer. Needs PMC_MOSAIC=1.
 !   PMC_WET           1 = removal of particles and gases by grid-scale precipitation, in cloud
-!                     (default 0). PMC_WET_SCRIT: only particles with a critical supersaturation
+!                     (default 0). 2 = only the diagnostics: nothing is removed. PMC_WET_SCRIT: only particles with a critical supersaturation
 !                     up to this value (as a fraction, 0.002 = 0.2%) are removed (default: all).
 !                     PMC_GAS_WET: file of the fraction of each gas that is in cloud water
 !                     (species name, 0 to 1); needs PMC_MOSAIC=1.
@@ -248,7 +248,7 @@ module mpas_atm_partmc
    !> production of precipitation, and the part of the production counted as reaching the
    !> surface (kg); last, the number of particles expected to be removed given the particles
    !> that were in the layers (the sum of probability times number).
-   logical :: pmc_wet = .false.
+   logical :: pmc_wet = .false., pmc_wet_diag_only = .false.
    real (kind=RKIND) :: pmc_wet_scrit = 1.0e9_RKIND
    character(len=256) :: gas_wet_file = ''
    real (kind=RKIND) :: wet_sums(6) = 0.0_RKIND
@@ -418,6 +418,7 @@ contains
       if (stat == 0) read(envval, *) pmc_chem_top
       call get_environment_variable('PMC_WET', envval, status=stat)
       if (stat == 0) pmc_wet = (trim(envval) /= '0')
+      if (stat == 0) pmc_wet_diag_only = (trim(envval) == '2')
       call get_environment_variable('PMC_WET_SCRIT', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_wet_scrit
       call get_environment_variable('PMC_GAS_WET', envval, status=stat)
@@ -3159,6 +3160,10 @@ contains
                wet_cls(1,i_cls(ic)) = wet_cls(1,i_cls(ic)) + amt
                wet_cls(2,i_cls(ic)) = wet_cls(2,i_cls(ic)) + amt_p
             end do
+            if (pmc_wet_diag_only) then
+               wet_sums(6) = wet_sums(6) + amt_p
+               cycle
+            end if
             do i_s = 1, 4
                scalars(idx(i_s),k,iCell) = scalars(idx(i_s),k,iCell) * (1.0_RKIND - p)
             end do

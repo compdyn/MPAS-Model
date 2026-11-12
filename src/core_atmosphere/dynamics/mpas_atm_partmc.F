@@ -18,9 +18,11 @@
 !   PMC_KZ_PHYS       1 = vertical mixing with the boundary-layer scheme's heat diffusivity
 !                     (kzh) in place of the prescribed profile (default 0)
 !   PMC_LAGR_SUBSTEPS lagrangian mode: trajectory sub-steps per model step (default 1)
-!   PMC_LAGR_FLUXVEL  lagrangian mode: 1 = velocity built in each cell from its own edge and face
-!                     mass fluxes, so that its divergence is the model's discrete one, instead
-!                     of interpolating reconstructed cell-centre winds (default 0)
+!   PMC_LAGR_FLUXVEL  lagrangian mode: velocity built in each cell from its own edge and face
+!                     mass fluxes instead of interpolating reconstructed cell-centre winds
+!                     (default 0 = interpolate). 1: constant plus linear field with the model's
+!                     discrete divergence. 2: also matches the mass flux through every edge
+!                     (lowest-order Raviart-Thomas field on the triangles centre-vertex-vertex).
 !   PMC_LAGR_UCONST   lagrangian mode: 1 = horizontal velocity constant within a layer instead of
 !                     linear between layer centres (default 0)
 !   PMC_TEST_WIND     lagrangian mode: replace the model winds by an analytic flow with a
@@ -200,7 +202,13 @@ module mpas_atm_partmc
    !> Lagrangian mode: horizontal velocity constant within each layer.
    logical :: lagr_u_const = .false.
    !> Lagrangian mode: velocity from each cell's own mass fluxes.
-   logical :: lagr_flux_vel = .false.
+   integer :: lagr_flux_vel = 0
+   !> For lagr_flux_vel = 2, per cell and per edge in counter-clockwise order: the edge, its
+   !> length signed so that length*ruAvg is the outward mass flux, the two edge vertices relative
+   !> to the cell centre in the tangent plane (m), and the area of the triangle they make with
+   !> the centre. rt_n is the number of edges, 0 if the cell lacks an edge on this task.
+   integer, allocatable :: rt_n(:), rt_edge(:,:)
+   real (kind=RKIND), allocatable :: rt_len(:,:), rt_a(:,:,:), rt_b(:,:,:), rt_area(:,:)
    integer :: n_mixed = 0
    !> Brownian coagulation in every cell each step, and events so far.
    logical :: pmc_coag = .false.
@@ -296,7 +304,7 @@ contains
       call get_environment_variable('PMC_KZ_TOP', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_kz_top
       call get_environment_variable('PMC_LAGR_FLUXVEL', envval, status=stat)
-      if (stat == 0) lagr_flux_vel = (trim(envval) /= '0')
+      if (stat == 0) read(envval, *) lagr_flux_vel
       call get_environment_variable('PMC_LAGR_UCONST', envval, status=stat)
       if (stat == 0) lagr_u_const = (trim(envval) /= '0')
       call get_environment_variable('PMC_KZ_PHYS', envval, status=stat)
@@ -587,6 +595,92 @@ contains
 
 
    !> Local cell whose centre is nearest to unit vector p, searching from cell_hint.
+   !> Geometry for the edge-flux-matching velocity (lagr_flux_vel = 2); see rt_n.
+   subroutine lagr_rt_setup(mesh)
+      type (mpas_pool_type), intent(in) :: mesh
+      integer, pointer :: nCells, nEdges, nVertices
+      integer, dimension(:), pointer :: nEdgesOnCell
+      integer, dimension(:,:), pointer :: edgesOnCell, verticesOnEdge, cellsOnEdge
+      real (kind=RKIND), dimension(:), pointer :: xVertex, yVertex, zVertex, dvEdge
+      integer :: c, j, i, n, e, iv, order(12), jj, tmp
+      real (kind=RKIND) :: nrm(3), va(3,12), vb(3,12), ang(12), e1(3), e2(3), mid(3), t(3), sgn(12)
+
+      call mpas_pool_get_dimension(mesh, 'nCells', nCells)
+      call mpas_pool_get_dimension(mesh, 'nEdges', nEdges)
+      call mpas_pool_get_dimension(mesh, 'nVertices', nVertices)
+      call mpas_pool_get_array(mesh, 'nEdgesOnCell', nEdgesOnCell)
+      call mpas_pool_get_array(mesh, 'edgesOnCell', edgesOnCell)
+      call mpas_pool_get_array(mesh, 'verticesOnEdge', verticesOnEdge)
+      call mpas_pool_get_array(mesh, 'cellsOnEdge', cellsOnEdge)
+      call mpas_pool_get_array(mesh, 'xVertex', xVertex)
+      call mpas_pool_get_array(mesh, 'yVertex', yVertex)
+      call mpas_pool_get_array(mesh, 'zVertex', zVertex)
+      call mpas_pool_get_array(mesh, 'dvEdge', dvEdge)
+      allocate(rt_n(nCells), rt_edge(12,nCells), rt_len(12,nCells), rt_a(3,12,nCells), rt_b(3,12,nCells), &
+               rt_area(12,nCells))
+      rt_n = 0
+      do c = 1, nCells
+         n = nEdgesOnCell(c)
+         nrm = cxyz(:,c)
+         do j = 1, n
+            e = edgesOnCell(j,c)
+            if (e < 1 .or. e > nEdges) exit
+            if (minval(verticesOnEdge(:,e)) < 1 .or. maxval(verticesOnEdge(:,e)) > nVertices) exit
+            do i = 1, 2
+               iv = verticesOnEdge(i,e)
+               t = (/ xVertex(iv), yVertex(iv), zVertex(iv) /)
+               t = radius * (t / norm2(t) - nrm)
+               t = t - sum(t*nrm)*nrm
+               if (i == 1) va(:,j) = t
+               if (i == 2) vb(:,j) = t
+            end do
+            ! counter-clockwise seen from outside the sphere
+            if (sum(nrm * cross3(va(:,j), vb(:,j))) < 0.0_RKIND) then
+               t = va(:,j)
+               va(:,j) = vb(:,j)
+               vb(:,j) = t
+            end if
+            sgn(j) = 1.0_RKIND
+            if (cellsOnEdge(2,e) == c) sgn(j) = -1.0_RKIND
+         end do
+         if (j <= n) cycle
+         e1 = va(:,1) / norm2(va(:,1))
+         e2 = cross3(nrm, e1)
+         do j = 1, n
+            mid = 0.5_RKIND*(va(:,j) + vb(:,j))
+            ang(j) = atan2(sum(mid*e2), sum(mid*e1))
+            order(j) = j
+         end do
+         do j = 2, n
+            do jj = j, 2, -1
+               if (ang(order(jj)) >= ang(order(jj-1))) exit
+               tmp = order(jj)
+               order(jj) = order(jj-1)
+               order(jj-1) = tmp
+            end do
+         end do
+         do i = 1, n
+            j = order(i)
+            rt_edge(i,c) = edgesOnCell(j,c)
+            rt_len(i,c) = sgn(j) * dvEdge(edgesOnCell(j,c))
+            rt_a(:,i,c) = va(:,j)
+            rt_b(:,i,c) = vb(:,j)
+            rt_area(i,c) = 0.5_RKIND * sum(nrm * cross3(va(:,j), vb(:,j)))
+         end do
+         rt_n(c) = n
+      end do
+
+   contains
+
+      pure function cross3(a, b) result(c3)
+         real (kind=RKIND), intent(in) :: a(3), b(3)
+         real (kind=RKIND) :: c3(3)
+         c3 = (/ a(2)*b(3) - a(3)*b(2), a(3)*b(1) - a(1)*b(3), a(1)*b(2) - a(2)*b(1) /)
+      end function cross3
+
+   end subroutine lagr_rt_setup
+
+
    integer function find_cell(p, cell_hint, nCells, nEdgesOnCell, cellsOnCell)
       real (kind=RKIND), intent(in) :: p(3)
       integer, intent(in) :: cell_hint, nCells
@@ -788,6 +882,7 @@ contains
             zc(k) = 0.5_RKIND*(zf(k) + zf(k+1))
          end do
          allocate(pos(nVertLevels, nCellsSolve), pos_in(nVertLevels, nCellsSolve))
+         if (lagr_flux_vel == 2) call lagr_rt_setup(mesh)
          allocate(cell_rmax(nCells))
          cell_rmax = 0.0_RKIND
          do iCell = 1, nCellsSolve
@@ -1612,7 +1707,7 @@ contains
       !> Step-averaged transport velocity: Cartesian horizontal velocity at cell centres
       !> and d(zeta)/dt at cell faces, from the mass fluxes used for scalar transport.
       subroutine lagr_velocities()
-         type (field2DReal), pointer :: f_ux, f_uy, f_uz, f_om, f_div
+         type (field2DReal), pointer :: f_ux, f_uy, f_uz, f_om, f_div, f_ru
          real (kind=RKIND), allocatable :: u_e(:,:), u_zonal(:,:), u_merid(:,:)
          real (kind=RKIND), dimension(:), pointer :: xEdge, yEdge, zEdge, dvEdge, areaCell_l
          integer, dimension(:,:), pointer :: edgesOnCell_l
@@ -1630,7 +1725,7 @@ contains
          uz => f_uz % array
          om => f_om % array
 
-         if (lagr_flux_vel .and. lagr_wind == WIND_MODEL) then
+         if (lagr_flux_vel > 0 .and. lagr_wind == WIND_MODEL) then
             ! Mass-flux vector and half the mass divergence of every layer of every cell, from the
             ! cell's own edge fluxes: m(x) = M + (D/2)(x - x_c) has divergence D, and M is the
             ! area-weighted reconstruction sum over edges of (x_e - x_c) * outward flux.
@@ -1671,6 +1766,10 @@ contains
             call mpas_dmpar_exch_halo_field(f_uz)
             call mpas_dmpar_exch_halo_field(f_om)
             call mpas_dmpar_exch_halo_field(f_div)
+            if (lagr_flux_vel == 2) then
+               call mpas_pool_get_field(diag, 'ruAvg', f_ru)
+               call mpas_dmpar_exch_halo_field(f_ru)
+            end if
             return
          end if
 
@@ -1725,14 +1824,19 @@ contains
          real (kind=RKIND) :: wt(3), best_wt(3), best_min, det, a(3), b(3), cc3(3), f, ff
 
          cell = find_cell(p, cell_hint, nCells, nEdgesOnCell, cellsOnCell)
-         if (lagr_flux_vel .and. lagr_wind == WIND_MODEL) then
+         if (lagr_flux_vel > 0 .and. lagr_wind == WIND_MODEL) then
             kf = find_level(zp)
             ff = (zp - zf(kf)) / (zf(kf+1) - zf(kf))
             f = 2.0_RKIND / (rho_zz_old(kf,cell) + rho_zz_new(kf,cell))
             a = radius * (p - cxyz(:,cell))
-            vel(1) = f * (ux(kf,cell) + hdiv(kf,cell)*a(1))
-            vel(2) = f * (uy(kf,cell) + hdiv(kf,cell)*a(2))
-            vel(3) = f * (uz(kf,cell) + hdiv(kf,cell)*a(3))
+            if (lagr_flux_vel == 2 .and. rt_n(cell) > 0) then
+               call rt_mass_flux(cell, kf, a, vel)
+               vel = f * vel
+            else
+               vel(1) = f * (ux(kf,cell) + hdiv(kf,cell)*a(1))
+               vel(2) = f * (uy(kf,cell) + hdiv(kf,cell)*a(2))
+               vel(3) = f * (uz(kf,cell) + hdiv(kf,cell)*a(3))
+            end if
             vel = vel - sum(vel*p)*p
             omega = f * ((1.0_RKIND - ff)*om(kf,cell) + ff*om(kf+1,cell))
             return
@@ -1799,6 +1903,53 @@ contains
             omega = omega + best_wt(j) * ((1.0_RKIND - ff)*om(kf,ct) + ff*om(kf+1,ct))
          end do
       end subroutine lagr_vel
+
+
+      !> Horizontal mass flux per area at offset r (m) from the centre of a cell, in layer kk:
+      !> the lowest-order Raviart-Thomas field on the triangles (centre, vertex, vertex), which
+      !> has the model's mass flux through every edge and a uniform divergence. The fluxes
+      !> through the spokes from the centre to the vertices follow from the uniform divergence,
+      !> up to a rotation about the centre that is set to zero on average.
+      subroutine rt_mass_flux(cell, kk, r, m)
+         integer, intent(in) :: cell, kk
+         real (kind=RKIND), intent(in) :: r(3)
+         real (kind=RKIND), intent(out) :: m(3)
+         integer :: n, i, ip, it
+         real (kind=RKIND) :: fl(MAX_FACES), g(MAX_FACES), d, nrm(3), best, w1, w2, s1, s2
+
+         n = rt_n(cell)
+         nrm = cxyz(:,cell)
+         do i = 1, n
+            fl(i) = rt_len(i,cell) * ruAvg(kk, rt_edge(i,cell))
+         end do
+         d = sum(fl(1:n)) / sum(rt_area(1:n,cell))
+         g(1) = 0.0_RKIND
+         do i = 1, n - 1
+            g(i+1) = g(i) + d*rt_area(i,cell) - fl(i)
+         end do
+         s1 = 0.0_RKIND
+         s2 = 0.0_RKIND
+         do i = 1, n
+            w1 = 1.0_RKIND / norm2(rt_a(:,i,cell))
+            s1 = s1 + g(i)*w1
+            s2 = s2 + w1
+         end do
+         g(1:n) = g(1:n) - s1/s2
+         ! the triangle that holds r
+         it = 1
+         best = -huge(1.0_RKIND)
+         do i = 1, n
+            w1 = triple(nrm, rt_a(:,i,cell), r)
+            w2 = triple(nrm, r, rt_b(:,i,cell))
+            if (min(w1, w2) > best) then
+               best = min(w1, w2)
+               it = i
+            end if
+         end do
+         ip = it + 1
+         if (ip > n) ip = 1
+         m = (fl(it)*r + g(ip)*(r - rt_a(:,it,cell)) - g(it)*(r - rt_b(:,it,cell))) / (2.0_RKIND*rt_area(it,cell))
+      end subroutine rt_mass_flux
 
 
       pure real (kind=RKIND) function triple(a, b, c3)

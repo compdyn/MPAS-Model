@@ -3143,7 +3143,7 @@ contains
       call mpas_pool_get_field(state, 'scalars', scalars_field, 2)
       call mpas_dmpar_exch_halo_field(scalars_field)
 
-      if (mod(itimestep, 12) == 0) then
+      if (mod(itimestep, 12) == 0 .or. itimestep <= 3) then
          sums = wet_sums
          call mpas_dmpar_sum_real_array(domain % dminfo, 6, sums, g_sums)
          call mpas_log_write('PartMC wet removal step $i: number removed so far: reference = $r, particles = $r; ' &

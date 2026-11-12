@@ -223,6 +223,8 @@ module mpas_atm_partmc
    character(len=256) :: gas_data_file = 'gas_data.dat', gas_init_file = 'gas_init.dat'
    real (kind=RKIND) :: pmc_chem_top = 1.0e9_RKIND, chem_s0 = 0.0_RKIND
    real (kind=dp), allocatable :: gas_mix(:,:,:)
+   !> Repeat sample cells' chemistry after another cell to check MOSAIC carries nothing over.
+   logical :: pmc_chem_selftest = .false.
 #ifdef MPAS_PARTMC_MOSAIC
    type(gas_data_t) :: gas_data
 #endif
@@ -343,6 +345,8 @@ contains
       if (stat == 0) lagr_u_const = (trim(envval) /= '0')
       call get_environment_variable('PMC_MOSAIC', envval, status=stat)
       if (stat == 0) pmc_chem = (trim(envval) /= '0')
+      call get_environment_variable('PMC_CHEM_SELFTEST', envval, status=stat)
+      if (stat == 0) pmc_chem_selftest = (trim(envval) /= '0')
       call get_environment_variable('PMC_GAS_DATA', envval, status=stat)
       if (stat == 0) gas_data_file = envval
       call get_environment_variable('PMC_GAS_INIT', envval, status=stat)
@@ -2648,7 +2652,12 @@ contains
       type(gas_state_t) :: gas_state
       character(len=PMC_UUID_LEN) :: uuid
       real (kind=RKIND) :: qv, vol, sums(3), g_sums(3), t0, t1, t_local, t_max
-      real (kind=dp) :: del_t, e_s
+      real (kind=dp) :: del_t, e_s, doy, decl, hour_angle, cos_ref, rh_in
+      real (kind=dp), allocatable :: gas_a(:), gas_pre(:)
+      type(aero_state_t) :: state_a, state_b, state_pre
+      type(env_state_t) :: env_b
+      real (kind=RKIND) :: test_sums(3), g_test(3)
+      integer :: kk, jc, n_test, g_n_test
 
       if (.not. pmc_chem .or. pmc_n_part <= 0) return
 
@@ -2712,6 +2721,9 @@ contains
 
       n_cells = 0
       sums = 0.0_RKIND
+      test_sums = 0.0_RKIND
+      n_test = 0
+      allocate(gas_a(n_gas), gas_pre(n_gas))
       call cpu_time(t0)
       do iCell = 1, nCellsSolve
          do k = 1, nVertLevels
@@ -2731,6 +2743,11 @@ contains
                zalt_m = env_state%altitude
                gas_state%mix_rat = gas_mix(:,k,iCell)
                n_before = aero_state_n_part(aero_states(k,iCell))
+               if (pmc_chem_selftest .and. mod(iCell, 500) == 0 .and. mod(k, 9) == 1) then
+                  state_pre = aero_states(k,iCell)
+                  gas_pre = gas_state%mix_rat
+                  rh_in = env_state%rel_humid
+               end if
                call mosaic_timestep(env_state, aero_data, aero_states(k,iCell), gas_data, gas_state, .false., uuid)
                if (aero_state_n_part(aero_states(k,iCell)) /= n_before) then
                   call mpas_log_write('PartMC: MOSAIC changed the number of particles in a cell', &
@@ -2738,6 +2755,48 @@ contains
                end if
                gas_mix(:,k,iCell) = gas_state%mix_rat
                n_cells = n_cells + 1
+
+               if (pmc_chem_selftest .and. mod(iCell, 500) == 0 .and. mod(k, 9) == 1) then
+                  ! Repeat this cell's step from the saved state after MOSAIC has worked on a
+                  ! different cell: MOSAIC keeps its working state in module variables, so this
+                  ! checks that nothing carries over from one cell to the next.
+                  gas_a = gas_state%mix_rat
+                  state_a = aero_states(k,iCell)
+                  env_b = env_state
+                  ! solar zenith angle against a direct calculation
+                  doy = real(env_state%start_day, kind=dp) + (env_state%start_time + env_state%elapsed_time &
+                        + 0.5d0*del_t) / 86400.0d0
+                  decl = -23.44d0 * pii/180.0d0 * cos(2.0d0*pii*(doy + 9.0d0)/365.0d0)
+                  hour_angle = 2.0d0*pii*(doy - floor(doy)) - pii + lonCell(iCell)
+                  cos_ref = sin(latCell(iCell))*sin(decl) + cos(latCell(iCell))*cos(decl)*cos(hour_angle)
+                  test_sums(3) = max(test_sums(3), abs(cos(env_state%solar_zenith_angle) - cos_ref))
+                  ! a far-away cell, then this one again
+                  kk = nVertLevels + 1 - k
+                  jc = nCellsSolve + 1 - iCell
+                  env_b%temp = theta_m(kk,jc) / (1.0_RKIND + rvord*max(0.0_RKIND, scalars(index_qv,kk,jc))) * exner(kk,jc)
+                  env_b%pressure = pressure_p(kk,jc) + pressure_base(kk,jc)
+                  env_b%rel_humid = 0.3d0
+                  rlat = latCell(jc)
+                  rlon = lonCell(jc)
+                  state_b = aero_states(kk,jc)
+                  gas_state%mix_rat = gas_mix(:,kk,jc)
+                  call mosaic_timestep(env_b, aero_data, state_b, gas_data, gas_state, .false., uuid)
+                  env_b = env_state
+                  env_b%rel_humid = rh_in
+                  rlat = latCell(iCell)
+                  rlon = lonCell(iCell)
+                  state_b = state_pre
+                  gas_state%mix_rat = gas_pre
+                  call mosaic_timestep(env_b, aero_data, state_b, gas_data, gas_state, .false., uuid)
+                  do j = 1, n_gas
+                     if (gas_a(j) > 1.0d-12) test_sums(1) = max(test_sums(1), abs(gas_state%mix_rat(j)/gas_a(j) - 1.0d0))
+                  end do
+                  do j = 1, aero_state_n_part(state_a)
+                     test_sums(2) = max(test_sums(2), abs(sum(state_b%apa%particle(j)%vol) &
+                                                          / sum(state_a%apa%particle(j)%vol) - 1.0d0))
+                  end do
+                  n_test = n_test + 1
+               end if
             end if
 
             if (mod(itimestep, 12) == 0 .or. itimestep == 1) then
@@ -2759,6 +2818,13 @@ contains
       end do
       call cpu_time(t1)
 
+      if (pmc_chem_selftest) then
+         call mpas_dmpar_max_real_array(domain % dminfo, 3, test_sums, g_test)
+         call mpas_dmpar_sum_int(domain % dminfo, n_test, g_n_test)
+         call mpas_log_write('PartMC chemistry self-test step $i: $i cells repeated after another cell; largest ' &
+                             // 'rel diff gas = $r, particle volume = $r; largest cos(zenith) diff from direct ' &
+                             // 'calculation = $r', intArgs=(/itimestep, g_n_test/), realArgs=g_test)
+      end if
       if (mod(itimestep, 12) == 0 .or. itimestep == 1) then
          t_local = t1 - t0
          call mpas_dmpar_sum_real_array(domain % dminfo, 3, sums, g_sums)

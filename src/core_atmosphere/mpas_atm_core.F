@@ -1010,7 +1010,7 @@ module atm_core
 #endif
       use mpas_atm_partmc, only: atm_partmc_check, atm_partmc_particles_transport, atm_partmc_particles_to_scalar, &
                                  atm_partmc_output, atm_partmc_vertical_mixing, atm_partmc_coagulation, &
-                                 atm_partmc_convection
+                                 atm_partmc_convection, atm_partmc_surface
       use mpas_atm_halos, only: exchange_halo_group
 
       implicit none
@@ -1056,6 +1056,7 @@ module atm_core
       call atm_partmc_particles_transport(domain, itimestep)
       call atm_partmc_vertical_mixing(domain, itimestep)
       call atm_partmc_convection(domain, itimestep)
+      call atm_partmc_surface(domain, itimestep)
       call atm_partmc_coagulation(domain, itimestep)
       call atm_partmc_output(domain, itimestep, dt)
 

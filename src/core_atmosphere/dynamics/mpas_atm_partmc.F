@@ -15,6 +15,8 @@
 !   PMC_KZ_MAX        peak of a prescribed vertical diffusivity profile (m^2/s, default 0 = no
 !                     vertical mixing); applied to the Eulerian scalars and, in lagrangian
 !                     mode, to the particles. PMC_KZ_TOP is the height where it reaches zero.
+!   PMC_EMIT_FLUX     number flux (m^-2 s^-1) of soot-like particles emitted over land (default 0)
+!   PMC_DRYDEP_V      dry deposition velocity (m/s) applied to the lowest layer (default 0)
 !   PMC_CONV          1 = convective transport of tracers and particles with the cu_ntiedtke
 !                     scheme's mass fluxes (default 0)
 !   PMC_KZ_PHYS       1 = vertical mixing with the boundary-layer scheme's heat diffusivity
@@ -159,7 +161,7 @@ module mpas_atm_partmc
 
    public :: atm_partmc_init, atm_partmc_check, atm_partmc_particles_init, atm_partmc_particles_transport, &
              atm_partmc_particles_to_scalar, atm_partmc_output, atm_partmc_vertical_mixing, &
-             atm_partmc_convection, &
+             atm_partmc_convection, atm_partmc_surface, &
              atm_partmc_coagulation
 
    integer, parameter :: MODE_FLUX = 1, MODE_LAGR = 2
@@ -204,6 +206,10 @@ module mpas_atm_partmc
    logical :: pmc_kz_phys = .false.
    !> Convective transport with the cumulus scheme's mass fluxes, and particle layer changes so far.
    logical :: pmc_conv = .false.
+   !> Surface emission flux over land (m^-2 s^-1) and dry deposition velocity (m/s).
+   real (kind=RKIND) :: pmc_emit_flux = 0.0_RKIND, pmc_drydep_v = 0.0_RKIND
+   !> Real particles so far: emitted (reference, particles) and deposited (reference, particles).
+   real (kind=RKIND) :: surf_sums(4) = 0.0_RKIND
    integer :: n_conv = 0
    !> Lagrangian mode: horizontal velocity constant within each layer.
    logical :: lagr_u_const = .false.
@@ -313,6 +319,10 @@ contains
       if (stat == 0) read(envval, *) lagr_flux_vel
       call get_environment_variable('PMC_LAGR_UCONST', envval, status=stat)
       if (stat == 0) lagr_u_const = (trim(envval) /= '0')
+      call get_environment_variable('PMC_EMIT_FLUX', envval, status=stat)
+      if (stat == 0) read(envval, *) pmc_emit_flux
+      call get_environment_variable('PMC_DRYDEP_V', envval, status=stat)
+      if (stat == 0) read(envval, *) pmc_drydep_v
       call get_environment_variable('PMC_CONV', envval, status=stat)
       if (stat == 0) pmc_conv = (trim(envval) /= '0')
       call get_environment_variable('PMC_KZ_PHYS', envval, status=stat)
@@ -2429,6 +2439,141 @@ contains
 #endif
 
    end subroutine atm_partmc_convection
+
+
+   !> Surface emission and dry deposition in the lowest layer, for the Eulerian number scalars
+   !> and, in Lagrangian mode, the particles.
+   !>
+   !> Dry deposition: a constant deposition velocity v acts on the lowest layer of depth dz, so
+   !> a fraction 1 - exp(-v dt / dz) of the layer's number is removed; each particle there is
+   !> removed with that probability. Emission: a uniform number flux over land of soot-like
+   !> particles (the composition and sizes of source 2). The reference scalars get the flux
+   !> divided by the layer's air mass. New computational particles get the weight level that
+   !> the cell's content calls for, and their number is rounded at random, so emission is
+   !> exact in expectation.
+   subroutine atm_partmc_surface(domain, itimestep)
+
+      type (domain_type), intent(inout) :: domain
+      integer, intent(in) :: itimestep
+
+#ifdef MPAS_PARTMC
+      type (mpas_pool_type), pointer :: mesh, state, sfc_input
+      type (field3DReal), pointer :: scalars_field
+      real (kind=RKIND), dimension(:,:,:), pointer :: scalars
+      real (kind=RKIND), dimension(:,:), pointer :: rho_zz, zz
+      real (kind=RKIND), dimension(:), pointer :: rdzw, areaCell, xland
+      real (kind=RKIND), pointer :: config_dt
+      integer, dimension(:,:), pointer :: cellsOnCell
+      integer, dimension(:), pointer :: nEdgesOnCell
+      integer, pointer :: nCells, nCellsSolve, index_pmc_num, index_pmc_num2, index_ref, index_src2
+      integer :: iCell, j, g, n, i, i_oc, i_bc, idx(4), i_s
+      real (kind=RKIND) :: dz, m1, p_dep, n_cell, w, f, x(NPOS), sums(4), g_sums(4)
+      real (kind=dp) :: diam, vol_tot
+      real (kind=dp), allocatable :: vols(:)
+      type(aero_particle_t) :: particle
+
+      if (pmc_emit_flux <= 0.0_RKIND .and. pmc_drydep_v <= 0.0_RKIND) return
+
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'state', state)
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'sfc_input', sfc_input)
+      call mpas_pool_get_config(domain % blocklist % configs, 'config_dt', config_dt)
+      call mpas_pool_get_dimension(mesh, 'nCells', nCells)
+      call mpas_pool_get_dimension(mesh, 'nCellsSolve', nCellsSolve)
+      call mpas_pool_get_dimension(state, 'index_pmc_num', index_pmc_num)
+      call mpas_pool_get_dimension(state, 'index_pmc_num2', index_pmc_num2)
+      call mpas_pool_get_dimension(state, 'index_pmc_ref', index_ref)
+      call mpas_pool_get_dimension(state, 'index_pmc_ref_src2', index_src2)
+      call mpas_pool_get_array(mesh, 'rdzw', rdzw)
+      call mpas_pool_get_array(mesh, 'zz', zz)
+      call mpas_pool_get_array(mesh, 'areaCell', areaCell)
+      call mpas_pool_get_array(mesh, 'nEdgesOnCell', nEdgesOnCell)
+      call mpas_pool_get_array(mesh, 'cellsOnCell', cellsOnCell)
+      call mpas_pool_get_array(state, 'scalars', scalars, 2)
+      call mpas_pool_get_array(state, 'rho_zz', rho_zz, 2)
+      nullify(xland)
+      call mpas_pool_get_array(sfc_input, 'xland', xland)
+      idx = (/ index_pmc_num, index_pmc_num2, index_ref, index_src2 /)
+      i_oc = aero_data_spec_by_name(aero_data, 'OC')
+      i_bc = aero_data_spec_by_name(aero_data, 'BC')
+      allocate(vols(n_spec))
+
+      do iCell = 1, nCellsSolve
+         dz = 1.0_RKIND / (rdzw(1) * zz(1,iCell))
+         ! air mass per area of the lowest layer; number per area is m1 times the mixing ratio
+         m1 = rho_zz(1,iCell) / rdzw(1)
+
+         if (pmc_drydep_v > 0.0_RKIND) then
+            p_dep = 1.0_RKIND - exp(-pmc_drydep_v * config_dt / dz)
+            surf_sums(3) = surf_sums(3) + p_dep * m1 * scalars(index_ref,1,iCell) * areaCell(iCell)
+            do i_s = 1, 4
+               scalars(idx(i_s),1,iCell) = scalars(idx(i_s),1,iCell) * (1.0_RKIND - p_dep)
+            end do
+            if (pmc_n_part > 0 .and. pmc_mode == MODE_LAGR) then
+               do j = pos(1,iCell) % n, 1, -1
+                  if (pmc_random() >= p_dep) cycle
+                  g = aero_states(1,iCell)%apa%particle(j)%weight_class
+                  surf_sums(4) = surf_sums(4) + lagr_w * 2.0_RKIND**(g - LAGR_G0)
+                  call aero_state_remove_particle_no_info(aero_states(1,iCell), j)
+                  call pos_remove(pos(1,iCell), j)
+               end do
+            end if
+         end if
+
+         if (pmc_emit_flux > 0.0_RKIND .and. associated(xland)) then
+            if (nint(xland(iCell)) == 1) then
+               f = pmc_emit_flux * config_dt
+               scalars(index_ref,1,iCell) = scalars(index_ref,1,iCell) + f / m1
+               scalars(index_src2,1,iCell) = scalars(index_src2,1,iCell) + f / m1
+               surf_sums(1) = surf_sums(1) + f * areaCell(iCell)
+               if (pmc_n_part > 0 .and. pmc_mode == MODE_LAGR) then
+                  n_cell = m1 * scalars(index_ref,1,iCell) * areaCell(iCell)
+                  g = LAGR_G0 + nint(log(n_cell / (real(pmc_n_part, kind=RKIND) * lagr_w)) / log(2.0_RKIND))
+                  g = max(1, min(LAGR_GROUPS, g))
+                  w = lagr_w * 2.0_RKIND**(g - LAGR_G0)
+                  f = f * areaCell(iCell) / w
+                  n = int(f)
+                  if (pmc_random() < f - real(n, kind=RKIND)) n = n + 1
+                  do i = 1, n
+                     call aero_particle_zero(particle, aero_data)
+                     diam = 0.05d-6 * exp(log(1.8d0) * rand_normal(0.0d0, 1.0d0))
+                     vol_tot = pii / 6.0d0 * diam**3
+                     vols = 0.0d0
+                     vols(i_bc) = 0.6d0 * vol_tot
+                     vols(i_oc) = 0.4d0 * vol_tot
+                     call aero_particle_set_component(particle, 2, 0.0d0)
+                     particle%n_primary_parts = 1
+                     call aero_particle_set_vols(particle, vols)
+                     call aero_particle_new_id(particle)
+                     call aero_particle_set_weight(particle, 1, g)
+                     call aero_state_add_particle(aero_states(1,iCell), particle, aero_data)
+                     call random_in_cell(iCell, 1, nCells, nEdgesOnCell, cellsOnCell, x(1:4))
+                     x(5:7) = x(1:3)
+                     call pos_append(pos(1,iCell), x)
+                  end do
+                  surf_sums(2) = surf_sums(2) + real(n, kind=RKIND) * w
+               end if
+            end if
+         end if
+
+         if (pmc_n_part > 0 .and. pmc_mode == MODE_LAGR .and. lagr_control) then
+            call lagr_rebalance(1, iCell, nCells, nEdgesOnCell, cellsOnCell)
+         end if
+      end do
+
+      call mpas_pool_get_field(state, 'scalars', scalars_field, 2)
+      call mpas_dmpar_exch_halo_field(scalars_field)
+
+      if (mod(itimestep, 12) == 0) then
+         sums = surf_sums
+         call mpas_dmpar_sum_real_array(domain % dminfo, 4, sums, g_sums)
+         call mpas_log_write('PartMC surface step $i: emitted so far: reference = $r, particles = $r; ' &
+                             // 'deposited so far: reference = $r, particles = $r', &
+                             intArgs=(/itimestep/), realArgs=g_sums)
+      end if
+#endif
+
+   end subroutine atm_partmc_surface
 
 
    !> PartMC Brownian coagulation in every owned cell for one model time step.

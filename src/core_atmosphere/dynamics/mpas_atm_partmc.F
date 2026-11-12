@@ -246,11 +246,12 @@ module mpas_atm_partmc
    !> Wet removal: switch, largest critical supersaturation removed, gas file, and sums by this
    !> task so far: number removed (reference, particles), precipitation at the surface, column
    !> production of precipitation, and the part of the production counted as reaching the
-   !> surface (kg).
+   !> surface (kg); last, the number of particles expected to be removed given the particles
+   !> that were in the layers (the sum of probability times number).
    logical :: pmc_wet = .false.
    real (kind=RKIND) :: pmc_wet_scrit = 1.0e9_RKIND
    character(len=256) :: gas_wet_file = ''
-   real (kind=RKIND) :: wet_sums(5) = 0.0_RKIND
+   real (kind=RKIND) :: wet_sums(6) = 0.0_RKIND
    !> Sulfate (mol) in particles removed by dry and wet deposition, by this task so far.
    real (kind=RKIND) :: part_s_removed = 0.0_RKIND
    !> Repeat sample cells' chemistry after another cell to check MOSAIC carries nothing over.
@@ -3023,7 +3024,7 @@ contains
       integer, pointer :: nCells, nCellsSolve, nVertLevels, index_qc, index_qi, index_qv
       integer, pointer :: index_pmc_num, index_pmc_num2, index_ref, index_src2
       integer :: iCell, k, j, g, i_s, idx(4), n_gas
-      real (kind=RKIND) :: prod, col_prod, r, p, mk, cond, w, sums(5), g_sums(5)
+      real (kind=RKIND) :: prod, col_prod, r, p, mk, cond, w, sums(6), g_sums(6)
       real (kind=RKIND), allocatable :: amount(:)
       type(env_state_t) :: env_state
       logical :: removed
@@ -3120,6 +3121,8 @@ contains
                                 * exner(k,iCell)
             end if
             do j = pos(k,iCell) % n, 1, -1
+               g = aero_states(k,iCell)%apa%particle(j)%weight_class
+               wet_sums(6) = wet_sums(6) + p * lagr_w * 2.0_RKIND**(g - LAGR_G0)
                if (pmc_random() >= p) cycle
                if (pmc_wet_scrit < 1.0e8_RKIND) then
                   if (aero_particle_crit_rel_humid(aero_states(k,iCell)%apa%particle(j), aero_data, env_state) &
@@ -3142,10 +3145,11 @@ contains
 
       if (mod(itimestep, 12) == 0) then
          sums = wet_sums
-         call mpas_dmpar_sum_real_array(domain % dminfo, 5, sums, g_sums)
+         call mpas_dmpar_sum_real_array(domain % dminfo, 6, sums, g_sums)
          call mpas_log_write('PartMC wet removal step $i: number removed so far: reference = $r, particles = $r; ' &
                              // 'so far (kg): surface precipitation = $r, column production = $r, ' &
-                             // 'production counted as reaching the surface = $r', &
+                             // 'production counted as reaching the surface = $r; particles expected ' &
+                             // 'from the layers'' content (all activated) = $r', &
                              intArgs=(/itimestep/), realArgs=g_sums)
       end if
 #endif

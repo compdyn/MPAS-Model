@@ -15,6 +15,10 @@
 !   PMC_KZ_MAX        peak of a prescribed vertical diffusivity profile (m^2/s, default 0 = no
 !                     vertical mixing); applied to the Eulerian scalars and, in lagrangian
 !                     mode, to the particles. PMC_KZ_TOP is the height where it reaches zero.
+!   PMC_MOSAIC        1 = MOSAIC gas chemistry and gas-particle partitioning in every cell
+!                     (needs a build with MOSAIC; default 0). PMC_GAS_DATA and PMC_GAS_INIT
+!                     name the PartMC gas files (gas_data.dat, gas_init.dat); PMC_CHEM_TOP
+!                     is the altitude (m) above which chemistry is skipped.
 !   PMC_EMIT_FLUX     number flux (m^-2 s^-1) of soot-like particles emitted over land (default 0)
 !   PMC_EMIT_LEVELS   number of lowest layers the emission is spread over, uniformly in mixing
 !                     ratio (default 1)
@@ -150,6 +154,11 @@ module mpas_atm_partmc
    use pmc_spec_file
    use pmc_env_state
    use pmc_coagulation
+#ifdef MPAS_PARTMC_MOSAIC
+   use pmc_gas_data
+   use pmc_gas_state
+   use pmc_mosaic
+#endif
    use pmc_coag_kernel
    use pmc_aero_sorted
    use pmc_aero_info_array
@@ -163,7 +172,7 @@ module mpas_atm_partmc
 
    public :: atm_partmc_init, atm_partmc_check, atm_partmc_particles_init, atm_partmc_particles_transport, &
              atm_partmc_particles_to_scalar, atm_partmc_output, atm_partmc_vertical_mixing, &
-             atm_partmc_convection, atm_partmc_surface, &
+             atm_partmc_convection, atm_partmc_surface, atm_partmc_chemistry, &
              atm_partmc_coagulation
 
    integer, parameter :: MODE_FLUX = 1, MODE_LAGR = 2
@@ -208,6 +217,15 @@ module mpas_atm_partmc
    logical :: pmc_kz_phys = .false.
    !> Convective transport with the cumulus scheme's mass fluxes, and particle layer changes so far.
    logical :: pmc_conv = .false.
+   !> MOSAIC chemistry: switch, gas files, top altitude (m), per-cell gas mixing ratios (ppb)
+   !> as (species, level, cell), and the initial global sulfur (mol).
+   logical :: pmc_mosaic = .false.
+   character(len=256) :: gas_data_file = 'gas_data.dat', gas_init_file = 'gas_init.dat'
+   real (kind=RKIND) :: pmc_chem_top = 1.0e9_RKIND, chem_s0 = 0.0_RKIND
+   real (kind=dp), allocatable :: gas_mix(:,:,:)
+#ifdef MPAS_PARTMC_MOSAIC
+   type(gas_data_t) :: gas_data
+#endif
    !> Surface emission flux over land (m^-2 s^-1) and dry deposition velocity (m/s).
    real (kind=RKIND) :: pmc_emit_flux = 0.0_RKIND, pmc_drydep_v = 0.0_RKIND
    !> Real particles so far: emitted (reference, particles) and deposited (reference, particles).
@@ -323,6 +341,14 @@ contains
       if (stat == 0) read(envval, *) lagr_flux_vel
       call get_environment_variable('PMC_LAGR_UCONST', envval, status=stat)
       if (stat == 0) lagr_u_const = (trim(envval) /= '0')
+      call get_environment_variable('PMC_MOSAIC', envval, status=stat)
+      if (stat == 0) pmc_mosaic = (trim(envval) /= '0')
+      call get_environment_variable('PMC_GAS_DATA', envval, status=stat)
+      if (stat == 0) gas_data_file = envval
+      call get_environment_variable('PMC_GAS_INIT', envval, status=stat)
+      if (stat == 0) gas_init_file = envval
+      call get_environment_variable('PMC_CHEM_TOP', envval, status=stat)
+      if (stat == 0) read(envval, *) pmc_chem_top
       call get_environment_variable('PMC_EMIT_FLUX', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_emit_flux
       call get_environment_variable('PMC_EMIT_LEVELS', envval, status=stat)
@@ -2588,6 +2614,166 @@ contains
 #endif
 
    end subroutine atm_partmc_surface
+
+
+   !> Gas chemistry and gas-particle partitioning with MOSAIC (CBM-Z, ASTEM, MESA) in every
+   !> owned cell, through PartMC's interface.
+   !>
+   !> Each cell has its own gas state (mixing ratios in ppb), kept in this module. It starts
+   !> from one PartMC gas_init file everywhere and is NOT transported, mixed, emitted or
+   !> deposited yet: this step only puts the chemistry call in place. Temperature, pressure
+   !> and relative humidity come from the model state; latitude, longitude, altitude and time
+   !> are set for MOSAIC's solar zenith angle.
+   subroutine atm_partmc_chemistry(domain, itimestep)
+
+#ifdef MPAS_PARTMC_MOSAIC
+      use module_data_mosaic_main, only : rlon, rlat, zalt_m
+#endif
+
+      type (domain_type), intent(inout) :: domain
+      integer, intent(in) :: itimestep
+
+#ifdef MPAS_PARTMC_MOSAIC
+      type (mpas_pool_type), pointer :: mesh, state, diag
+      real (kind=RKIND), dimension(:,:,:), pointer :: scalars
+      real (kind=RKIND), dimension(:,:), pointer :: theta_m, exner, pressure_p, pressure_base, zgrid, zz
+      real (kind=RKIND), dimension(:), pointer :: latCell, lonCell, areaCell, rdzw
+      real (kind=RKIND), pointer :: config_dt
+      character (len=StrKIND), pointer :: config_start_time
+      integer, pointer :: nCellsSolve, nVertLevels, index_qv
+      integer :: iCell, k, j, n_before, n_cells, g_n_cells, n_gas, yr, mo, dy, hr, mi, sc, i_so2, i_h2so4, i_so4
+      integer, parameter :: days_before(12) = (/ 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 /)
+      type(spec_file_t) :: file
+      type(env_state_t) :: env_state
+      type(gas_state_t) :: gas_state
+      character(len=PMC_UUID_LEN) :: uuid
+      real (kind=RKIND) :: qv, vol, sums(3), g_sums(3), t0, t1, t_local, t_max
+      real (kind=dp) :: del_t, e_s
+
+      if (.not. pmc_mosaic .or. pmc_n_part <= 0) return
+
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'state', state)
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'diag', diag)
+      call mpas_pool_get_config(domain % blocklist % configs, 'config_dt', config_dt)
+      call mpas_pool_get_config(domain % blocklist % configs, 'config_start_time', config_start_time)
+      call mpas_pool_get_dimension(mesh, 'nCellsSolve', nCellsSolve)
+      call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
+      call mpas_pool_get_dimension(state, 'index_qv', index_qv)
+      call mpas_pool_get_array(mesh, 'latCell', latCell)
+      call mpas_pool_get_array(mesh, 'lonCell', lonCell)
+      call mpas_pool_get_array(mesh, 'areaCell', areaCell)
+      call mpas_pool_get_array(mesh, 'rdzw', rdzw)
+      call mpas_pool_get_array(mesh, 'zgrid', zgrid)
+      call mpas_pool_get_array(mesh, 'zz', zz)
+      call mpas_pool_get_array(state, 'scalars', scalars, 2)
+      call mpas_pool_get_array(state, 'theta_m', theta_m, 2)
+      call mpas_pool_get_array(diag, 'exner', exner)
+      call mpas_pool_get_array(diag, 'pressure_p', pressure_p)
+      call mpas_pool_get_array(diag, 'pressure_base', pressure_base)
+
+      del_t = config_dt
+      uuid = 'mpas-partmc'
+      read(config_start_time, '(i4,1x,i2,1x,i2,1x,i2,1x,i2,1x,i2)') yr, mo, dy, hr, mi, sc
+      env_state%start_day = days_before(mo) + dy
+      if (mo > 2 .and. mod(yr, 4) == 0) env_state%start_day = env_state%start_day + 1
+      env_state%start_time = real(hr*3600 + mi*60 + sc, kind=dp)
+      env_state%elapsed_time = real(itimestep - 1, kind=dp) * del_t
+
+      if (.not. allocated(gas_mix)) then
+         call spec_file_open(trim(gas_data_file), file)
+         call spec_file_read_gas_data(file, gas_data)
+         call spec_file_close(file)
+         call spec_file_open(trim(gas_init_file), file)
+         call spec_file_read_gas_state(file, gas_data, gas_state)
+         call spec_file_close(file)
+         n_gas = gas_data_n_spec(gas_data)
+         allocate(gas_mix(n_gas, nVertLevels, nCellsSolve))
+         do iCell = 1, nCellsSolve
+            do k = 1, nVertLevels
+               gas_mix(:,k,iCell) = gas_state%mix_rat
+            end do
+         end do
+         env_state%temp = 288.0d0
+         env_state%pressure = 1.0d5
+         env_state%rel_humid = 0.5d0
+         env_state%latitude = 0.0d0
+         env_state%longitude = 0.0d0
+         env_state%altitude = 0.0d0
+         call mosaic_init(env_state, aero_data, del_t, .false.)
+         call mpas_log_write('PartMC: MOSAIC with $i gas species from ' // trim(gas_data_file) // ', initial state ' &
+                             // trim(gas_init_file) // ', below $r m', intArgs=(/n_gas/), realArgs=(/pmc_chem_top/))
+      end if
+      n_gas = gas_data_n_spec(gas_data)
+      call gas_state_set_size(gas_state, n_gas)
+      i_so2 = gas_data_spec_by_name(gas_data, 'SO2')
+      i_h2so4 = gas_data_spec_by_name(gas_data, 'H2SO4')
+      i_so4 = aero_data_spec_by_name(aero_data, 'SO4')
+
+      n_cells = 0
+      sums = 0.0_RKIND
+      call cpu_time(t0)
+      do iCell = 1, nCellsSolve
+         do k = 1, nVertLevels
+            vol = cell_volume(areaCell(iCell), rdzw(k), zz(k,iCell))
+            qv = max(0.0_RKIND, scalars(index_qv,k,iCell))
+            env_state%temp = theta_m(k,iCell) / (1.0_RKIND + rvord*qv) * exner(k,iCell)
+            env_state%pressure = pressure_p(k,iCell) + pressure_base(k,iCell)
+            e_s = env_state_sat_vapor_pressure(env_state)
+            env_state%rel_humid = min(0.99d0, max(1.0d-4, qv * env_state%pressure / (0.622d0 + qv) / e_s))
+            env_state%latitude = latCell(iCell) * 180.0d0 / pii
+            env_state%longitude = lonCell(iCell) * 180.0d0 / pii
+            env_state%altitude = 0.5d0*(zgrid(k,iCell) + zgrid(k+1,iCell))
+
+            if (env_state%altitude < pmc_chem_top) then
+               rlat = latCell(iCell)
+               rlon = lonCell(iCell)
+               zalt_m = env_state%altitude
+               gas_state%mix_rat = gas_mix(:,k,iCell)
+               n_before = aero_state_n_part(aero_states(k,iCell))
+               call mosaic_timestep(env_state, aero_data, aero_states(k,iCell), gas_data, gas_state, .false., uuid)
+               if (aero_state_n_part(aero_states(k,iCell)) /= n_before) then
+                  call mpas_log_write('PartMC: MOSAIC changed the number of particles in a cell', &
+                                      messageType=MPAS_LOG_CRIT)
+               end if
+               gas_mix(:,k,iCell) = gas_state%mix_rat
+               n_cells = n_cells + 1
+            end if
+
+            if (mod(itimestep, 12) == 0 .or. itimestep == 1) then
+               ! sulfur (mol): gas, then particles
+               sums(1) = sums(1) + (gas_mix(i_so2,k,iCell) + gas_mix(i_h2so4,k,iCell)) * 1.0d-9 &
+                                   * env_state_air_molar_den(env_state) * vol
+               do j = 1, aero_state_n_part(aero_states(k,iCell))
+                  sums(2) = sums(2) + aero_states(k,iCell)%apa%particle(j)%vol(i_so4) &
+                                      * aero_data%density(i_so4) / aero_data%molec_weight(i_so4) &
+                                      * aero_weight_array_num_conc(aero_states(k,iCell)%awa, &
+                                           aero_states(k,iCell)%apa%particle(j), aero_data) * vol
+                  sums(3) = sums(3) + aero_states(k,iCell)%apa%particle(j)%vol(aero_data%i_water) &
+                                      * aero_data%density(aero_data%i_water) &
+                                      * aero_weight_array_num_conc(aero_states(k,iCell)%awa, &
+                                           aero_states(k,iCell)%apa%particle(j), aero_data) * vol
+               end do
+            end if
+         end do
+      end do
+      call cpu_time(t1)
+
+      if (mod(itimestep, 12) == 0 .or. itimestep == 1) then
+         t_local = t1 - t0
+         call mpas_dmpar_sum_real_array(domain % dminfo, 3, sums, g_sums)
+         call mpas_dmpar_sum_int(domain % dminfo, n_cells, g_n_cells)
+         call mpas_dmpar_max_real(domain % dminfo, t_local, t_max)
+         if (chem_s0 <= 0.0_RKIND) chem_s0 = g_sums(1) + g_sums(2)
+         call mpas_log_write('PartMC chemistry step $i: cells = $i, sulfur (mol) gas = $r, particles = $r, ' &
+                             // 'total rel change = $r, particle water (kg) = $r, slowest task = $r s', &
+                             intArgs=(/itimestep, g_n_cells/), &
+                             realArgs=(/g_sums(1), g_sums(2), (g_sums(1) + g_sums(2))/chem_s0 - 1.0_RKIND, &
+                                        g_sums(3), t_max/))
+      end if
+#endif
+
+   end subroutine atm_partmc_chemistry
 
 
    !> PartMC Brownian coagulation in every owned cell for one model time step.

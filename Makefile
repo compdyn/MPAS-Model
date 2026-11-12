@@ -805,6 +805,12 @@ ifneq "$(PARTMC)" ""
 	override CPPFLAGS += -DMPAS_PARTMC
 endif
 
+ifneq "$(MOSAIC)" ""
+	FCINCLUDES += -I$(MOSAIC)/datamodules
+	LIBS += -L$(MOSAIC) -lmosaic
+	override CPPFLAGS += -DMPAS_PARTMC_MOSAIC
+endif
+
 ifneq "$(LAPACK)" ""
         LIBS += -L$(LAPACK)
         LIBS += -llapack

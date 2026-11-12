@@ -158,6 +158,7 @@ module mpas_atm_partmc
    use pmc_gas_data
    use pmc_gas_state
    use pmc_mosaic
+   use pmc_output, only : output_state, OUTPUT_TYPE_SINGLE
 #endif
    use pmc_coag_kernel
    use pmc_aero_sorted
@@ -225,6 +226,9 @@ module mpas_atm_partmc
    integer, allocatable :: gas_idx(:)
    !> Repeat sample cells' chemistry after another cell to check MOSAIC carries nothing over.
    logical :: pmc_chem_selftest = .false.
+   !> Cells (global cell ID and level) whose state is saved in PartMC's own file format before
+   !> and after each chemistry step, for replaying the step with the standalone PartMC program.
+   integer :: n_box = 0, box_id(16), box_k(16), box_steps = 60
 #ifdef MPAS_PARTMC_MOSAIC
    type(gas_data_t) :: gas_data
 #endif
@@ -305,7 +309,7 @@ contains
 
    subroutine read_settings()
       character(len=256) :: envval
-      integer :: stat
+      integer :: stat, i
       real (kind=RKIND) :: num_scale
 
       if (settings_read) return
@@ -347,6 +351,19 @@ contains
       if (stat == 0) pmc_chem = (trim(envval) /= '0')
       call get_environment_variable('PMC_CHEM_SELFTEST', envval, status=stat)
       if (stat == 0) pmc_chem_selftest = (trim(envval) /= '0')
+      ! PMC_CHEM_BOX="id:level,id:level,...", files go to the directory box/
+      call get_environment_variable('PMC_CHEM_BOX', envval, status=stat)
+      if (stat == 0 .and. len_trim(envval) > 0) then
+         n_box = 1
+         do i = 1, len_trim(envval)
+            if (envval(i:i) == ',') n_box = n_box + 1
+            if (envval(i:i) == ':') envval(i:i) = ','
+         end do
+         n_box = min(n_box, size(box_id))
+         read(envval, *) (box_id(i), box_k(i), i = 1, n_box)
+      end if
+      call get_environment_variable('PMC_CHEM_BOX_STEPS', envval, status=stat)
+      if (stat == 0) read(envval, *) box_steps
       call get_environment_variable('PMC_GAS_DATA', envval, status=stat)
       if (stat == 0) gas_data_file = envval
       call get_environment_variable('PMC_GAS_INIT', envval, status=stat)
@@ -2689,7 +2706,9 @@ contains
       type(aero_state_t) :: state_a, state_b, state_pre
       type(env_state_t) :: env_b
       real (kind=RKIND) :: test_sums(3), g_test(3)
-      integer :: kk, jc, n_test, g_n_test
+      integer :: kk, jc, n_test, g_n_test, i_box
+      integer, dimension(:), pointer :: indexToCellID
+      character(len=64) :: box_prefix
 
       if (.not. pmc_chem .or. pmc_n_part <= 0) return
 
@@ -2707,6 +2726,7 @@ contains
       call mpas_pool_get_array(mesh, 'rdzw', rdzw)
       call mpas_pool_get_array(mesh, 'zgrid', zgrid)
       call mpas_pool_get_array(mesh, 'zz', zz)
+      call mpas_pool_get_array(mesh, 'indexToCellID', indexToCellID)
       call mpas_pool_get_array(state, 'scalars', scalars, 2)
       call mpas_pool_get_array(state, 'theta_m', theta_m, 2)
       call mpas_pool_get_array(state, 'rho_zz', rho_zz, 2)
@@ -2794,7 +2814,24 @@ contains
                   gas_pre = gas_state%mix_rat
                   rh_in = env_state%rel_humid
                end if
+               i_box = 0
+               if (itimestep <= box_steps) then
+                  do j = 1, n_box
+                     if (indexToCellID(iCell) == box_id(j) .and. k == box_k(j)) i_box = j
+                  end do
+               end if
+               if (i_box > 0) then
+                  write(box_prefix, '(a,i0,a,i0)') 'box/c', box_id(i_box), '_k', k
+                  call output_state(trim(box_prefix) // '_pre', OUTPUT_TYPE_SINGLE, aero_data, aero_states(k,iCell), &
+                                    gas_data, gas_state, env_state, itimestep, env_state%elapsed_time, del_t, 1, &
+                                    .false., .false., uuid)
+               end if
                call mosaic_timestep(env_state, aero_data, aero_states(k,iCell), gas_data, gas_state, .false., uuid)
+               if (i_box > 0) then
+                  call output_state(trim(box_prefix) // '_post', OUTPUT_TYPE_SINGLE, aero_data, aero_states(k,iCell), &
+                                    gas_data, gas_state, env_state, itimestep, env_state%elapsed_time, del_t, 1, &
+                                    .false., .false., uuid)
+               end if
                if (aero_state_n_part(aero_states(k,iCell)) /= n_before) then
                   call mpas_log_write('PartMC: MOSAIC changed the number of particles in a cell', &
                                       messageType=MPAS_LOG_CRIT)

@@ -252,6 +252,10 @@ module mpas_atm_partmc
    real (kind=RKIND) :: pmc_wet_scrit = 1.0e9_RKIND
    character(len=256) :: gas_wet_file = ''
    real (kind=RKIND) :: wet_sums(6) = 0.0_RKIND
+   !> Sums weighted by the reference number removed, to describe where removal happens:
+   !> probability, vertical Courant number of rising air, share in rising air, number of
+   !> adjacent removing layers, and the share in runs of 1, 2-3, 4-7 and 8 or more layers.
+   real (kind=RKIND) :: wet_where(8) = 0.0_RKIND
    !> Sulfate (mol) in particles removed by dry and wet deposition, by this task so far.
    real (kind=RKIND) :: part_s_removed = 0.0_RKIND
    !> Repeat sample cells' chemistry after another cell to check MOSAIC carries nothing over.
@@ -3016,7 +3020,7 @@ contains
       type (mpas_pool_type), pointer :: mesh, state, diag, diag_physics
       type (field3DReal), pointer :: scalars_field
       real (kind=RKIND), dimension(:,:,:), pointer :: scalars
-      real (kind=RKIND), dimension(:,:), pointer :: rho_zz, rainprod, theta_m, exner
+      real (kind=RKIND), dimension(:,:), pointer :: rho_zz, rainprod, theta_m, exner, wwAvg
       real (kind=RKIND), dimension(:), pointer :: rdzw, areaCell, rainncv
       real (kind=RKIND), pointer :: config_dt
       integer, dimension(:,:), pointer :: cellsOnCell
@@ -3028,6 +3032,8 @@ contains
       real (kind=RKIND), allocatable :: amount(:)
       type(env_state_t) :: env_state
       logical :: removed
+      integer :: k1, k2, n_run
+      real (kind=RKIND) :: amt, cn, wsum(8), g_wsum(8)
 #ifdef MPAS_PARTMC_MOSAIC
       type(spec_file_t) :: file
       type(gas_state_t), save :: gas_wet
@@ -3058,6 +3064,7 @@ contains
       call mpas_pool_get_array(state, 'rho_zz', rho_zz, 2)
       call mpas_pool_get_array(state, 'theta_m', theta_m, 2)
       call mpas_pool_get_array(diag, 'exner', exner)
+      call mpas_pool_get_array(diag, 'wwAvg', wwAvg)
       nullify(rainprod)
       nullify(rainncv)
       call mpas_pool_get_array(diag_physics, 'rainprod', rainprod)
@@ -3103,7 +3110,37 @@ contains
             ! dry air mass per area; number per area is mk times the mixing ratio
             mk = rho_zz(k,iCell) / rdzw(k)
 
-            wet_sums(1) = wet_sums(1) + p * mk * scalars(index_ref,k,iCell) * areaCell(iCell)
+            amt = p * mk * scalars(index_ref,k,iCell) * areaCell(iCell)
+            wet_sums(1) = wet_sums(1) + amt
+            ! where this removal happens: run of adjacent layers with production, and the
+            ! Courant number of the vertical mass flux through the layer
+            k1 = k
+            do while (k1 > 1)
+               if (rainprod(k1-1,iCell) <= 0.0_RKIND) exit
+               k1 = k1 - 1
+            end do
+            k2 = k
+            do while (k2 < nVertLevels)
+               if (rainprod(k2+1,iCell) <= 0.0_RKIND) exit
+               k2 = k2 + 1
+            end do
+            n_run = k2 - k1 + 1
+            cn = 0.5_RKIND * (wwAvg(k,iCell) + wwAvg(k+1,iCell)) * config_dt * rdzw(k) / rho_zz(k,iCell)
+            wet_where(1) = wet_where(1) + amt * p
+            if (cn > 0.0_RKIND) then
+               wet_where(2) = wet_where(2) + amt * cn
+               wet_where(3) = wet_where(3) + amt
+            end if
+            wet_where(4) = wet_where(4) + amt * real(n_run, kind=RKIND)
+            if (n_run == 1) then
+               wet_where(5) = wet_where(5) + amt
+            else if (n_run <= 3) then
+               wet_where(6) = wet_where(6) + amt
+            else if (n_run <= 7) then
+               wet_where(7) = wet_where(7) + amt
+            else
+               wet_where(8) = wet_where(8) + amt
+            end if
             do i_s = 1, 4
                scalars(idx(i_s),k,iCell) = scalars(idx(i_s),k,iCell) * (1.0_RKIND - p)
             end do
@@ -3151,6 +3188,16 @@ contains
                              // 'production counted as reaching the surface = $r; particles expected ' &
                              // 'from the layers'' content (all activated) = $r', &
                              intArgs=(/itimestep/), realArgs=g_sums)
+         wsum = wet_where
+         call mpas_dmpar_sum_real_array(domain % dminfo, 8, wsum, g_wsum)
+         if (g_sums(1) > 0.0_RKIND) then
+            call mpas_log_write('PartMC wet removal step $i: weighted by number removed: probability = $r, ' &
+                                // 'Courant number of rising air = $r, share in rising air = $r, adjacent ' &
+                                // 'removing layers = $r, share in runs of 1, 2-3, 4-7, 8+ layers = $r $r $r $r', &
+                                intArgs=(/itimestep/), &
+                                realArgs=(/g_wsum(1)/g_sums(1), g_wsum(2)/max(g_wsum(3), 1.0e-30_RKIND), &
+                                           g_wsum(3)/g_sums(1), g_wsum(4)/g_sums(1), g_wsum(5:8)/g_sums(1)/))
+         end if
       end if
 #endif
 

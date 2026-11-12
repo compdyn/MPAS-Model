@@ -27,6 +27,11 @@
 !                     PMC_GAS_EMIT_SCALE (default 1). Needs PMC_MOSAIC=1.
 !   PMC_GAS_DRYDEP    file of gas dry deposition velocities (species name, m/s), applied to the
 !                     lowest layer. Needs PMC_MOSAIC=1.
+!   PMC_WET           1 = removal of particles and gases by grid-scale precipitation, in cloud
+!                     (default 0). PMC_WET_SCRIT: only particles with a critical supersaturation
+!                     up to this value (as a fraction, 0.002 = 0.2%) are removed (default: all).
+!                     PMC_GAS_WET: file of the fraction of each gas that is in cloud water
+!                     (species name, 0 to 1); needs PMC_MOSAIC=1.
 !   PMC_EMIT_FLUX     number flux (m^-2 s^-1) of soot-like particles emitted over land (default 0)
 !   PMC_EMIT_LEVELS   number of lowest layers the emission is spread over, uniformly in mixing
 !                     ratio (default 1)
@@ -182,6 +187,7 @@ module mpas_atm_partmc
    public :: atm_partmc_init, atm_partmc_check, atm_partmc_particles_init, atm_partmc_particles_transport, &
              atm_partmc_particles_to_scalar, atm_partmc_output, atm_partmc_vertical_mixing, &
              atm_partmc_convection, atm_partmc_surface, atm_partmc_gas_surface, atm_partmc_chemistry, &
+             atm_partmc_wet_removal, &
              atm_partmc_coagulation
 
    integer, parameter :: MODE_FLUX = 1, MODE_LAGR = 2
@@ -236,7 +242,17 @@ module mpas_atm_partmc
    !> deposited by this task so far for each species.
    character(len=256) :: gas_emit_file = '', gas_drydep_file = ''
    real (kind=RKIND) :: gas_emit_scale = 1.0_RKIND
-   real (kind=RKIND), allocatable :: gas_emitted(:), gas_deposited(:), gas_content0(:)
+   real (kind=RKIND), allocatable :: gas_emitted(:), gas_deposited(:), gas_content0(:), gas_wetdep(:)
+   !> Wet removal: switch, largest critical supersaturation removed, gas file, and sums by this
+   !> task so far: number removed (reference, particles), precipitation at the surface, column
+   !> production of precipitation, and the part of the production counted as reaching the
+   !> surface (kg).
+   logical :: pmc_wet = .false.
+   real (kind=RKIND) :: pmc_wet_scrit = 1.0e9_RKIND
+   character(len=256) :: gas_wet_file = ''
+   real (kind=RKIND) :: wet_sums(5) = 0.0_RKIND
+   !> Sulfate (mol) in particles removed by dry and wet deposition, by this task so far.
+   real (kind=RKIND) :: part_s_removed = 0.0_RKIND
    !> Repeat sample cells' chemistry after another cell to check MOSAIC carries nothing over.
    logical :: pmc_chem_selftest = .false.
    !> Cells (global cell ID and level) whose state is saved in PartMC's own file format before
@@ -391,6 +407,12 @@ contains
       if (stat == 0) gas_init_file = envval
       call get_environment_variable('PMC_CHEM_TOP', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_chem_top
+      call get_environment_variable('PMC_WET', envval, status=stat)
+      if (stat == 0) pmc_wet = (trim(envval) /= '0')
+      call get_environment_variable('PMC_WET_SCRIT', envval, status=stat)
+      if (stat == 0) read(envval, *) pmc_wet_scrit
+      call get_environment_variable('PMC_GAS_WET', envval, status=stat)
+      if (stat == 0) gas_wet_file = envval
       call get_environment_variable('PMC_GAS_EMIT', envval, status=stat)
       if (stat == 0) gas_emit_file = envval
       call get_environment_variable('PMC_GAS_EMIT_SCALE', envval, status=stat)
@@ -2624,6 +2646,8 @@ contains
                   if (pmc_random() >= p_dep) cycle
                   g = aero_states(1,iCell)%apa%particle(j)%weight_class
                   surf_sums(4) = surf_sums(4) + lagr_w * 2.0_RKIND**(g - LAGR_G0)
+                  part_s_removed = part_s_removed + particle_sulfate(aero_states(1,iCell)%apa%particle(j)) &
+                                                    * lagr_w * 2.0_RKIND**(g - LAGR_G0)
                   call aero_state_remove_particle_no_info(aero_states(1,iCell), j)
                   call pos_remove(pos(1,iCell), j)
                end do
@@ -2823,13 +2847,17 @@ contains
       type(gas_state_t), allocatable, save :: gas_emit_states(:)
       real (kind=dp), allocatable, save :: gas_emit_time(:), gas_emit_rate(:)
       real (kind=dp) :: rate
+      logical, save :: gas_surface_read = .false.
+      real (kind=RKIND), allocatable :: g_wet(:)
+      integer :: j_w
 
       if (.not. pmc_chem .or. pmc_n_part <= 0) return
-      if (len_trim(gas_emit_file) == 0 .and. len_trim(gas_drydep_file) == 0) return
+      if (len_trim(gas_emit_file) == 0 .and. len_trim(gas_drydep_file) == 0 &
+          .and. .not. (pmc_wet .and. len_trim(gas_wet_file) > 0)) return
 
       call gas_setup(domain)
       n_gas = gas_data_n_spec(gas_data)
-      allocate(local(n_gas), g_content(n_gas), g_emit(n_gas), g_dep(n_gas), frac(n_gas), amount(n_gas))
+      allocate(local(n_gas), g_content(n_gas), g_emit(n_gas), g_dep(n_gas), frac(n_gas), amount(n_gas), g_wet(n_gas))
 
       call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
       call mpas_pool_get_subpool(domain % blocklist % structs, 'state', state)
@@ -2845,12 +2873,9 @@ contains
       nullify(landmask)
       call mpas_pool_get_array(sfc_input, 'landmask', landmask)
 
-      if (.not. allocated(gas_emitted)) then
-         allocate(gas_emitted(n_gas), gas_deposited(n_gas), gas_content0(n_gas))
-         gas_emitted = 0.0_RKIND
-         gas_deposited = 0.0_RKIND
-         call gas_content(domain, local)
-         call mpas_dmpar_sum_real_array(domain % dminfo, n_gas, local, gas_content0)
+      call gas_budget_setup(domain)
+      if (.not. gas_surface_read) then
+         gas_surface_read = .true.
          if (len_trim(gas_emit_file) > 0) then
             call spec_file_open(trim(gas_emit_file), file)
             call spec_file_read_gas_states_times_rates(file, gas_data, gas_emit_time, gas_emit_rate, gas_emit_states)
@@ -2907,22 +2932,225 @@ contains
          call mpas_dmpar_sum_real_array(domain % dminfo, n_gas, local, g_content)
          call mpas_dmpar_sum_real_array(domain % dminfo, n_gas, gas_emitted, g_emit)
          call mpas_dmpar_sum_real_array(domain % dminfo, n_gas, gas_deposited, g_dep)
-         ! the species with the most emitted and the most deposited so far
+         call mpas_dmpar_sum_real_array(domain % dminfo, n_gas, gas_wetdep, g_wet)
+         ! the species with the most emitted, dry deposited and wet deposited so far
          j_e = maxloc(g_emit, dim=1)
          j_d = maxloc(g_dep, dim=1)
+         j_w = maxloc(g_wet, dim=1)
          do j = 1, n_gas
-            if (j /= j_e .and. j /= j_d) cycle
+            if (j /= j_e .and. j /= j_d .and. j /= j_w) cycle
             call mpas_log_write('PartMC gas surface step $i: ' // trim(gas_data%name(j)) // ' (mol) content = $r, ' &
-                                // 'at start = $r, emitted = $r, deposited = $r, budget residual / content = $r', &
+                                // 'at start = $r, emitted = $r, dry deposited = $r, wet deposited = $r, ' &
+                                // 'budget residual / content = $r', &
                                 intArgs=(/itimestep/), &
-                                realArgs=(/g_content(j), gas_content0(j), g_emit(j), g_dep(j), &
-                                           (g_content(j) - gas_content0(j) - g_emit(j) + g_dep(j)) &
+                                realArgs=(/g_content(j), gas_content0(j), g_emit(j), g_dep(j), g_wet(j), &
+                                           (g_content(j) - gas_content0(j) - g_emit(j) + g_dep(j) + g_wet(j)) &
                                            / max(g_content(j), 1.0e-30_RKIND)/))
          end do
       end if
 #endif
 
    end subroutine atm_partmc_gas_surface
+
+
+   !> Sulfate (mol) in one real particle represented by a computational particle.
+   function particle_sulfate(particle)
+      type(aero_particle_t), intent(in) :: particle
+      real (kind=RKIND) :: particle_sulfate
+      integer, save :: i_so4 = -1
+      if (i_so4 < 0) i_so4 = aero_data_spec_by_name(aero_data, 'SO4')
+      particle_sulfate = 0.0_RKIND
+      if (i_so4 > 0) particle_sulfate = particle%vol(i_so4) * aero_data%density(i_so4) / aero_data%molec_weight(i_so4)
+   end function particle_sulfate
+
+
+   !> Allocate the gas budget sums and record the content of each gas at the start. Does this
+   !> once, at the first call.
+   subroutine gas_budget_setup(domain)
+
+      type (domain_type), intent(inout) :: domain
+
+#ifdef MPAS_PARTMC_MOSAIC
+      real (kind=RKIND), allocatable :: local(:)
+      integer :: n_gas
+
+      if (allocated(gas_emitted)) return
+      call gas_setup(domain)
+      n_gas = gas_data_n_spec(gas_data)
+      allocate(gas_emitted(n_gas), gas_deposited(n_gas), gas_wetdep(n_gas), gas_content0(n_gas), local(n_gas))
+      gas_emitted = 0.0_RKIND
+      gas_deposited = 0.0_RKIND
+      gas_wetdep = 0.0_RKIND
+      call gas_content(domain, local)
+      call mpas_dmpar_sum_real_array(domain % dminfo, n_gas, local, gas_content0)
+#endif
+
+   end subroutine gas_budget_setup
+
+
+   !> Removal of particles and gases in cloud by grid-scale precipitation.
+   !>
+   !> The microphysics gives, for each layer, the rate P at which cloud water and ice turn into
+   !> precipitation (rainprod, kg/kg/s). Over one step the layer's condensate loses the fraction
+   !>   f = P dt / (qc + qi + P dt)
+   !> (qc and qi are the values after the microphysics, so the denominator is the condensate
+   !> before the conversion). Precipitation that evaporates on the way down puts its content
+   !> back in the air; that is not followed layer by layer here. Instead f is multiplied by the
+   !> fraction r of the column's production that reaches the ground in this step,
+   !>   r = min(1, surface precipitation / column sum of P dt),
+   !> so that nothing is removed where no precipitation arrives. A tracer that is all in the
+   !> cloud condensate loses the fraction r f. Particles: each one in the layer whose critical
+   !> supersaturation is at most PMC_WET_SCRIT is removed with probability r f. The reference
+   !> number scalars lose r f, so they agree with the particles only when all particles count
+   !> as activated. Gases lose e r f, with e the fraction of the gas in cloud water from the
+   !> PMC_GAS_WET file. The cell is taken as cloudy throughout wherever it has condensate,
+   !> as the microphysics does. Convective precipitation and scavenging below cloud are not
+   !> included.
+   subroutine atm_partmc_wet_removal(domain, itimestep)
+
+      type (domain_type), intent(inout) :: domain
+      integer, intent(in) :: itimestep
+
+#ifdef MPAS_PARTMC
+      type (mpas_pool_type), pointer :: mesh, state, diag, diag_physics
+      type (field3DReal), pointer :: scalars_field
+      real (kind=RKIND), dimension(:,:,:), pointer :: scalars
+      real (kind=RKIND), dimension(:,:), pointer :: rho_zz, rainprod, theta_m, exner
+      real (kind=RKIND), dimension(:), pointer :: rdzw, areaCell, rainncv
+      real (kind=RKIND), pointer :: config_dt
+      integer, dimension(:,:), pointer :: cellsOnCell
+      integer, dimension(:), pointer :: nEdgesOnCell
+      integer, pointer :: nCells, nCellsSolve, nVertLevels, index_qc, index_qi, index_qv
+      integer, pointer :: index_pmc_num, index_pmc_num2, index_ref, index_src2
+      integer :: iCell, k, j, g, i_s, idx(4), n_gas
+      real (kind=RKIND) :: prod, col_prod, r, p, mk, cond, w, sums(5), g_sums(5)
+      real (kind=RKIND), allocatable :: amount(:)
+      type(env_state_t) :: env_state
+      logical :: removed
+#ifdef MPAS_PARTMC_MOSAIC
+      type(spec_file_t) :: file
+      type(gas_state_t), save :: gas_wet
+#endif
+
+      if (.not. pmc_wet) return
+
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'state', state)
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'diag', diag)
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'diag_physics', diag_physics)
+      call mpas_pool_get_config(domain % blocklist % configs, 'config_dt', config_dt)
+      call mpas_pool_get_dimension(mesh, 'nCells', nCells)
+      call mpas_pool_get_dimension(mesh, 'nCellsSolve', nCellsSolve)
+      call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
+      call mpas_pool_get_dimension(state, 'index_qc', index_qc)
+      call mpas_pool_get_dimension(state, 'index_qi', index_qi)
+      call mpas_pool_get_dimension(state, 'index_qv', index_qv)
+      call mpas_pool_get_dimension(state, 'index_pmc_num', index_pmc_num)
+      call mpas_pool_get_dimension(state, 'index_pmc_num2', index_pmc_num2)
+      call mpas_pool_get_dimension(state, 'index_pmc_ref', index_ref)
+      call mpas_pool_get_dimension(state, 'index_pmc_ref_src2', index_src2)
+      call mpas_pool_get_array(mesh, 'rdzw', rdzw)
+      call mpas_pool_get_array(mesh, 'areaCell', areaCell)
+      call mpas_pool_get_array(mesh, 'nEdgesOnCell', nEdgesOnCell)
+      call mpas_pool_get_array(mesh, 'cellsOnCell', cellsOnCell)
+      call mpas_pool_get_array(state, 'scalars', scalars, 2)
+      call mpas_pool_get_array(state, 'rho_zz', rho_zz, 2)
+      call mpas_pool_get_array(state, 'theta_m', theta_m, 2)
+      call mpas_pool_get_array(diag, 'exner', exner)
+      nullify(rainprod)
+      nullify(rainncv)
+      call mpas_pool_get_array(diag_physics, 'rainprod', rainprod)
+      call mpas_pool_get_array(diag_physics, 'rainncv', rainncv)
+      if (.not. associated(rainprod) .or. .not. associated(rainncv)) then
+         call mpas_log_write('PartMC: wet removal needs a microphysics scheme that gives rainprod', &
+                             messageType=MPAS_LOG_CRIT)
+      end if
+      idx = (/ index_pmc_num, index_pmc_num2, index_ref, index_src2 /)
+
+      n_gas = 0
+#ifdef MPAS_PARTMC_MOSAIC
+      if (pmc_chem .and. pmc_n_part > 0 .and. len_trim(gas_wet_file) > 0) then
+         call gas_budget_setup(domain)
+         n_gas = gas_data_n_spec(gas_data)
+         allocate(amount(n_gas))
+         if (.not. allocated(gas_wet%mix_rat)) then
+            call spec_file_open(trim(gas_wet_file), file)
+            call spec_file_read_gas_state(file, gas_data, gas_wet)
+            call spec_file_close(file)
+            call mpas_log_write('PartMC: wet removal of gases with the in-cloud fractions of ' // trim(gas_wet_file))
+         end if
+      end if
+#endif
+
+      do iCell = 1, nCellsSolve
+         ! precipitation produced in the column this step (kg m^-2) and the part reaching the ground
+         col_prod = 0.0_RKIND
+         do k = 1, nVertLevels
+            col_prod = col_prod + max(0.0_RKIND, rainprod(k,iCell)) * config_dt * rho_zz(k,iCell) / rdzw(k)
+         end do
+         wet_sums(3) = wet_sums(3) + max(0.0_RKIND, rainncv(iCell)) * areaCell(iCell)
+         wet_sums(4) = wet_sums(4) + col_prod * areaCell(iCell)
+         if (col_prod <= 0.0_RKIND .or. rainncv(iCell) <= 0.0_RKIND) cycle
+         r = min(1.0_RKIND, rainncv(iCell) / col_prod)
+         wet_sums(5) = wet_sums(5) + r * col_prod * areaCell(iCell)
+
+         do k = 1, nVertLevels
+            prod = max(0.0_RKIND, rainprod(k,iCell)) * config_dt
+            if (prod <= 0.0_RKIND) cycle
+            cond = max(0.0_RKIND, scalars(index_qc,k,iCell)) + max(0.0_RKIND, scalars(index_qi,k,iCell))
+            p = r * prod / (cond + prod)
+            ! dry air mass per area; number per area is mk times the mixing ratio
+            mk = rho_zz(k,iCell) / rdzw(k)
+
+            wet_sums(1) = wet_sums(1) + p * mk * scalars(index_ref,k,iCell) * areaCell(iCell)
+            do i_s = 1, 4
+               scalars(idx(i_s),k,iCell) = scalars(idx(i_s),k,iCell) * (1.0_RKIND - p)
+            end do
+#ifdef MPAS_PARTMC_MOSAIC
+            if (n_gas > 0) then
+               amount = min(1.0d0, max(0.0d0, gas_wet%mix_rat)) * p * scalars(gas_idx,k,iCell)
+               scalars(gas_idx,k,iCell) = scalars(gas_idx,k,iCell) - amount
+               gas_wetdep = gas_wetdep + amount * 1.0e-9_RKIND * mk / 0.028966_RKIND * areaCell(iCell)
+            end if
+#endif
+            if (pmc_n_part <= 0 .or. pmc_mode /= MODE_LAGR) cycle
+            removed = .false.
+            if (pmc_wet_scrit < 1.0e8_RKIND) then
+               env_state%temp = theta_m(k,iCell) / (1.0_RKIND + rvord*max(0.0_RKIND, scalars(index_qv,k,iCell))) &
+                                * exner(k,iCell)
+            end if
+            do j = pos(k,iCell) % n, 1, -1
+               if (pmc_random() >= p) cycle
+               if (pmc_wet_scrit < 1.0e8_RKIND) then
+                  if (aero_particle_crit_rel_humid(aero_states(k,iCell)%apa%particle(j), aero_data, env_state) &
+                      - 1.0d0 > pmc_wet_scrit) cycle
+               end if
+               g = aero_states(k,iCell)%apa%particle(j)%weight_class
+               w = lagr_w * 2.0_RKIND**(g - LAGR_G0)
+               wet_sums(2) = wet_sums(2) + w
+               part_s_removed = part_s_removed + particle_sulfate(aero_states(k,iCell)%apa%particle(j)) * w
+               call aero_state_remove_particle_no_info(aero_states(k,iCell), j)
+               call pos_remove(pos(k,iCell), j)
+               removed = .true.
+            end do
+            if (removed .and. lagr_control) call lagr_rebalance(k, iCell, nCells, nEdgesOnCell, cellsOnCell)
+         end do
+      end do
+
+      call mpas_pool_get_field(state, 'scalars', scalars_field, 2)
+      call mpas_dmpar_exch_halo_field(scalars_field)
+
+      if (mod(itimestep, 12) == 0) then
+         sums = wet_sums
+         call mpas_dmpar_sum_real_array(domain % dminfo, 5, sums, g_sums)
+         call mpas_log_write('PartMC wet removal step $i: number removed so far: reference = $r, particles = $r; ' &
+                             // 'so far (kg): surface precipitation = $r, column production = $r, ' &
+                             // 'production counted as reaching the surface = $r', &
+                             intArgs=(/itimestep/), realArgs=g_sums)
+      end if
+#endif
+
+   end subroutine atm_partmc_wet_removal
 
 
    !> Gas chemistry and gas-particle partitioning with MOSAIC (CBM-Z, ASTEM, MESA) in every
@@ -3148,8 +3376,10 @@ contains
          t_local = t1 - t0
          ! net sulfur (mol) put in at the surface so far
          if (allocated(gas_emitted)) then
-            sums(4) = gas_emitted(i_so2) + gas_emitted(i_h2so4) - gas_deposited(i_so2) - gas_deposited(i_h2so4)
+            sums(4) = gas_emitted(i_so2) + gas_emitted(i_h2so4) - gas_deposited(i_so2) - gas_deposited(i_h2so4) &
+                      - gas_wetdep(i_so2) - gas_wetdep(i_h2so4)
          end if
+         sums(4) = sums(4) - part_s_removed
          call mpas_dmpar_sum_real_array(domain % dminfo, 4, sums, g_sums)
          call mpas_dmpar_sum_int(domain % dminfo, n_cells, g_n_cells)
          call mpas_dmpar_max_real(domain % dminfo, t_local, t_max)

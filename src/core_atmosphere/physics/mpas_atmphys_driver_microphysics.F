@@ -454,6 +454,7 @@
                   re_qc_bg  = re_qc_bg    , re_qi_bg   = re_qi_bg     , re_qs_bg  = re_qs_bg  , &
                   re_qc_max = re_qc_max   , re_qi_max  = re_qi_max    , re_qs_max = re_qs_max , &
                   errmsg    = errmsg      , errflg     = errflg                               , &
+                  rainprod  = rainprod_p  , evapprod   = evapprod_p                           , &
                   ids = ids , ide = ide , jds = jds , jde = jde , kds = kds , kde = kde       , &
                   ims = ims , ime = ime , jms = jms , jme = jme , kms = kms , kme = kme       , &
                   its = its , ite = ite , jts = jts , jte = jte , kts = kts , kte = kte         &

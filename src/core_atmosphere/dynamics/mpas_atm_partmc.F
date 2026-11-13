@@ -19,6 +19,10 @@
 !                     (needs a build with MOSAIC; default 0). PMC_GAS_DATA and PMC_GAS_INIT
 !                     name the PartMC gas files (gas_data.dat, gas_init.dat); PMC_CHEM_TOP
 !                     is the altitude (m) above which chemistry is skipped.
+!   PMC_AQCHEM        1 = in-cloud oxidation of SO2 by H2O2 and O3 in the grid-scale cloud water
+!                     (bulk, fixed pH PMC_AQ_PH, default 4.5); the sulfate goes in equal amounts
+!                     to the real particles that activate at supersaturation PMC_AQ_SMAX
+!                     (default 0.002). Needs PMC_MOSAIC=1.
 !   PMC_CHEM_BOX      "id:level,id:level": save these cells (global cell ID and level) before and
 !                     after each of the first PMC_CHEM_BOX_STEPS (60) chemistry steps in
 !                     PartMC's output format, in the directory box/
@@ -275,6 +279,10 @@ module mpas_atm_partmc
    !> so the moles MOSAIC moves between gas and particles match the moles counted here only with
    !> M = 8.31432/287. The value 0.028966 used before differs by 1.5e-4, which showed as a
    !> steady loss of sulfur while sulfate condensed.
+   !> In-cloud sulfate: switch, cloud pH, activation supersaturation, and the sulfate (mol)
+   !> made by this task since the start of the run via H2O2 and via O3.
+   logical :: pmc_aq = .false.
+   real (kind=RKIND) :: pmc_aq_ph = 4.5_RKIND, pmc_aq_smax = 0.002_RKIND, aq_s(2) = 0.0_RKIND
    real (kind=RKIND), parameter :: M_AIR = 82.056e-6_RKIND * 101325.0_RKIND / 287.0_RKIND
    !> Gas emission and dry deposition: files, scale, and the amounts (mol) emitted and
    !> deposited by this task so far for each species.
@@ -509,6 +517,12 @@ contains
       if (stat == 0) gas_init_file = envval
       call get_environment_variable('PMC_CHEM_TOP', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_chem_top
+      call get_environment_variable('PMC_AQCHEM', envval, status=stat)
+      if (stat == 0) pmc_aq = (trim(envval) /= '0')
+      call get_environment_variable('PMC_AQ_PH', envval, status=stat)
+      if (stat == 0) read(envval, *) pmc_aq_ph
+      call get_environment_variable('PMC_AQ_SMAX', envval, status=stat)
+      if (stat == 0) read(envval, *) pmc_aq_smax
       call get_environment_variable('PMC_WET', envval, status=stat)
       if (stat == 0) pmc_wet = (trim(envval) /= '0')
       if (stat == 0) pmc_wet_diag_only = (trim(envval) == '2')
@@ -3816,6 +3830,109 @@ contains
 
 
    !> Sulfate (mol) in one real particle represented by a computational particle.
+   !> SO2 oxidised in cloud water in a step of dt (s), as mixing ratios (mol/mol) of the
+   !> cloudy air: by H2O2 (d_h) and then by O3 (d_o). Bulk scheme of GEOS-Chem's AQCHEM_SO2
+   !> (Seinfeld and Pandis; Jacob 1986) at the fixed pH pmc_aq_ph: Henry's law with the
+   !> dissociation of SO2 and H2O2, the gas fractions left in the gas phase, the H2O2 path as
+   !> an exact second-order step (so it stops when SO2 or H2O2 runs out) and the O3 path
+   !> first order in the SO2 left. temp (K), pres (Pa), l_c liquid water volume fraction
+   !> (m^3/m^3) in the cloud, so2/h2o2/o3 mixing ratios (mol/mol).
+   subroutine aq_sulfate_rate(temp, pres, l_c, dt, so2, h2o2, o3, d_h, d_o)
+      real (kind=RKIND), intent(in) :: temp, pres, l_c, dt, so2, h2o2, o3
+      real (kind=RKIND), intent(out) :: d_h, d_o
+      real (kind=RKIND), parameter :: R_ATM = 0.08205_RKIND
+      real (kind=RKIND) :: x, hp, p_atm, h_so2, ks1, ks2, hs_so2, h_h2o2, kh1, hs_h2o2, h_o3, &
+                           xg_so2, xg_h2o2, xg_o3, k_h, k_o3, f0, f1, f2, a, b, ex
+
+      d_h = 0.0_RKIND
+      d_o = 0.0_RKIND
+      if (so2 <= 0.0_RKIND .or. l_c <= 0.0_RKIND) return
+      x = 298.15_RKIND / temp - 1.0_RKIND
+      hp = 10.0_RKIND**(-pmc_aq_ph)
+      p_atm = pres / 101325.0_RKIND
+      h_so2 = 1.22_RKIND * exp(10.55_RKIND * x)
+      ks1 = 1.30e-2_RKIND * exp(6.75_RKIND * x)
+      ks2 = 6.31e-8_RKIND * exp(5.05_RKIND * x)
+      hs_so2 = h_so2 * (1.0_RKIND + ks1/hp + ks1*ks2/hp**2)
+      h_h2o2 = 7.45e4_RKIND * exp(22.21_RKIND * x)
+      kh1 = 2.2e-12_RKIND * exp(-12.52_RKIND * x)
+      hs_h2o2 = h_h2o2 * (1.0_RKIND + kh1/hp)
+      h_o3 = 1.13e-2_RKIND * exp(8.51_RKIND * x)
+      xg_so2 = 1.0_RKIND / (1.0_RKIND + hs_so2 * R_ATM * temp * l_c)
+      xg_h2o2 = 1.0_RKIND / (1.0_RKIND + hs_h2o2 * R_ATM * temp * l_c)
+      xg_o3 = 1.0_RKIND / (1.0_RKIND + h_o3 * R_ATM * temp * l_c)
+
+      ! H2O2: d(SO4)/dt = k_h [SO2] [H2O2] in mol/mol, nearly independent of pH
+      if (h2o2 > 0.0_RKIND) then
+         k_h = 6.31e14_RKIND * exp(-4760.0_RKIND / temp) * ks1 * h_so2 * hs_h2o2 * xg_so2 * xg_h2o2 &
+               * p_atm * l_c * R_ATM * temp
+         a = max(so2, h2o2)
+         b = min(so2, h2o2)
+         if ((a - b) * k_h * dt < 1.0e-6_RKIND) then
+            d_h = b * b * k_h * dt / (1.0_RKIND + b * k_h * dt)
+         else
+            ex = exp(-(a - b) * k_h * dt)
+            d_h = a * b * (1.0_RKIND - ex) / (a - b * ex)
+         end if
+         d_h = min(d_h, b)
+      end if
+
+      ! O3: S(IV) = SO2(aq) + HSO3- + SO3--, each with its rate constant
+      f0 = 1.0_RKIND / (1.0_RKIND + ks1/hp + ks1*ks2/hp**2)
+      f1 = 1.0_RKIND / (1.0_RKIND + hp/ks1 + ks2/hp)
+      f2 = 1.0_RKIND / (1.0_RKIND + hp/ks2 + hp**2/(ks1*ks2))
+      k_o3 = (2.4e4_RKIND * f0 + 3.49e12_RKIND * exp(-4830.0_RKIND / temp) * f1 &
+              + 7.32e14_RKIND * exp(-4030.0_RKIND / temp) * f2) &
+             * hs_so2 * xg_so2 * p_atm * h_o3 * xg_o3 * l_c * R_ATM * temp
+      d_o = (so2 - d_h) * (1.0_RKIND - exp(-k_o3 * max(0.0_RKIND, o3) * dt))
+   end subroutine aq_sulfate_rate
+
+
+   !> Give mol (mol) of new sulfate in a cell of volume vol (m^3) to the particles that
+   !> activate at supersaturation pmc_aq_smax, the same amount to each real particle (one
+   !> droplet each); if none would activate, the particle with the lowest critical
+   !> supersaturation takes it all.
+   subroutine add_sulfate(aero_state, env_state, mol, vol)
+      type(aero_state_t), intent(inout) :: aero_state
+      type(env_state_t), intent(in) :: env_state
+      real (kind=RKIND), intent(in) :: mol, vol
+      integer :: j, j_min, i_so4, n
+      real (kind=dp) :: s_c, s_min, n_act, per
+      logical, allocatable :: act(:)
+      real (kind=dp), allocatable :: nc(:)
+
+      n = aero_state_n_part(aero_state)
+      if (n == 0 .or. mol <= 0.0_RKIND) return
+      i_so4 = aero_data_spec_by_name(aero_data, 'SO4')
+      allocate(act(n), nc(n))
+      n_act = 0.0d0
+      s_min = huge(1.0d0)
+      j_min = 1
+      do j = 1, n
+         nc(j) = aero_weight_array_num_conc(aero_state%awa, aero_state%apa%particle(j), aero_data)
+         s_c = aero_particle_crit_rel_humid(aero_state%apa%particle(j), aero_data, env_state) - 1.0d0
+         act(j) = (s_c <= pmc_aq_smax)
+         if (act(j)) n_act = n_act + nc(j)
+         if (s_c < s_min) then
+            s_min = s_c
+            j_min = j
+         end if
+      end do
+      if (n_act <= 0.0d0) then
+         act(j_min) = .true.
+         n_act = nc(j_min)
+      end if
+      ! mol per real particle
+      per = mol / (vol * n_act)
+      do j = 1, n
+         if (.not. act(j)) cycle
+         aero_state%apa%particle(j)%vol(i_so4) = aero_state%apa%particle(j)%vol(i_so4) &
+              + per * aero_data%molec_weight(i_so4) / aero_data%density(i_so4)
+      end do
+      deallocate(act, nc)
+   end subroutine add_sulfate
+
+
    function particle_sulfate(particle)
       type(aero_particle_t), intent(in) :: particle
       real (kind=RKIND) :: particle_sulfate
@@ -4193,6 +4310,11 @@ contains
       integer, dimension(:), pointer :: indexToCellID
       character(len=64) :: box_prefix
       type(aero_data_t) :: aero_data_box
+      type (mpas_pool_type), pointer :: diag_physics
+      real (kind=RKIND), dimension(:,:), pointer :: cldfrac
+      integer, pointer :: index_qc
+      integer :: i_h2o2, i_o3
+      real (kind=RKIND) :: qc, f_c, l_c, rho_d, d_h, d_o, d_ppb, aq_g(2)
 
       if (.not. pmc_chem .or. pmc_n_part <= 0) return
 
@@ -4217,6 +4339,12 @@ contains
       call mpas_pool_get_array(diag, 'exner', exner)
       call mpas_pool_get_array(diag, 'pressure_p', pressure_p)
       call mpas_pool_get_array(diag, 'pressure_base', pressure_base)
+      nullify(cldfrac)
+      if (pmc_aq) then
+         call mpas_pool_get_dimension(state, 'index_qc', index_qc)
+         call mpas_pool_get_subpool(domain % blocklist % structs, 'diag_physics', diag_physics)
+         call mpas_pool_get_array(diag_physics, 'cldfrac', cldfrac)
+      end if
 
       del_t = config_dt
       uuid = 'mpas-partmc'
@@ -4232,6 +4360,8 @@ contains
       i_so2 = gas_data_spec_by_name(gas_data, 'SO2')
       i_h2so4 = gas_data_spec_by_name(gas_data, 'H2SO4')
       i_so4 = aero_data_spec_by_name(aero_data, 'SO4')
+      i_h2o2 = gas_data_spec_by_name(gas_data, 'H2O2')
+      i_o3 = gas_data_spec_by_name(gas_data, 'O3')
 
       n_cells = 0
       sums = 0.0_RKIND
@@ -4295,6 +4425,36 @@ contains
                end if
                scalars(gas_idx,k,iCell) = gas_state%mix_rat * moist_fac
                n_cells = n_cells + 1
+
+               ! in-cloud sulfate in the liquid cloud water of the cell
+               if (pmc_aq) then
+                  qc = max(0.0_RKIND, scalars(index_qc,k,iCell))
+                  if (qc > 1.0e-8_RKIND .and. env_state%temp > 258.15d0) then
+                     f_c = 1.0_RKIND
+                     if (associated(cldfrac)) f_c = min(1.0_RKIND, max(0.1_RKIND, cldfrac(k,iCell)))
+                     rho_d = rho_zz(k,iCell) * zz(k,iCell)
+                     ! in-cloud liquid water volume fraction, at most 2 g/m^3
+                     l_c = min(2.0e-6_RKIND, rho_d * qc / 1000.0_RKIND / f_c)
+                     call aq_sulfate_rate(real(env_state%temp, kind=RKIND), real(env_state%pressure, kind=RKIND), &
+                                          l_c, real(del_t, kind=RKIND), &
+                                          scalars(gas_idx(i_so2),k,iCell) / moist_fac * 1.0e-9_RKIND, &
+                                          scalars(gas_idx(i_h2o2),k,iCell) / moist_fac * 1.0e-9_RKIND, &
+                                          scalars(gas_idx(i_o3),k,iCell) / moist_fac * 1.0e-9_RKIND, d_h, d_o)
+                     ! cell means in ppb of dry air
+                     d_h = f_c * d_h * 1.0e9_RKIND * moist_fac
+                     d_o = f_c * d_o * 1.0e9_RKIND * moist_fac
+                     d_ppb = min(d_h + d_o, scalars(gas_idx(i_so2),k,iCell))
+                     if (d_ppb > 0.0_RKIND) then
+                        d_o = d_ppb - min(d_h, d_ppb)
+                        d_h = d_ppb - d_o
+                        scalars(gas_idx(i_so2),k,iCell) = scalars(gas_idx(i_so2),k,iCell) - d_ppb
+                        scalars(gas_idx(i_h2o2),k,iCell) = max(0.0_RKIND, scalars(gas_idx(i_h2o2),k,iCell) - d_h)
+                        call add_sulfate(aero_states(k,iCell), env_state, d_ppb * 1.0e-9_RKIND * rho_d * vol / M_AIR, vol)
+                        aq_s(1) = aq_s(1) + d_h * 1.0e-9_RKIND * rho_d * vol / M_AIR
+                        aq_s(2) = aq_s(2) + d_o * 1.0e-9_RKIND * rho_d * vol / M_AIR
+                     end if
+                  end if
+               end if
 
                if (pmc_chem_selftest .and. mod(iCell, 97) == 0 .and. mod(k, 9) == 1) then
                   ! Repeat this cell's step from the saved state after MOSAIC has worked on a
@@ -4394,6 +4554,11 @@ contains
                              // 'total less this = $r', intArgs=(/itimestep/), &
                              realArgs=(/ch4_min, ch4_min/chem_s0, &
                                         (g_sums(1) + g_sums(2) - g_sums(4) - ch4_min)/chem_s0 - 1.0_RKIND/))
+         if (pmc_aq) then
+            call mpas_dmpar_sum_real_array(domain % dminfo, 2, aq_s, aq_g)
+            call mpas_log_write('PartMC chemistry step $i: in-cloud sulfate made since the start of this run (mol): ' &
+                                // 'by H2O2 = $r, by O3 = $r', intArgs=(/itimestep/), realArgs=aq_g)
+         end if
          call mpas_log_write('PartMC chemistry step $i: cells = $i, sulfur (mol) gas = $r, particles = $r, ' &
                              // 'total less net surface input, rel change = $r, particle water (kg) = $r, ' &
                              // 'slowest task = $r s', &

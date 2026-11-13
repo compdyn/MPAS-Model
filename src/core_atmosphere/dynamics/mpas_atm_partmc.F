@@ -42,6 +42,20 @@
 !                     oc (kg m^-2 s^-1). The gases need PMC_MOSAIC=1; BC and OC are emitted as
 !                     one carbonaceous mode (PMC_CARB_DG, default 6e-8 m, geometric standard
 !                     deviation 1.8) with the cell's BC/OC ratio. PMC_EMIS_SCALE multiplies all.
+!   PMC_EMIS_SECTORS  1 = with PMC_EMIS_FILE from tools/make_emis2.py: carbonaceous particles by
+!                     source (sources 5-10: road and off-road transport, industry and energy,
+!                     fuel exploitation and flaring, residential, shipping, agricultural and
+!                     waste burning; 11: biomass burning by month with a latitude-dependent
+!                     injection profile; 12: mineral dust) in place of the single mode, each with
+!                     its own size (number geometric mean diameter 30 nm for fossil sources, 80 nm
+!                     for biofuel and fires, sigma 1.8, Dentener et al. 2006) and the BC/OC ratio
+!                     of its cell; fire gases by month; DMS from a seawater climatology (emitted
+!                     as SO2); isoprene and monoterpenes from emission factors with temperature
+!                     and light factors. Dust: flux PMC_DUST_SCALE * 1e-9 * source * u10^2
+!                     (u10 - PMC_DUST_UT) kg m^-2 s^-1 (default threshold 6.5 m/s), sizes from
+!                     Kok (2011). PMC_BIO_SCALE and PMC_DMS_SCALE scale those fluxes.
+!                     Every emitted particle carries source_id = source + 16 * (global cell ID
+!                     of the cell it was emitted in) and its emission time (s since 2000-01-01).
 !   PMC_SEASALT       1 = sea salt particles emitted over open water from the 10-m wind speed
 !                     with the flux of Gong (2003), dry diameters 0.07-10 um; PMC_SEASALT_SCALE
 !                     multiplies it
@@ -51,6 +65,9 @@
 !   PMC_EMIT_LEVELS   number of lowest layers the emission is spread over, uniformly in mixing
 !                     ratio (default 1)
 !   PMC_DRYDEP_V      dry deposition velocity (m/s) applied to the lowest layer (default 0)
+!   PMC_SETTLE        1 = lagrangian mode: particles also fall at their Stokes settling velocity
+!                     (wet diameter and density, Cunningham correction) through the column;
+!                     in the lowest layer the dry deposition scheme removes them.
 !   PMC_DRYDEP_SCHEME 1 = lagrangian mode: a deposition velocity for each particle from its size
 !                     and density with PartMC's scenario_loss_rate_drydep (Zhang et al. 2001
 !                     form), using the wind speed of the lowest layer and the model's roughness
@@ -345,13 +362,29 @@ module mpas_atm_partmc
    !> Size-dependent dry deposition: switch, and sums by this task so far: number expected to
    !> be removed (probability times number), number removed, and number-weighted sums of the
    !> deposition velocity and of one, for the mean velocity.
-   logical :: pmc_drydep_scheme = .false.
+   logical :: pmc_drydep_scheme = .false., pmc_settle = .false.
    !> Emissions per cell from an inventory file: file, scale, the carbonaceous mode, fluxes of
    !> the owned cells (BC and OC in kg m^-2 s^-1, gases in mol m^-2 s^-1).
    character(len=256) :: emis_file = ''
    real (kind=RKIND) :: emis_scale = 1.0_RKIND, carb_dg = 6.0e-8_RKIND, carb_sigma = 1.8_RKIND
    real (kind=RKIND), allocatable :: emis_bc(:), emis_oc(:), emis_gas(:,:)
    logical :: emis_part_read = .false.
+   !> Emissions by source (PMC_EMIS_SECTORS): particle sources (kinds) 5-10 the inventory
+   !> sectors, 11 biomass burning, 12 dust; their sizes; per-cell fluxes; dust size table
+   !> (bin edges of the diameter, m, and cumulative share of the mass); kg emitted per kind by
+   !> this task since the start of the run; fire gases by month, seawater DMS by month
+   !> (nmol/L), biogenic emission factors (mol m^-2 s^-1); moles emitted of DMS, isoprene and
+   !> monoterpenes by this task.
+   logical :: pmc_sectors = .false.
+   integer, parameter :: N_SEC = 6, K_BB = 11, K_DUST = 12, N_KIND = 12, N_DU = 60, SRC_STRIDE = 16
+   character(len=3), parameter :: sec_name(N_SEC) = (/ 'tro', 'ind', 'flr', 'rco', 'shp', 'awb' /)
+   real (kind=RKIND), parameter :: kind_dg(5:11) = (/ 3.0e-8_RKIND, 3.0e-8_RKIND, 3.0e-8_RKIND, &
+                                                     8.0e-8_RKIND, 3.0e-8_RKIND, 8.0e-8_RKIND, 8.0e-8_RKIND /)
+   real (kind=RKIND), allocatable :: sec_bc(:,:), sec_oc(:,:), bb_bc(:,:), bb_oc(:,:), dust_src(:)
+   real (kind=RKIND) :: dust_scale = 1.0_RKIND, dust_ut = 6.5_RKIND, du_edge(N_DU+1), du_cum(N_DU)
+   real (kind=RKIND) :: kind_mass(N_KIND) = 0.0_RKIND, gas_nat(3) = 0.0_RKIND
+   real (kind=RKIND), allocatable :: gas_bb(:,:,:), dms_w(:,:), isop_ef(:), mterp_ef(:)
+   real (kind=RKIND) :: bio_scale = 1.0_RKIND, dms_scale = 1.0_RKIND
    !> Sea salt: switch, scale, and the size distribution of the flux at 1 m/s: bin edges of
    !> the dry diameter (m), cumulative share of the number, number flux (m^-2 s^-1).
    logical :: pmc_seasalt = .false.
@@ -548,6 +581,16 @@ contains
       if (stat == 0) read(envval, *) carb_dg
       call get_environment_variable('PMC_SEASALT', envval, status=stat)
       if (stat == 0) pmc_seasalt = (trim(envval) /= '0')
+      call get_environment_variable('PMC_EMIS_SECTORS', envval, status=stat)
+      if (stat == 0) pmc_sectors = (trim(envval) /= '0')
+      call get_environment_variable('PMC_DUST_SCALE', envval, status=stat)
+      if (stat == 0) read(envval, *) dust_scale
+      call get_environment_variable('PMC_DUST_UT', envval, status=stat)
+      if (stat == 0) read(envval, *) dust_ut
+      call get_environment_variable('PMC_BIO_SCALE', envval, status=stat)
+      if (stat == 0) read(envval, *) bio_scale
+      call get_environment_variable('PMC_DMS_SCALE', envval, status=stat)
+      if (stat == 0) read(envval, *) dms_scale
       call get_environment_variable('PMC_SEASALT_SCALE', envval, status=stat)
       if (stat == 0) read(envval, *) seasalt_scale
       call get_environment_variable('PMC_Q_BACKGROUND', envval, status=stat)
@@ -558,6 +601,8 @@ contains
       if (stat == 0) read(envval, *) pmc_emit_flux
       call get_environment_variable('PMC_EMIT_LEVELS', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_emit_levels
+      call get_environment_variable('PMC_SETTLE', envval, status=stat)
+      if (stat == 0) pmc_settle = (trim(envval) /= '0')
       call get_environment_variable('PMC_DRYDEP_SCHEME', envval, status=stat)
       if (stat == 0) pmc_drydep_scheme = (trim(envval) /= '0')
       call get_environment_variable('PMC_DRYDEP_V', envval, status=stat)
@@ -1755,7 +1800,7 @@ contains
                    / zz(k,iCell)
                c_part = c_part + m
                v_part = v_part + m*m
-               if (aero_states(k,iCell)%apa%particle(i_part)%component(1)%source_id == 2) then
+               if (mod(aero_states(k,iCell)%apa%particle(i_part)%component(1)%source_id, SRC_STRIDE) == 2) then
                   c2_part = c2_part + m
                   v2_part = v2_part + m*m
                else
@@ -2411,7 +2456,7 @@ contains
       !> Lagrangian mode: advance every particle with midpoint steps through the
       !> step-averaged velocity field.
       subroutine lagr_move()
-         real (kind=RKIND) :: xo(NPOS), xm(4), xn(NPOS), vel(3), omega, z_lo, z_hi, dt
+         real (kind=RKIND) :: xo(NPOS), xm(4), xn(NPOS), vel(3), omega, z_lo, z_hi, dt, w_s
          integer :: j, cell_n, k_n, i_sub
          logical :: clamped
 
@@ -2424,13 +2469,19 @@ contains
                   xn = pos(k,iCell) % x(:,j)
                   cell_n = iCell
                   clamped = .false.
+                  ! settling, as a rate of the vertical coordinate (zz = d zeta / dz)
+                  w_s = 0.0_RKIND
+                  if (pmc_settle) w_s = zz(k,iCell) * settling_velocity(aero_states(k,iCell)%apa%particle(j), &
+                                                                        0.5_RKIND*(zf(k) + zf(k+1)))
                   do i_sub = 1, lagr_substeps
                      xo = xn
                      call lagr_vel(xo(1:3), xo(4), cell_n, vel, omega)
+                     omega = omega - w_s
                      xm(1:3) = xo(1:3) + 0.5_RKIND*dt*vel/radius
                      xm(1:3) = xm(1:3) / norm2(xm(1:3))
                      xm(4) = min(z_hi, max(z_lo, xo(4) + 0.5_RKIND*dt*omega))
                      call lagr_vel(xm(1:3), xm(4), cell_n, vel, omega)
+                     omega = omega - w_s
                      xn(1:3) = xo(1:3) + dt*vel/radius
                      xn(1:3) = xn(1:3) / norm2(xn(1:3))
                      xn(4) = xo(4) + dt*omega
@@ -3239,9 +3290,19 @@ contains
       real (kind=RKIND) :: f_bc, rho_mix, m_mean, n_flux, wind, r80, dfdr, esum(7), g_esum(7)
       logical :: found
       integer :: ib, i_na, i_cl
+      ! emissions by source
+      integer :: i_sec, i_mo, i_oin, mo_now
+      integer, dimension(:), pointer :: indexToCellID
+      real (kind=RKIND), dimension(:), pointer :: latCell, snowh
+      real (kind=RKIND) :: cur_dg, prof(200), fm, km(N_KIND), g_km(N_KIND), dd, cum
+      real (kind=RKIND), dimension(:,:), pointer :: zgrid_s
+      real (kind=dp) :: t_now
+      real (kind=RKIND), allocatable :: cell_vals(:)
+      integer, pointer :: nVertLevels
 
       if (pmc_emit_flux <= 0.0_RKIND .and. pmc_drydep_v <= 0.0_RKIND .and. .not. pmc_drydep_scheme &
           .and. len_trim(emis_file) == 0 .and. .not. pmc_seasalt) return
+      call model_date(domain, mo_now, t_now)
 
       call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
       call mpas_pool_get_subpool(domain % blocklist % structs, 'state', state)
@@ -3297,7 +3358,17 @@ contains
       i_bc = aero_data_spec_by_name(aero_data, 'BC')
       i_na = aero_data_spec_by_name(aero_data, 'Na')
       i_cl = aero_data_spec_by_name(aero_data, 'Cl')
+      i_oin = aero_data_spec_by_name(aero_data, 'OIN')
       allocate(vols(n_spec))
+      call mpas_pool_get_array(mesh, 'indexToCellID', indexToCellID)
+      call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
+      call mpas_pool_get_array(mesh, 'latCell', latCell)
+      call mpas_pool_get_array(mesh, 'zgrid', zgrid_s)
+      nullify(snowh)
+      call mpas_pool_get_array(sfc_input, 'snowh', snowh)
+      ! the months held for fires and DMS are February and March
+      i_mo = merge(1, 2, mo_now <= 2)
+      cur_dg = carb_dg
 
       if (len_trim(emis_file) > 0 .and. .not. emis_part_read) then
          emis_part_read = .true.
@@ -3308,8 +3379,43 @@ contains
          emis_oc = max(0.0_RKIND, emis_oc) * emis_scale
          call mpas_log_write('PartMC: BC and OC emissions from ' // trim(emis_file) // ' times $r, one mode with ' &
                              // 'geometric mean diameter $r m', realArgs=(/emis_scale, carb_dg/))
+         if (pmc_sectors) then
+            allocate(sec_bc(nCellsSolve,N_SEC), sec_oc(nCellsSolve,N_SEC), bb_bc(nCellsSolve,2), bb_oc(nCellsSolve,2), &
+                     dust_src(nCellsSolve), cell_vals(nCellsSolve))
+            do i_sec = 1, N_SEC
+               call emis_read(domain, 'bc_' // sec_name(i_sec), cell_vals, found)
+               if (.not. found) call mpas_log_write('PartMC: no bc_' // sec_name(i_sec) // ' in ' // trim(emis_file), &
+                                                    messageType=MPAS_LOG_CRIT)
+               sec_bc(:,i_sec) = max(0.0_RKIND, cell_vals) * emis_scale
+               call emis_read(domain, 'oc_' // sec_name(i_sec), cell_vals, found)
+               sec_oc(:,i_sec) = max(0.0_RKIND, cell_vals) * emis_scale
+            end do
+            do ib = 1, 2
+               call emis_read(domain, 'bc_bb_0' // char(ichar('1') + ib), cell_vals, found)
+               bb_bc(:,ib) = max(0.0_RKIND, cell_vals) * emis_scale
+               call emis_read(domain, 'oc_bb_0' // char(ichar('1') + ib), cell_vals, found)
+               bb_oc(:,ib) = max(0.0_RKIND, cell_vals) * emis_scale
+            end do
+            call emis_read(domain, 'dust_src', cell_vals, found)
+            dust_src = min(1.0_RKIND, max(0.0_RKIND, cell_vals))
+            deallocate(cell_vals)
+            ! Kok (2011) emitted dust volume distribution, D in um:
+            ! dV/dlnD ~ D (1 + erf(ln(D/3.4) / (sqrt(2) ln 3))) exp(-(D/12)^3), 0.1-20 um
+            do ib = 1, N_DU + 1
+               du_edge(ib) = 0.1e-6_RKIND * 200.0_RKIND**(real(ib - 1, kind=RKIND) / real(N_DU, kind=RKIND))
+            end do
+            do ib = 1, N_DU
+               dd = sqrt(du_edge(ib) * du_edge(ib+1)) * 1.0e6_RKIND
+               du_cum(ib) = dd * (1.0_RKIND + erf(log(dd / 3.4_RKIND) / (sqrt(2.0_RKIND) * log(3.0_RKIND)))) &
+                            * exp(-(dd / 12.0_RKIND)**3) * log(du_edge(ib+1) / du_edge(ib))
+               if (ib > 1) du_cum(ib) = du_cum(ib) + du_cum(ib-1)
+            end do
+            du_cum = du_cum / du_cum(N_DU)
+            call mpas_log_write('PartMC: emissions by source from ' // trim(emis_file) // '; dust scale $r, ' &
+                                // 'threshold $r m/s', realArgs=(/dust_scale, dust_ut/))
+         end if
       end if
-      if (pmc_seasalt) then
+      if (pmc_seasalt .or. pmc_sectors) then
          call mpas_pool_get_subpool(domain % blocklist % structs, 'diag_physics', diag_phys2)
          nullify(u10)
          call mpas_pool_get_array(diag_phys2, 'u10', u10)
@@ -3319,7 +3425,7 @@ contains
          if (.not. associated(u10) .or. .not. associated(xland)) then
             call mpas_log_write('PartMC: PMC_SEASALT needs u10, v10 and xland', messageType=MPAS_LOG_CRIT)
          end if
-         if (ss_unit <= 0.0_RKIND) then
+         if (ss_unit <= 0.0_RKIND .and. pmc_seasalt) then
             ! Gong (2003) flux dF/dr (m^-2 s^-1 um^-1) at 1 m/s against the radius at 80% humidity
             ! r (um), which is about the dry diameter; N_SS bins equal in log r from 0.07 to 10 um
             do ib = 1, N_SS + 1
@@ -3435,8 +3541,33 @@ contains
             end if
          end if
 
+         if (pmc_sectors) then
+            ! surface sources over the lowest layers in proportion to their air mass
+            prof = 0.0_RKIND
+            do k = 1, pmc_emit_levels
+               prof(k) = rho_zz(k,iCell) / rdzw(k)
+            end do
+            prof = prof / sum(prof(1:pmc_emit_levels))
+            do i_sec = 1, N_SEC
+               call emit_carb(4 + i_sec, sec_bc(iCell,i_sec), sec_oc(iCell,i_sec))
+            end do
+            call bb_profile(iCell)
+            call emit_carb(K_BB, bb_bc(iCell,i_mo), bb_oc(iCell,i_mo))
+            ! dust from bare, snow-free land
+            if (dust_src(iCell) > 0.0_RKIND .and. associated(landmask)) then
+               if (landmask(iCell) == 1) then
+                  wind = sqrt(u10(iCell)**2 + v10(iCell)**2)
+                  fm = 0.0_RKIND
+                  if (associated(snowh)) fm = snowh(iCell)
+                  if (wind > dust_ut .and. fm < 0.01_RKIND) then
+                     call emit_dust(dust_scale * 1.0e-9_RKIND * dust_src(iCell) * wind**2 * (wind - dust_ut) &
+                                    * config_dt * areaCell(iCell))
+                  end if
+               end if
+            end if
+         end if
          ! carbonaceous particles from the inventory
-         if (allocated(emis_bc)) then
+         if (allocated(emis_bc) .and. .not. pmc_sectors) then
             if (emis_bc(iCell) + emis_oc(iCell) > 0.0_RKIND) then
                f_bc = emis_bc(iCell) / (emis_bc(iCell) + emis_oc(iCell))
                rho_mix = 1.0_RKIND / (f_bc / aero_data%density(i_bc) + (1.0_RKIND - f_bc) / aero_data%density(i_oc))
@@ -3475,6 +3606,15 @@ contains
                              // 'mass (kg): inventory = $r, particles = $r; sea salt number: expected = $r, ' &
                              // 'particles = $r, mass (kg) = $r', intArgs=(/itimestep/), realArgs=g_esum)
       end if
+      if (mod(itimestep, 12) == 0 .and. pmc_sectors) then
+         km = kind_mass
+         call mpas_dmpar_sum_real_array(domain % dminfo, N_KIND, km, g_km)
+         call mpas_log_write('PartMC emission step $i: particle mass (kg) emitted since the start of this run: ' &
+                             // 'transport $r, industry $r, flaring $r, residential $r, shipping $r, ' &
+                             // 'agricultural/waste $r, fires $r, dust $r, sea salt $r', intArgs=(/itimestep/), &
+                             realArgs=(/g_km(5), g_km(6), g_km(7), g_km(8), g_km(9), g_km(10), g_km(11), g_km(12), &
+                                        g_km(4)/))
+      end if
       if (mod(itimestep, 12) == 0) then
          sums = surf_sums
          call mpas_dmpar_sum_real_array(domain % dminfo, 4, sums, g_sums)
@@ -3507,7 +3647,7 @@ contains
          if (n_area <= 0.0_RKIND) return
          m_kk = rho_zz(kk,iCell) / rdzw(kk)
          scalars(index_ref,kk,iCell) = scalars(index_ref,kk,iCell) + n_area / m_kk
-         if (i_kind == 3) emis_sums(1) = emis_sums(1) + n_area * areaCell(iCell)
+         if (i_kind == 3 .or. (i_kind >= 5 .and. i_kind <= K_BB)) emis_sums(1) = emis_sums(1) + n_area * areaCell(iCell)
          if (i_kind == 4) emis_sums(5) = emis_sums(5) + n_area * areaCell(iCell)
          if (pmc_n_part <= 0 .or. pmc_mode /= MODE_LAGR) return
          ! number of real particles the cell holds, from its particles if it has any
@@ -3525,8 +3665,8 @@ contains
          do i_new = 1, n_new
             call aero_particle_zero(particle, aero_data)
             vols = 0.0d0
-            if (i_kind == 3) then
-               d_new = carb_dg * exp(log(carb_sigma) * rand_normal(0.0d0, 1.0d0))
+            if (i_kind == 3 .or. (i_kind >= 5 .and. i_kind <= K_BB)) then
+               d_new = cur_dg * exp(log(carb_sigma) * rand_normal(0.0d0, 1.0d0))
                v_new = pii / 6.0d0 * d_new**3
                ! volumes from the mass fraction of BC
                vols(i_bc) = v_new * (f_bc / aero_data%density(i_bc)) * rho_mix
@@ -3547,8 +3687,9 @@ contains
                vols(i_cl) = 0.6066d0 * m_new / aero_data%density(i_cl)
                emis_sums(6) = emis_sums(6) + w_new
                emis_sums(7) = emis_sums(7) + w_new * m_new
+               kind_mass(4) = kind_mass(4) + w_new * m_new
             end if
-            call aero_particle_set_component(particle, i_kind, 0.0d0)
+            call aero_particle_set_component(particle, i_kind + SRC_STRIDE * indexToCellID(iCell), t_now)
             particle%n_primary_parts = 1
             call aero_particle_set_vols(particle, vols)
             call aero_particle_new_id(particle)
@@ -3560,6 +3701,100 @@ contains
          end do
          if (lagr_control .and. kk > 1) call lagr_rebalance(kk, iCell, nCells, nEdgesOnCell, cellsOnCell)
       end subroutine emit_kind
+
+
+      !> Carbonaceous particles of source i_kind from BC and OC mass fluxes (kg m^-2 s^-1),
+      !> spread over the layers with the fractions in prof.
+      subroutine emit_carb(i_kind, flux_bc, flux_oc)
+         integer, intent(in) :: i_kind
+         real (kind=RKIND), intent(in) :: flux_bc, flux_oc
+         integer :: kz
+
+         if (flux_bc + flux_oc <= 0.0_RKIND) return
+         cur_dg = kind_dg(i_kind)
+         f_bc = flux_bc / (flux_bc + flux_oc)
+         rho_mix = 1.0_RKIND / (f_bc / aero_data%density(i_bc) + (1.0_RKIND - f_bc) / aero_data%density(i_oc))
+         m_mean = rho_mix * pii / 6.0_RKIND * cur_dg**3 * exp(4.5_RKIND * log(carb_sigma)**2)
+         n_flux = (flux_bc + flux_oc) / m_mean
+         emis_sums(3) = emis_sums(3) + (flux_bc + flux_oc) * config_dt * areaCell(iCell)
+         kind_mass(i_kind) = kind_mass(i_kind) + (flux_bc + flux_oc) * config_dt * areaCell(iCell)
+         do kz = 1, nVertLevels
+            if (prof(kz) > 0.0_RKIND) call emit_kind(i_kind, kz, n_flux * config_dt * prof(kz))
+         end do
+         cur_dg = carb_dg
+      end subroutine emit_carb
+
+
+      !> Fire injection profile of Dentener et al. (2006, Table 4) by latitude, in prof:
+      !> shares of the layers 0-0.1, 0.1-0.5, 0.5-1, 1-2, 2-3, 3-6 km above the ground.
+      subroutine bb_profile(jCell)
+         integer, intent(in) :: jCell
+         real (kind=RKIND), parameter :: zb(7) = (/ 0.0_RKIND, 100.0_RKIND, 500.0_RKIND, 1000.0_RKIND, &
+                                                    2000.0_RKIND, 3000.0_RKIND, 6000.0_RKIND /)
+         real (kind=RKIND) :: share(6), lo, hi, alat
+         integer :: ibd, kz
+
+         alat = abs(latCell(jCell)) * 180.0_RKIND / pii
+         if (alat < 30.0_RKIND) then
+            share = (/ 0.2_RKIND, 0.4_RKIND, 0.4_RKIND, 0.0_RKIND, 0.0_RKIND, 0.0_RKIND /)
+         else if (alat < 50.0_RKIND) then
+            share = (/ 0.2_RKIND, 0.2_RKIND, 0.2_RKIND, 0.4_RKIND, 0.0_RKIND, 0.0_RKIND /)
+         else
+            share = (/ 0.1_RKIND, 0.1_RKIND, 0.2_RKIND, 0.2_RKIND, 0.4_RKIND, 0.0_RKIND /)
+         end if
+         prof = 0.0_RKIND
+         do kz = 1, nVertLevels
+            lo = zgrid_s(kz,jCell) - zgrid_s(1,jCell)
+            hi = zgrid_s(kz+1,jCell) - zgrid_s(1,jCell)
+            do ibd = 1, 6
+               prof(kz) = prof(kz) + share(ibd) * max(0.0_RKIND, min(hi, zb(ibd+1)) - max(lo, zb(ibd))) &
+                                     / (zb(ibd+1) - zb(ibd))
+            end do
+         end do
+      end subroutine bb_profile
+
+
+      !> Dust of mass m_kg (kg) into the lowest layer of the cell: two computational particles
+      !> with diameters drawn from the mass distribution, each standing for half the mass. The
+      !> number it stands for is rounded at random to a neighbouring power-of-two weight, so mass
+      !> and number are exact in expectation.
+      subroutine emit_dust(m_kg)
+         real (kind=RKIND), intent(in) :: m_kg
+         integer, parameter :: N_DRAW = 2
+         integer :: i_d, ibd, g_new
+         real (kind=RKIND) :: u, n_tgt, x2
+         real (kind=dp) :: d_new, v_new
+
+         if (m_kg <= 0.0_RKIND .or. pmc_n_part <= 0 .or. pmc_mode /= MODE_LAGR) return
+         do i_d = 1, N_DRAW
+            u = pmc_random()
+            do ibd = 1, N_DU - 1
+               if (u <= du_cum(ibd)) exit
+            end do
+            d_new = du_edge(ibd) * (du_edge(ibd+1) / du_edge(ibd))**pmc_random()
+            v_new = pii / 6.0d0 * d_new**3
+            n_tgt = m_kg / real(N_DRAW, kind=RKIND) / real(v_new * aero_data%density(i_oin), kind=RKIND)
+            x2 = log(n_tgt / lagr_w) / log(2.0_RKIND)
+            g_new = floor(x2)
+            if (pmc_random() < 2.0_RKIND**(x2 - real(g_new, kind=RKIND)) - 1.0_RKIND) g_new = g_new + 1
+            g_new = max(1, min(LAGR_GROUPS, g_new + LAGR_G0))
+            scalars(index_ref,1,iCell) = scalars(index_ref,1,iCell) + n_tgt / (areaCell(iCell) * m1)
+            kind_mass(K_DUST) = kind_mass(K_DUST) + lagr_w * 2.0_RKIND**(g_new - LAGR_G0) &
+                                                    * real(v_new * aero_data%density(i_oin), kind=RKIND)
+            call aero_particle_zero(particle, aero_data)
+            vols = 0.0d0
+            vols(i_oin) = v_new
+            call aero_particle_set_component(particle, K_DUST + SRC_STRIDE * indexToCellID(iCell), t_now)
+            particle%n_primary_parts = 1
+            call aero_particle_set_vols(particle, vols)
+            call aero_particle_new_id(particle)
+            call aero_particle_set_weight(particle, 1, g_new)
+            call aero_state_add_particle(aero_states(1,iCell), particle, aero_data)
+            call random_in_cell(iCell, 1, nCells, nEdgesOnCell, cellsOnCell, x(1:4))
+            x(5:7) = x(1:3)
+            call pos_append(pos(1,iCell), x)
+         end do
+      end subroutine emit_dust
 #endif
 
    end subroutine atm_partmc_surface
@@ -3700,6 +3935,13 @@ contains
       logical :: found
       real (kind=RKIND), allocatable :: g_wet(:)
       integer :: j_w
+      ! fires, DMS and biogenic gases (PMC_EMIS_SECTORS)
+      type (mpas_pool_type), pointer :: dphys
+      real (kind=RKIND), dimension(:), pointer :: u10, v10, t2m, swdnb, sst, xice
+      real (kind=RKIND), allocatable :: extra(:)
+      real (kind=RKIND) :: wind, tc, sc_dms, k_w, f_dms, g_t, g_p, par, nat(3)
+      integer :: mo_now, i_mo, ib, j_so2, j_isop, j_api, j_lim
+      real (kind=dp) :: t_now
 
       if (.not. pmc_chem .or. pmc_n_part <= 0) return
       if (len_trim(gas_emit_file) == 0 .and. len_trim(gas_drydep_file) == 0 .and. len_trim(emis_file) == 0 &
@@ -3739,6 +3981,26 @@ contains
             end do
             call mpas_log_write('PartMC: gas emissions for $i species from ' // trim(emis_file) // ' times $r', &
                                 intArgs=(/n_found/), realArgs=(/emis_scale/))
+            if (pmc_sectors) then
+               allocate(gas_bb(n_gas, nCellsSolve, 2), dms_w(nCellsSolve, 2), isop_ef(nCellsSolve), &
+                        mterp_ef(nCellsSolve))
+               gas_bb = 0.0_RKIND
+               do ib = 1, 2
+                  do j = 1, n_gas
+                     call emis_read(domain, 'gas_bb_' // trim(gas_data%name(j)) // '_0' // char(ichar('1') + ib), &
+                                    cell_vals, found)
+                     if (found) gas_bb(j,:,ib) = max(0.0_RKIND, cell_vals) * emis_scale
+                  end do
+                  call emis_read(domain, 'dms_0' // char(ichar('1') + ib), cell_vals, found)
+                  dms_w(:,ib) = max(0.0_RKIND, cell_vals)
+               end do
+               call emis_read(domain, 'isop_ef', cell_vals, found)
+               isop_ef = max(0.0_RKIND, cell_vals)
+               call emis_read(domain, 'mterp_ef', cell_vals, found)
+               mterp_ef = max(0.0_RKIND, cell_vals)
+               call mpas_log_write('PartMC: fire gases, DMS and biogenic emission factors from ' // trim(emis_file) &
+                                   // '; DMS scale $r, biogenic scale $r', realArgs=(/dms_scale, bio_scale/))
+            end if
          end if
          if (len_trim(gas_emit_file) > 0) then
             call spec_file_open(trim(gas_emit_file), file)
@@ -3762,9 +4024,57 @@ contains
                                   real(itimestep - 1, kind=dp) * real(config_dt, kind=dp), emis, rate)
       end if
 
+      allocate(extra(n_gas))
+      extra = 0.0_RKIND
+      if (allocated(gas_bb)) then
+         call model_date(domain, mo_now, t_now)
+         i_mo = merge(1, 2, mo_now <= 2)
+         call mpas_pool_get_subpool(domain % blocklist % structs, 'diag_physics', dphys)
+         call mpas_pool_get_array(dphys, 'u10', u10)
+         call mpas_pool_get_array(dphys, 'v10', v10)
+         call mpas_pool_get_array(dphys, 't2m', t2m)
+         call mpas_pool_get_array(dphys, 'swdnb', swdnb)
+         call mpas_pool_get_array(sfc_input, 'sst', sst)
+         call mpas_pool_get_array(sfc_input, 'xice', xice)
+         j_so2 = gas_data_spec_by_name(gas_data, 'SO2')
+         j_isop = gas_data_spec_by_name(gas_data, 'ISOP')
+         j_api = gas_data_spec_by_name(gas_data, 'API')
+         j_lim = gas_data_spec_by_name(gas_data, 'LIM')
+      end if
+
       do iCell = 1, nCellsSolve
          ! mol of dry air per area in the lowest layer
          air1 = rho_zz(1,iCell) / rdzw(1) / M_AIR
+         if (allocated(gas_bb)) then
+            ! fires of this month
+            extra = gas_bb(:,iCell,i_mo)
+            nat = 0.0_RKIND
+            if (landmask(iCell) == 0) then
+               ! DMS from the sea (Nightingale et al. 2000 transfer velocity, Saltzman et al.
+               ! 1993 Schmidt number), emitted as SO2
+               wind = sqrt(u10(iCell)**2 + v10(iCell)**2)
+               tc = min(35.0_RKIND, max(-2.0_RKIND, sst(iCell) - 273.15_RKIND))
+               sc_dms = 2674.0_RKIND - 147.12_RKIND*tc + 3.726_RKIND*tc**2 - 0.038_RKIND*tc**3
+               k_w = (0.222_RKIND * wind**2 + 0.333_RKIND * wind) / 3.6e5_RKIND * (sc_dms / 600.0_RKIND)**(-0.5_RKIND)
+               f_dms = dms_scale * k_w * dms_w(iCell,i_mo) * 1.0e-6_RKIND * (1.0_RKIND - min(1.0_RKIND, max(0.0_RKIND, xice(iCell))))
+               extra(j_so2) = extra(j_so2) + f_dms
+               nat(1) = f_dms
+            else
+               ! isoprene (light and temperature, Guenther et al. 1993, normalised at 303 K) and
+               ! monoterpenes (temperature), shared equally between API and LIM
+               g_t = exp(95000.0_RKIND * (t2m(iCell) - 303.0_RKIND) / (8.314_RKIND * 303.0_RKIND * t2m(iCell))) &
+                     / (1.0_RKIND + exp(230000.0_RKIND * (t2m(iCell) - 314.0_RKIND) / (8.314_RKIND * 303.0_RKIND * t2m(iCell)))) &
+                     * (1.0_RKIND + exp(230000.0_RKIND * (303.0_RKIND - 314.0_RKIND) / (8.314_RKIND * 303.0_RKIND * 303.0_RKIND)))
+               par = 2.0_RKIND * max(0.0_RKIND, swdnb(iCell))
+               g_p = 0.0027_RKIND * 1.066_RKIND * par / sqrt(1.0_RKIND + (0.0027_RKIND * par)**2)
+               nat(2) = bio_scale * isop_ef(iCell) * g_t * g_p
+               nat(3) = bio_scale * mterp_ef(iCell) * exp(0.09_RKIND * (t2m(iCell) - 303.0_RKIND))
+               if (j_isop > 0) extra(j_isop) = extra(j_isop) + nat(2)
+               if (j_api > 0) extra(j_api) = extra(j_api) + 0.5_RKIND * nat(3)
+               if (j_lim > 0) extra(j_lim) = extra(j_lim) + 0.5_RKIND * nat(3)
+            end if
+            gas_nat = gas_nat + nat * config_dt * areaCell(iCell)
+         end if
          if (allocated(gas_drydep%mix_rat)) then
             dz = 1.0_RKIND / (rdzw(1) * zz(1,iCell))
             frac = 1.0_RKIND - exp(-gas_drydep%mix_rat * config_dt / dz)
@@ -3792,7 +4102,7 @@ contains
             do k = 1, pmc_emit_levels
                air_emit = air_emit + rho_zz(k,iCell) / rdzw(k) / M_AIR
             end do
-            amount = emis_gas(:,iCell) * config_dt
+            amount = (emis_gas(:,iCell) + extra) * config_dt
             do k = 1, pmc_emit_levels
                scalars(gas_idx,k,iCell) = scalars(gas_idx,k,iCell) + amount / air_emit * 1.0e9_RKIND
             end do
@@ -3803,6 +4113,11 @@ contains
       call mpas_pool_get_field(state, 'scalars', scalars_field, 2)
       call mpas_dmpar_exch_halo_field(scalars_field)
 
+      if (allocated(gas_bb) .and. mod(itimestep, 12) == 0) then
+         call mpas_dmpar_sum_real_array(domain % dminfo, 3, gas_nat, nat)
+         call mpas_log_write('PartMC gas surface step $i: emitted since the start of this run (mol): DMS (as SO2) $r, ' &
+                             // 'isoprene $r, monoterpenes $r', intArgs=(/itimestep/), realArgs=nat)
+      end if
       if (mod(itimestep, 12) == 0 .or. itimestep == 1) then
          call gas_content(domain, local)
          call mpas_dmpar_sum_real_array(domain % dminfo, n_gas, local, g_content)
@@ -3829,7 +4144,6 @@ contains
    end subroutine atm_partmc_gas_surface
 
 
-   !> Sulfate (mol) in one real particle represented by a computational particle.
    !> SO2 oxidised in cloud water in a step of dt (s), as mixing ratios (mol/mol) of the
    !> cloudy air: by H2O2 (d_h) and then by O3 (d_o). Bulk scheme of GEOS-Chem's AQCHEM_SO2
    !> (Seinfeld and Pandis; Jacob 1986) at the fixed pH pmc_aq_ph: Henry's law with the
@@ -3933,6 +4247,46 @@ contains
    end subroutine add_sulfate
 
 
+   !> Stokes settling velocity (m/s, downward positive) of a particle from its wet diameter
+   !> and density, with the Cunningham slip correction; z (m) sets the mean free path. Zero
+   !> below 0.3 um, where it is below 1e-5 m/s.
+   real (kind=RKIND) function settling_velocity(particle, z)
+      type(aero_particle_t), intent(in) :: particle
+      real (kind=RKIND), intent(in) :: z
+      real (kind=dp) :: d, rho_p, lam, cc
+
+      settling_velocity = 0.0_RKIND
+      d = aero_particle_diameter(particle, aero_data)
+      if (d < 0.3d-6) return
+      rho_p = aero_particle_mass(particle, aero_data) / aero_particle_volume(particle)
+      lam = 0.0651d-6 * exp(real(z, kind=dp) / 8000.0d0)
+      cc = 1.0d0 + 2.0d0 * lam / d * (1.257d0 + 0.4d0 * exp(-0.55d0 * d / lam))
+      settling_velocity = real(rho_p * 9.81d0 * d**2 * cc / (18.0d0 * 1.8d-5), kind=RKIND)
+   end function settling_velocity
+
+
+   !> Current model month and time in seconds since 2000-01-01 00:00 UTC.
+   subroutine model_date(domain, mo, t_abs)
+      use mpas_timekeeping
+      type (domain_type), intent(in) :: domain
+      integer, intent(out) :: mo
+      real (kind=dp), intent(out) :: t_abs
+      type (MPAS_Time_type) :: now
+      integer :: yr, dy, h, mi, sc, ierr, y, days
+      integer, parameter :: before(12) = (/ 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 /)
+
+      now = mpas_get_clock_time(domain % clock, MPAS_NOW, ierr)
+      call mpas_get_time(now, YYYY=yr, MM=mo, DD=dy, H=h, M=mi, S=sc, ierr=ierr)
+      days = before(mo) + dy - 1
+      if (mo > 2 .and. mod(yr, 4) == 0) days = days + 1
+      do y = 2000, yr - 1
+         days = days + merge(366, 365, mod(y, 4) == 0)
+      end do
+      t_abs = real(days, kind=dp) * 86400.0d0 + real(h*3600 + mi*60 + sc, kind=dp)
+   end subroutine model_date
+
+
+   !> Sulfate (mol) in one real particle represented by a computational particle.
    function particle_sulfate(particle)
       type(aero_particle_t), intent(in) :: particle
       real (kind=RKIND) :: particle_sulfate

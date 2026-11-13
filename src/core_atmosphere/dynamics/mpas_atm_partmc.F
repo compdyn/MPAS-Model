@@ -46,6 +46,9 @@
 !                     (default 0 = interpolate). 1: constant plus linear field with the model's
 !                     discrete divergence. 2: also matches the mass flux through every edge
 !                     (lowest-order Raviart-Thomas field on the triangles centre-vertex-vertex).
+!   PMC_LAGR_SHUFFLE  lagrangian mode, with PMC_WET: 1 = before wet removal every particle is moved
+!                     to a random point of its own cell and layer, which makes the cells well
+!                     mixed as an Eulerian scheme assumes (a test; default 0)
 !   PMC_LAGR_UCONST   lagrangian mode: 1 = horizontal velocity constant within a layer instead of
 !                     linear between layer centres (default 0)
 !   PMC_TEST_WIND     lagrangian mode: replace the model winds by an analytic flow with a
@@ -248,7 +251,7 @@ module mpas_atm_partmc
    !> production of precipitation, and the part of the production counted as reaching the
    !> surface (kg); last, the number of particles expected to be removed given the particles
    !> that were in the layers (the sum of probability times number).
-   logical :: pmc_wet = .false., pmc_wet_diag_only = .false.
+   logical :: pmc_wet = .false., pmc_wet_diag_only = .false., lagr_shuffle = .false.
    real (kind=RKIND) :: pmc_wet_scrit = 1.0e9_RKIND
    character(len=256) :: gas_wet_file = ''
    real (kind=RKIND) :: wet_sums(6) = 0.0_RKIND
@@ -392,6 +395,8 @@ contains
       if (stat == 0) read(envval, *) pmc_kz_top
       call get_environment_variable('PMC_LAGR_FLUXVEL', envval, status=stat)
       if (stat == 0) read(envval, *) lagr_flux_vel
+      call get_environment_variable('PMC_LAGR_SHUFFLE', envval, status=stat)
+      if (stat == 0) lagr_shuffle = (trim(envval) /= '0')
       call get_environment_variable('PMC_LAGR_UCONST', envval, status=stat)
       if (stat == 0) lagr_u_const = (trim(envval) /= '0')
       call get_environment_variable('PMC_MOSAIC', envval, status=stat)
@@ -3044,6 +3049,7 @@ contains
       real (kind=RKIND), dimension(:), pointer :: dvEdge
       integer, dimension(:,:), pointer :: edgesOnCell
       type (field2DReal), pointer :: rainprod_field
+      real (kind=RKIND) :: xs(NPOS)
 #ifdef MPAS_PARTMC_MOSAIC
       type(spec_file_t) :: file
       type(gas_state_t), save :: gas_wet
@@ -3106,6 +3112,18 @@ contains
          end if
       end if
 #endif
+
+      if (lagr_shuffle .and. pmc_n_part > 0 .and. pmc_mode == MODE_LAGR) then
+         do iCell = 1, nCellsSolve
+            do k = 1, nVertLevels
+               do j = 1, pos(k,iCell) % n
+                  call random_in_cell(iCell, k, nCells, nEdgesOnCell, cellsOnCell, xs(1:4))
+                  xs(5:7) = xs(1:3)
+                  pos(k,iCell) % x(:,j) = xs
+               end do
+            end do
+         end do
+      end if
 
       do iCell = 1, nCellsSolve
          ! precipitation produced in the column this step (kg m^-2) and the part reaching the ground

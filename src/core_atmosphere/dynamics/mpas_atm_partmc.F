@@ -37,6 +37,11 @@
 !   PMC_EMIT_LEVELS   number of lowest layers the emission is spread over, uniformly in mixing
 !                     ratio (default 1)
 !   PMC_DRYDEP_V      dry deposition velocity (m/s) applied to the lowest layer (default 0)
+!   PMC_DRYDEP_SCHEME 1 = lagrangian mode: a deposition velocity for each particle from its size
+!                     and density with PartMC's scenario_loss_rate_drydep (Zhang et al. 2001
+!                     form), using the wind speed of the lowest layer and the model's roughness
+!                     length with a neutral surface layer; the reference scalars are not
+!                     changed (default 0)
 !   PMC_CONV          1 = convective transport of tracers and particles with the cu_ntiedtke
 !                     scheme's mass fluxes (default 0)
 !   PMC_CONV_CHECK    1 = with PMC_CONV, compare the change of moist static energy that the column
@@ -178,6 +183,7 @@ module mpas_atm_partmc
    use pmc_spec_file
    use pmc_env_state
    use pmc_coagulation
+   use pmc_scenario, only : scenario_t, scenario_loss_rate_drydep
 #ifdef MPAS_PARTMC_MOSAIC
    use pmc_gas_data
    use pmc_gas_state
@@ -303,6 +309,11 @@ module mpas_atm_partmc
    real (kind=RKIND) :: pmc_emit_flux = 0.0_RKIND, pmc_drydep_v = 0.0_RKIND
    !> Real particles so far: emitted (reference, particles) and deposited (reference, particles).
    real (kind=RKIND) :: surf_sums(4) = 0.0_RKIND
+   !> Size-dependent dry deposition: switch, and sums by this task so far: number expected to
+   !> be removed (probability times number), number removed, and number-weighted sums of the
+   !> deposition velocity and of one, for the mean velocity.
+   logical :: pmc_drydep_scheme = .false.
+   real (kind=RKIND) :: drydep_sums(4) = 0.0_RKIND
    !> Number of lowest layers that receive the emission.
    integer :: pmc_emit_levels = 1
    integer :: n_conv = 0
@@ -472,6 +483,8 @@ contains
       if (stat == 0) read(envval, *) pmc_emit_flux
       call get_environment_variable('PMC_EMIT_LEVELS', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_emit_levels
+      call get_environment_variable('PMC_DRYDEP_SCHEME', envval, status=stat)
+      if (stat == 0) pmc_drydep_scheme = (trim(envval) /= '0')
       call get_environment_variable('PMC_DRYDEP_V', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_drydep_v
       call get_environment_variable('PMC_CONV', envval, status=stat)
@@ -3079,8 +3092,18 @@ contains
       real (kind=dp) :: diam, vol_tot
       real (kind=dp), allocatable :: vols(:)
       type(aero_particle_t) :: particle
+      type (mpas_pool_type), pointer :: diag, diag_physics
+      real (kind=RKIND), dimension(:,:), pointer :: theta_m, exner, pressure_p, pressure_base, zgrid, u_zon, u_mer
+      real (kind=RKIND), dimension(:), pointer :: znt
+      integer, pointer :: index_qv
+      type(scenario_t) :: scen
+      type(env_state_t) :: env_state
+      real (kind=dp) :: v_dep
+      real (kind=RKIND) :: dsum(4), g_dsum(4)
+      real (kind=dp), parameter :: test_diam(6) = (/ 1.0d-8, 3.0d-8, 1.0d-7, 3.0d-7, 1.0d-6, 1.0d-5 /)
+      real (kind=RKIND) :: test_v(6)
 
-      if (pmc_emit_flux <= 0.0_RKIND .and. pmc_drydep_v <= 0.0_RKIND) return
+      if (pmc_emit_flux <= 0.0_RKIND .and. pmc_drydep_v <= 0.0_RKIND .and. .not. pmc_drydep_scheme) return
 
       call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
       call mpas_pool_get_subpool(domain % blocklist % structs, 'state', state)
@@ -3103,6 +3126,35 @@ contains
       nullify(landmask)
       call mpas_pool_get_array(sfc_input, 'landmask', landmask)
       idx = (/ index_pmc_num, index_pmc_num2, index_ref, index_src2 /)
+      if (pmc_drydep_scheme) then
+         call mpas_pool_get_subpool(domain % blocklist % structs, 'diag', diag)
+         call mpas_pool_get_subpool(domain % blocklist % structs, 'diag_physics', diag_physics)
+         call mpas_pool_get_dimension(state, 'index_qv', index_qv)
+         call mpas_pool_get_array(state, 'theta_m', theta_m, 2)
+         call mpas_pool_get_array(diag, 'exner', exner)
+         call mpas_pool_get_array(diag, 'pressure_p', pressure_p)
+         call mpas_pool_get_array(diag, 'pressure_base', pressure_base)
+         call mpas_pool_get_array(diag, 'uReconstructZonal', u_zon)
+         call mpas_pool_get_array(diag, 'uReconstructMeridional', u_mer)
+         call mpas_pool_get_array(mesh, 'zgrid', zgrid)
+         nullify(znt)
+         call mpas_pool_get_array(diag_physics, 'znt', znt)
+         if (itimestep == 1 .and. domain % dminfo % my_proc_id == 0) then
+            ! deposition velocity against diameter for fixed conditions, for a look at the curve
+            env_state%temp = 288.0d0
+            env_state%pressure = 1.0d5
+            env_state%height = 1.0d0
+            scen%drydep%z_ref = 25.0d0
+            scen%drydep%u_mean = 5.0d0
+            scen%drydep%z_rough = 0.01d0
+            do i = 1, 6
+               test_v(i) = scenario_loss_rate_drydep(pii/6.0d0*test_diam(i)**3, 1800.0d0, aero_data, env_state, scen)
+            end do
+            call mpas_log_write('PartMC dry deposition velocity (m/s) for diameters 10 nm, 30 nm, 100 nm, 300 nm, ' &
+                                // '1 um, 10 um (density 1800 kg/m3, 5 m/s at 25 m, roughness 0.01 m): ' &
+                                // '$r $r $r $r $r $r', realArgs=test_v)
+         end if
+      end if
       i_oc = aero_data_spec_by_name(aero_data, 'OC')
       i_bc = aero_data_spec_by_name(aero_data, 'BC')
       allocate(vols(n_spec))
@@ -3112,7 +3164,34 @@ contains
          ! air mass per area of the lowest layer; number per area is m1 times the mixing ratio
          m1 = rho_zz(1,iCell) / rdzw(1)
 
-         if (pmc_drydep_v > 0.0_RKIND) then
+         if (pmc_drydep_scheme .and. pmc_n_part > 0 .and. pmc_mode == MODE_LAGR) then
+            ! a deposition velocity for every particle
+            env_state%temp = theta_m(1,iCell) / (1.0_RKIND + rvord*max(0.0_RKIND, scalars(index_qv,1,iCell))) &
+                             * exner(1,iCell)
+            env_state%pressure = pressure_p(1,iCell) + pressure_base(1,iCell)
+            env_state%height = 1.0d0
+            scen%drydep%z_ref = 0.5d0 * (zgrid(2,iCell) - zgrid(1,iCell))
+            scen%drydep%u_mean = max(0.5d0, sqrt(u_zon(1,iCell)**2 + u_mer(1,iCell)**2))
+            scen%drydep%z_rough = 0.01d0
+            if (associated(znt)) scen%drydep%z_rough = znt(iCell)
+            scen%drydep%z_rough = min(0.3d0 * scen%drydep%z_ref, max(1.0d-5, scen%drydep%z_rough))
+            do j = pos(1,iCell) % n, 1, -1
+               v_dep = scenario_loss_rate_drydep(aero_particle_volume(aero_states(1,iCell)%apa%particle(j)), &
+                          aero_particle_density(aero_states(1,iCell)%apa%particle(j), aero_data), aero_data, &
+                          env_state, scen)
+               p_dep = 1.0_RKIND - exp(-v_dep * config_dt / dz)
+               g = aero_states(1,iCell)%apa%particle(j)%weight_class
+               w = lagr_w * 2.0_RKIND**(g - LAGR_G0)
+               drydep_sums(1) = drydep_sums(1) + p_dep * w
+               drydep_sums(3) = drydep_sums(3) + v_dep * w
+               drydep_sums(4) = drydep_sums(4) + w
+               if (pmc_random() >= p_dep) cycle
+               drydep_sums(2) = drydep_sums(2) + w
+               part_s_removed = part_s_removed + particle_sulfate(aero_states(1,iCell)%apa%particle(j)) * w
+               call aero_state_remove_particle_no_info(aero_states(1,iCell), j)
+               call pos_remove(pos(1,iCell), j)
+            end do
+         else if (pmc_drydep_v > 0.0_RKIND) then
             p_dep = 1.0_RKIND - exp(-pmc_drydep_v * config_dt / dz)
             surf_sums(3) = surf_sums(3) + p_dep * m1 * scalars(index_ref,1,iCell) * areaCell(iCell)
             do i_s = 1, 4
@@ -3189,6 +3268,14 @@ contains
          call mpas_log_write('PartMC surface step $i: emitted so far: reference = $r, particles = $r; ' &
                              // 'deposited so far: reference = $r, particles = $r', &
                              intArgs=(/itimestep/), realArgs=g_sums)
+         if (pmc_drydep_scheme) then
+            dsum = drydep_sums
+            call mpas_dmpar_sum_real_array(domain % dminfo, 4, dsum, g_dsum)
+            call mpas_log_write('PartMC dry deposition step $i: size-dependent: number expected so far = $r, ' &
+                                // 'removed = $r, number-weighted mean velocity in the lowest layer = $r m/s', &
+                                intArgs=(/itimestep/), &
+                                realArgs=(/g_dsum(1), g_dsum(2), g_dsum(3)/max(g_dsum(4), 1.0e-30_RKIND)/))
+         end if
       end if
 #endif
 

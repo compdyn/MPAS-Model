@@ -63,6 +63,10 @@
 !   PMC_COUPLED       1 (default): the class scalars are reset from the particles every step
 !   PMC_SCALE_HEIGHT  e-folding height (m) of the initial number mixing ratio
 !   PMC_AERO_DATA     PartMC aerosol species file (default aero_data.dat)
+!   PMC_RESTART_INTERVAL  write the complete particle state every this many steps (0 = never)
+!                     to PMC_RESTART_DIR (default pmc_restart), one binary file per MPI task
+!   PMC_RESTART_READ  step number of the particle state to read at start-up, for a model
+!                     restart from the same time with the same number of tasks and partition
 !   PMC_OUT_INTERVAL  write particle files every this many steps (0 = never)
 !   PMC_OUT_FRAC      fraction of cells written each time (default 1)
 !   PMC_OUT_DIR       directory for particle files (default pmc_out)
@@ -194,7 +198,7 @@ module mpas_atm_partmc
    public :: atm_partmc_init, atm_partmc_check, atm_partmc_particles_init, atm_partmc_particles_transport, &
              atm_partmc_particles_to_scalar, atm_partmc_output, atm_partmc_vertical_mixing, &
              atm_partmc_convection, atm_partmc_surface, atm_partmc_gas_surface, atm_partmc_chemistry, &
-             atm_partmc_wet_removal, &
+             atm_partmc_wet_removal, atm_partmc_restart_write, &
              atm_partmc_coagulation
 
    integer, parameter :: MODE_FLUX = 1, MODE_LAGR = 2
@@ -318,6 +322,10 @@ module mpas_atm_partmc
    integer :: n_coag_total = 0
    !> Particle output: interval in steps (0 = off), fraction of cells written, directory.
    integer :: pmc_out_interval = 0
+   !> Restart files for the particle state: write interval (steps), step to read at start-up,
+   !> directory.
+   integer :: pmc_restart_interval = 0, pmc_restart_read = 0
+   character(len=256) :: pmc_restart_dir = 'pmc_restart'
    real (kind=RKIND) :: pmc_out_frac = 1.0_RKIND
    character(len=256) :: pmc_out_dir = 'pmc_out'
 
@@ -478,6 +486,12 @@ contains
       n_class = max(1, min(MAX_CLASS, n_class))
       call get_environment_variable('PMC_AERO_DATA', envval, status=stat)
       if (stat == 0) aero_data_file = envval
+      call get_environment_variable('PMC_RESTART_INTERVAL', envval, status=stat)
+      if (stat == 0) read(envval, *) pmc_restart_interval
+      call get_environment_variable('PMC_RESTART_READ', envval, status=stat)
+      if (stat == 0) read(envval, *) pmc_restart_read
+      call get_environment_variable('PMC_RESTART_DIR', envval, status=stat)
+      if (stat == 0) pmc_restart_dir = envval
       call get_environment_variable('PMC_OUT_INTERVAL', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_out_interval
       call get_environment_variable('PMC_OUT_FRAC', envval, status=stat)
@@ -1162,6 +1176,9 @@ contains
          call mpas_log_write('PartMC: flux transport with $i weight classes, one-way', intArgs=(/n_class/))
       end if
 
+      if (pmc_restart_interval > 0) call execute_command_line('mkdir -p ' // trim(pmc_restart_dir))
+      if (pmc_restart_read > 0) call restart_read(domain)
+
    contains
 
       !> Add a new particle from source i_source to cell (k,iCell) in weight class i_class.
@@ -1195,6 +1212,180 @@ contains
 #endif
 
    end subroutine atm_partmc_particles_init
+
+
+   !> Name of this task's particle restart file for a step.
+   function restart_name(domain, step)
+      type (domain_type), intent(in) :: domain
+      integer, intent(in) :: step
+      character(len=512) :: restart_name
+      write(restart_name, '(a,"/particles_s",i8.8,"_r",i5.5,".bin")') trim(pmc_restart_dir), step, &
+            domain % dminfo % my_proc_id
+   end function restart_name
+
+
+   !> Write the complete particle state of this task: every cell's PartMC population (packed
+   !> with PartMC's own routines, so nothing is left out), the particle positions, the state
+   !> of the random number generator, the particle id counter, the weight unit and the
+   !> running sums of the diagnostics. Together with the model's own restart file this is
+   !> what a run needs to continue as if it had not stopped.
+   subroutine atm_partmc_restart_write(domain, itimestep)
+
+      type (domain_type), intent(inout) :: domain
+      integer, intent(in) :: itimestep
+
+#ifdef MPAS_PARTMC
+      type (mpas_pool_type), pointer :: mesh
+      integer, dimension(:), pointer :: indexToCellID
+      integer, pointer :: nCellsSolve, nVertLevels
+      integer :: u, iCell, k, n, nb, p, n_seed, has_gas
+      integer, allocatable :: seed(:)
+      character, allocatable :: buf(:)
+      integer (kind=I8KIND) :: n_tot
+
+      if (pmc_n_part <= 0 .or. pmc_restart_interval <= 0) return
+      if (mod(itimestep, pmc_restart_interval) /= 0) return
+
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
+      call mpas_pool_get_dimension(mesh, 'nCellsSolve', nCellsSolve)
+      call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
+      call mpas_pool_get_array(mesh, 'indexToCellID', indexToCellID)
+      call random_seed(size=n_seed)
+      allocate(seed(n_seed))
+      call random_seed(get=seed)
+
+      open(newunit=u, file=trim(restart_name(domain, itimestep)), access='stream', form='unformatted', status='replace')
+      write(u) 20261113, itimestep, nCellsSolve, nVertLevels, NPOS, pmc_mode, n_seed
+      write(u) indexToCellID(1:nCellsSolve)
+      write(u) seed
+      write(u) next_id
+      write(u) lagr_w, chem_s0, part_s_removed, m2_ref0, m2_part0, surf_sums, wet_sums, conv_wet
+      write(u) n_thinned, n_split, n_conv, n_mixed, n_coag_total
+      has_gas = merge(size(gas_emitted), 0, allocated(gas_emitted))
+      write(u) has_gas
+      if (has_gas > 0) write(u) gas_emitted, gas_deposited, gas_wetdep, gas_content0
+      n_tot = 0
+      do iCell = 1, nCellsSolve
+         do k = 1, nVertLevels
+            n = aero_state_n_part(aero_states(k,iCell))
+            nb = pmc_mpi_pack_size_aero_state(aero_states(k,iCell))
+            if (allocated(buf)) then
+               if (size(buf) < nb) deallocate(buf)
+            end if
+            if (.not. allocated(buf)) allocate(buf(2*nb))
+            p = 0
+            call pmc_mpi_pack_aero_state(buf, p, aero_states(k,iCell))
+            write(u) n, p
+            write(u) buf(1:p)
+            if (pmc_mode == MODE_LAGR .and. n > 0) write(u) pos(k,iCell) % x(:,1:n)
+            n_tot = n_tot + n
+         end do
+      end do
+      write(u) n_tot
+      close(u)
+      if (domain % dminfo % my_proc_id == 0) then
+         call mpas_log_write('PartMC restart step $i: particle state written to ' // trim(pmc_restart_dir), &
+                             intArgs=(/itimestep/))
+      end if
+#endif
+
+   end subroutine atm_partmc_restart_write
+
+
+   !> Read the particle state written by atm_partmc_restart_write, replacing the freshly
+   !> made populations. The run must have the same number of tasks and the same partition.
+   subroutine restart_read(domain)
+
+      type (domain_type), intent(inout) :: domain
+
+#ifdef MPAS_PARTMC
+      type (mpas_pool_type), pointer :: mesh
+      integer, dimension(:), pointer :: indexToCellID
+      integer, pointer :: nCellsSolve, nVertLevels
+      integer :: u, iCell, k, n, nb, p, n_seed, has_gas, hdr(7), ios, n_in
+      integer, allocatable :: seed(:), ids(:)
+      character, allocatable :: buf(:)
+      integer (kind=I8KIND) :: n_tot, n_chk
+      real (kind=RKIND) :: x(NPOS)
+      real (kind=RKIND), allocatable :: xs(:,:)
+
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
+      call mpas_pool_get_dimension(mesh, 'nCellsSolve', nCellsSolve)
+      call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
+      call mpas_pool_get_array(mesh, 'indexToCellID', indexToCellID)
+
+      open(newunit=u, file=trim(restart_name(domain, pmc_restart_read)), access='stream', form='unformatted', &
+           status='old', iostat=ios)
+      if (ios /= 0) then
+         call mpas_log_write('PartMC: cannot open ' // trim(restart_name(domain, pmc_restart_read)), &
+                             messageType=MPAS_LOG_CRIT)
+      end if
+      read(u) hdr
+      call random_seed(size=n_seed)
+      if (hdr(1) /= 20261113 .or. hdr(3) /= nCellsSolve .or. hdr(4) /= nVertLevels .or. hdr(5) /= NPOS &
+          .or. hdr(6) /= pmc_mode .or. hdr(7) /= n_seed) then
+         call mpas_log_write('PartMC: the particle restart file does not fit this run (tasks, partition, ' &
+                             // 'levels or transport mode differ)', messageType=MPAS_LOG_CRIT)
+      end if
+      allocate(ids(nCellsSolve), seed(n_seed))
+      read(u) ids
+      if (any(ids /= indexToCellID(1:nCellsSolve))) then
+         call mpas_log_write('PartMC: the particle restart file is for a different partition', &
+                             messageType=MPAS_LOG_CRIT)
+      end if
+      read(u) seed
+      read(u) next_id
+      read(u) lagr_w, chem_s0, part_s_removed, m2_ref0, m2_part0, surf_sums, wet_sums, conv_wet
+      read(u) n_thinned, n_split, n_conv, n_mixed, n_coag_total
+      read(u) has_gas
+      if (has_gas > 0) then
+         if (allocated(gas_emitted)) deallocate(gas_emitted, gas_deposited, gas_wetdep, gas_content0)
+         allocate(gas_emitted(has_gas), gas_deposited(has_gas), gas_wetdep(has_gas), gas_content0(has_gas))
+         read(u) gas_emitted, gas_deposited, gas_wetdep, gas_content0
+      end if
+      n_tot = 0
+      do iCell = 1, nCellsSolve
+         do k = 1, nVertLevels
+            read(u) n, nb
+            if (allocated(buf)) then
+               if (size(buf) < nb) deallocate(buf)
+            end if
+            if (.not. allocated(buf)) allocate(buf(2*nb))
+            read(u) buf(1:nb)
+            p = 0
+            call pmc_mpi_unpack_aero_state(buf, p, aero_states(k,iCell))
+            if (aero_state_n_part(aero_states(k,iCell)) /= n) then
+               call mpas_log_write('PartMC: particle restart file is inconsistent', messageType=MPAS_LOG_CRIT)
+            end if
+            if (pmc_mode == MODE_LAGR) then
+               pos(k,iCell) % n = 0
+               if (n > 0) then
+                  allocate(xs(NPOS, n))
+                  read(u) xs
+                  do n_in = 1, n
+                     x = xs(:,n_in)
+                     call pos_append(pos(k,iCell), x)
+                  end do
+                  deallocate(xs)
+               end if
+            end if
+            n_tot = n_tot + n
+         end do
+      end do
+      read(u) n_chk
+      close(u)
+      if (n_chk /= n_tot) then
+         call mpas_log_write('PartMC: particle restart file is truncated', messageType=MPAS_LOG_CRIT)
+      end if
+      ! last, so that nothing above has drawn random numbers after the state was set
+      call random_seed(put=seed)
+      if (domain % dminfo % my_proc_id == 0) then
+         call mpas_log_write('PartMC: particle state read from ' // trim(pmc_restart_dir) // ', step $i', &
+                             intArgs=(/pmc_restart_read/))
+      end if
+#endif
+
+   end subroutine restart_read
 
 
    !> Coupled flux mode: set each class scalar (time level 1) from the particle counts, so that

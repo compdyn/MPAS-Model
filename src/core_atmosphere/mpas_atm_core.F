@@ -1011,7 +1011,7 @@ module atm_core
       use mpas_atm_partmc, only: atm_partmc_check, atm_partmc_particles_transport, atm_partmc_particles_to_scalar, &
                                  atm_partmc_output, atm_partmc_vertical_mixing, atm_partmc_coagulation, &
                                  atm_partmc_convection, atm_partmc_surface, atm_partmc_chemistry, &
-                                 atm_partmc_gas_surface, atm_partmc_wet_removal
+                                 atm_partmc_gas_surface, atm_partmc_wet_removal, atm_partmc_restart_write
       use mpas_atm_halos, only: exchange_halo_group
 
       implicit none
@@ -1063,6 +1063,7 @@ module atm_core
       call atm_partmc_chemistry(domain, itimestep)
       call atm_partmc_coagulation(domain, itimestep)
       call atm_partmc_output(domain, itimestep, dt)
+      call atm_partmc_restart_write(domain, itimestep)
 
    end subroutine atm_do_timestep
    

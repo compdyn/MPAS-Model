@@ -312,6 +312,9 @@ module mpas_atm_partmc
    real (kind=RKIND) :: wet_cls(2,11) = 0.0_RKIND
    !> Sulfate (mol) in particles removed by dry and wet deposition, by this task so far.
    real (kind=RKIND) :: part_s_removed = 0.0_RKIND
+   !> Net sulfate (mol) added to the particles by the thinning of the population control
+   !> since the start of this run (not kept over restarts). Zero in expectation.
+   real (kind=RKIND) :: part_s_thin = 0.0_RKIND
    !> Repeat sample cells' chemistry after another cell to check MOSAIC carries nothing over.
    logical :: pmc_chem_selftest = .false.
    !> Cells (global cell ID and level) whose state is saved in PartMC's own file format before
@@ -2451,7 +2454,7 @@ contains
       integer, dimension(:), intent(in) :: nEdgesOnCell
       integer, dimension(:,:), intent(in) :: cellsOnCell
       integer :: n, j, g, g_sel
-      real (kind=RKIND) :: xp(NPOS)
+      real (kind=RKIND) :: xp(NPOS), s_w
       type(aero_particle_t) :: twin
 
       n = pos(k,iCell) % n
@@ -2463,11 +2466,15 @@ contains
          if (g_sel >= LAGR_GROUPS) exit
          do j = n, 1, -1
             if (aero_states(k,iCell)%apa%particle(j)%weight_class /= g_sel) cycle
+            ! sulfate this particle stands for (mol): lost if removed, gained again if doubled
+            s_w = particle_sulfate(aero_states(k,iCell)%apa%particle(j)) * lagr_w * 2.0_RKIND**(g_sel - LAGR_G0)
             if (pmc_random() < 0.5d0) then
+               part_s_thin = part_s_thin - s_w
                call aero_state_remove_particle_no_info(aero_states(k,iCell), j)
                call pos_remove(pos(k,iCell), j)
                n_thinned = n_thinned + 1
             else
+               part_s_thin = part_s_thin + s_w
                aero_states(k,iCell)%apa%particle(j)%weight_class = g_sel + 1
             end if
          end do
@@ -3822,8 +3829,9 @@ contains
       real (kind=RKIND), allocatable :: local(:)
       integer :: n_gas
 
-      if (allocated(gas_emitted)) return
+      ! the sums may already be there from a restart file; the gas data are still needed
       call gas_setup(domain)
+      if (allocated(gas_emitted)) return
       n_gas = gas_data_n_spec(gas_data)
       allocate(gas_emitted(n_gas), gas_deposited(n_gas), gas_wetdep(n_gas), gas_content0(n_gas), local(n_gas))
       gas_emitted = 0.0_RKIND
@@ -4372,6 +4380,13 @@ contains
          call mpas_dmpar_max_real(domain % dminfo, t_local, ch4_max)
          call mpas_log_write('PartMC chemistry step $i: CH4 tracer min = $r, max = $r ppb', &
                              intArgs=(/itimestep/), realArgs=(/ch4_min, ch4_max/))
+         t_local = part_s_thin
+         call mpas_dmpar_sum_real(domain % dminfo, t_local, ch4_min)
+         call mpas_log_write('PartMC chemistry step $i: sulfate added by the thinning of the population control ' &
+                             // 'since the start of this run = $r mol, / total at start = $r; rel change of the ' &
+                             // 'total less this = $r', intArgs=(/itimestep/), &
+                             realArgs=(/ch4_min, ch4_min/chem_s0, &
+                                        (g_sums(1) + g_sums(2) - g_sums(4) - ch4_min)/chem_s0 - 1.0_RKIND/))
          call mpas_log_write('PartMC chemistry step $i: cells = $i, sulfur (mol) gas = $r, particles = $r, ' &
                              // 'total less net surface input, rel change = $r, particle water (kg) = $r, ' &
                              // 'slowest task = $r s', &

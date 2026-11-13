@@ -425,7 +425,7 @@ module mpas_atm_partmc
    !> sums (variable, level, cell), the number of samples in them and the group of each species.
    integer :: pmc_diag_interval = 0, pmc_diag_every = 5, n_diag_samples = 0
    character(len=256) :: pmc_diag_dir = 'pmc_diag'
-   integer, parameter :: N_DIAG = 38, N_REG = 11
+   integer, parameter :: N_DIAG = 42, N_REG = 11
    real (kind=RKIND), allocatable :: diag_acc(:,:,:)
    integer, allocatable :: diag_group(:)
    !> Restart files for the particle state: write interval (steps), step to read at start-up,
@@ -5344,7 +5344,7 @@ contains
       integer, pointer :: nCellsSolve, nVertLevels, index_qv
       integer :: iCell, k, j, i_s, g, ncid, d_cell, d_lev, d_var, varid
       real (kind=dp) :: nc, d_dry, s_crit, mg(6), m_tot, h_a, h_o, h_h, p, m_nh, m_hy
-      real (kind=dp) :: t_now
+      real (kind=dp) :: t_now, kap, kv_sum, v_sum, k_cell, a_k, sc_own, sc_int
       integer :: mo_d, i_so4_d, i_no3_d, i_nh4_d, src, reg
       type(env_state_t) :: env_state
       real (kind=R4KIND), allocatable :: out(:,:,:), zm(:,:)
@@ -5353,7 +5353,8 @@ contains
          // 'm_bc,m_dust,m_seasalt,m_pom,m_soa,m_sia,' &
          // 'msub_bc,msub_dust,msub_seasalt,msub_pom,msub_soa,msub_sia,' &
          // 'mh_a,mh_o,mh_h,m_water,m_so4,m_no3,m_nh4,mbc_ccn0p1,mbc_ccn0p3,mage_bc,' &
-         // 'mbc_r0,mbc_r1,mbc_r2,mbc_r3,mbc_r4,mbc_r5,mbc_r6,mbc_r7,mbc_r8,mbc_r9,mbc_r10'
+         // 'mbc_r0,mbc_r1,mbc_r2,mbc_r3,mbc_r4,mbc_r5,mbc_r6,mbc_r7,mbc_r8,mbc_r9,mbc_r10,' &
+         // 'ccnk_0p1,ccnk_0p3,ccni_0p1,ccni_0p3'
 
       if (pmc_n_part <= 0 .or. pmc_diag_interval <= 0) return
 
@@ -5399,6 +5400,38 @@ contains
             do k = 1, nVertLevels
                env_state%temp = theta_m(k,iCell) / (1.0_RKIND + rvord*max(0.0_RKIND, scalars(index_qv,k,iCell))) &
                                 * exner(k,iCell)
+               ! the cell's volume-mean hygroscopicity, for CCN of the same particles internally mixed
+               kv_sum = 0.0d0
+               v_sum = 0.0d0
+               do j = 1, aero_state_n_part(aero_states(k,iCell))
+                  nc = aero_weight_array_num_conc(aero_states(k,iCell)%awa, aero_states(k,iCell)%apa%particle(j), &
+                                                  aero_data)
+                  d_dry = aero_particle_dry_diameter(aero_states(k,iCell)%apa%particle(j), aero_data)
+                  kap = aero_particle_solute_kappa(aero_states(k,iCell)%apa%particle(j), aero_data)
+                  kv_sum = kv_sum + nc * d_dry**3 * kap
+                  v_sum = v_sum + nc * d_dry**3
+               end do
+               k_cell = 0.0d0
+               if (v_sum > 0.0d0) k_cell = kv_sum / v_sum
+               ! Kelvin parameter A = 4 sigma M_w / (R T rho_w); kappa-Koehler critical
+               ! supersaturation sqrt(4 A^3 / (27 kappa D^3)) (Petters and Kreidenweis 2007)
+               a_k = 4.0d0 * 0.0728d0 * 0.018015d0 / (8.314d0 * env_state%temp * 1000.0d0)
+               do j = 1, aero_state_n_part(aero_states(k,iCell))
+                  nc = aero_weight_array_num_conc(aero_states(k,iCell)%awa, aero_states(k,iCell)%apa%particle(j), &
+                                                  aero_data)
+                  d_dry = aero_particle_dry_diameter(aero_states(k,iCell)%apa%particle(j), aero_data)
+                  kap = aero_particle_solute_kappa(aero_states(k,iCell)%apa%particle(j), aero_data)
+                  if (d_dry > 0.0d0) then
+                     sc_own = huge(1.0d0)
+                     if (kap > 1.0d-6) sc_own = sqrt(4.0d0 * a_k**3 / (27.0d0 * kap * d_dry**3))
+                     sc_int = huge(1.0d0)
+                     if (k_cell > 1.0d-6) sc_int = sqrt(4.0d0 * a_k**3 / (27.0d0 * k_cell * d_dry**3))
+                     if (sc_own <= 0.001d0) diag_acc(39,k,iCell) = diag_acc(39,k,iCell) + nc
+                     if (sc_own <= 0.003d0) diag_acc(40,k,iCell) = diag_acc(40,k,iCell) + nc
+                     if (sc_int <= 0.001d0) diag_acc(41,k,iCell) = diag_acc(41,k,iCell) + nc
+                     if (sc_int <= 0.003d0) diag_acc(42,k,iCell) = diag_acc(42,k,iCell) + nc
+                  end if
+               end do
                do j = 1, aero_state_n_part(aero_states(k,iCell))
                   nc = aero_weight_array_num_conc(aero_states(k,iCell)%awa, aero_states(k,iCell)%apa%particle(j), &
                                                   aero_data)

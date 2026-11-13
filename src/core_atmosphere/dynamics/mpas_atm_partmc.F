@@ -1353,6 +1353,8 @@ contains
             if (.not. allocated(buf)) allocate(buf(2*nb))
             read(u) buf(1:nb)
             p = 0
+            ! PartMC's unpack needs an empty population to fill
+            call aero_state_zero(aero_states(k,iCell))
             call pmc_mpi_unpack_aero_state(buf, p, aero_states(k,iCell))
             if (aero_state_n_part(aero_states(k,iCell)) /= n) then
                call mpas_log_write('PartMC: particle restart file is inconsistent', messageType=MPAS_LOG_CRIT)

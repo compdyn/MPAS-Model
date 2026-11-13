@@ -348,6 +348,9 @@ module mpas_atm_partmc
    !> Net sulfate (mol) added to the particles by the thinning of the population control
    !> since the start of this run (not kept over restarts). Zero in expectation.
    real (kind=RKIND) :: part_s_thin = 0.0_RKIND
+   !> Sum of the squares of the single thinning changes (mol^2): the variance of part_s_thin
+   !> if the thinning has no bias.
+   real (kind=RKIND) :: part_s_thin_var = 0.0_RKIND
    !> Repeat sample cells' chemistry after another cell to check MOSAIC carries nothing over.
    logical :: pmc_chem_selftest = .false.
    !> Cells (global cell ID and level) whose state is saved in PartMC's own file format before
@@ -2532,30 +2535,81 @@ contains
       integer, intent(in) :: k, iCell, nCells
       integer, dimension(:), intent(in) :: nEdgesOnCell
       integer, dimension(:,:), intent(in) :: cellsOnCell
-      integer :: n, j, g, g_sel
-      real (kind=RKIND) :: xp(NPOS), s_w
+      integer :: n, j, g, g_sel, m, a, b, jt, jk, jd
+      real (kind=RKIND) :: xp(NPOS), s_w, kt, w_sel
+      integer, allocatable :: sel(:)
+      real (kind=RKIND), allocatable :: key(:)
+      logical, allocatable :: drop(:)
       type(aero_particle_t) :: twin
 
       n = pos(k,iCell) % n
+      if (n > 2*pmc_n_part) allocate(sel(n), key(n), drop(n))
       do while (n > 2*pmc_n_part)
          g_sel = LAGR_GROUPS + 1
          do j = 1, n
             g_sel = min(g_sel, aero_states(k,iCell)%apa%particle(j)%weight_class)
          end do
          if (g_sel >= LAGR_GROUPS) exit
-         do j = n, 1, -1
+         ! Paired thinning: sort the particles of the class by dry mass, pair neighbours and
+         ! keep one of each pair at random, doubling its weight (an unpaired last particle is
+         ! kept with probability one half). Every particle is kept with probability one half,
+         ! as with independent coins, so the expected content is unchanged; but the change in
+         ! mass is the difference within a pair rather than a whole particle's mass, which
+         ! makes the thinning noise much smaller.
+         m = 0
+         do j = 1, n
             if (aero_states(k,iCell)%apa%particle(j)%weight_class /= g_sel) cycle
-            ! sulfate this particle stands for (mol): lost if removed, gained again if doubled
-            s_w = particle_sulfate(aero_states(k,iCell)%apa%particle(j)) * lagr_w * 2.0_RKIND**(g_sel - LAGR_G0)
-            if (pmc_random() < 0.5d0) then
-               part_s_thin = part_s_thin - s_w
-               call aero_state_remove_particle_no_info(aero_states(k,iCell), j)
-               call pos_remove(pos(k,iCell), j)
-               n_thinned = n_thinned + 1
+            m = m + 1
+            sel(m) = j
+            key(m) = particle_dry_mass(aero_states(k,iCell)%apa%particle(j))
+         end do
+         do a = 2, m                          ! insertion sort, m is at most a few dozen
+            jt = sel(a)
+            kt = key(a)
+            b = a - 1
+            do while (b >= 1)
+               if (key(b) <= kt) exit
+               sel(b+1) = sel(b)
+               key(b+1) = key(b)
+               b = b - 1
+            end do
+            sel(b+1) = jt
+            key(b+1) = kt
+         end do
+         w_sel = lagr_w * 2.0_RKIND**(g_sel - LAGR_G0)
+         drop(1:n) = .false.
+         do a = 1, m, 2
+            if (a < m) then
+               if (pmc_random() < 0.5d0) then
+                  jk = sel(a); jd = sel(a+1)
+               else
+                  jk = sel(a+1); jd = sel(a)
+               end if
+            else if (pmc_random() < 0.5d0) then
+               jk = sel(a); jd = 0
             else
-               part_s_thin = part_s_thin + s_w
-               aero_states(k,iCell)%apa%particle(j)%weight_class = g_sel + 1
+               jk = 0; jd = sel(a)
             end if
+            ! sulfate (mol) gained by the doubled particle and lost with the removed one
+            s_w = 0.0_RKIND
+            if (jk > 0) then
+               s_w = s_w + particle_sulfate(aero_states(k,iCell)%apa%particle(jk)) * w_sel
+               aero_states(k,iCell)%apa%particle(jk)%weight_class = g_sel + 1
+            end if
+            if (jd > 0) then
+               s_w = s_w - particle_sulfate(aero_states(k,iCell)%apa%particle(jd)) * w_sel
+               drop(jd) = .true.
+            end if
+            part_s_thin = part_s_thin + s_w
+            part_s_thin_var = part_s_thin_var + s_w**2
+         end do
+         ! remove from the end down: the particle moved into a freed slot comes from beyond it
+         ! and has been kept
+         do j = n, 1, -1
+            if (.not. drop(j)) cycle
+            call aero_state_remove_particle_no_info(aero_states(k,iCell), j)
+            call pos_remove(pos(k,iCell), j)
+            n_thinned = n_thinned + 1
          end do
          n = pos(k,iCell) % n
       end do
@@ -4395,6 +4449,16 @@ contains
    end function particle_sulfate
 
 
+   !> Dry mass of a particle (kg): total mass less water.
+   function particle_dry_mass(particle)
+      type(aero_particle_t), intent(in) :: particle
+      real (kind=RKIND) :: particle_dry_mass
+      particle_dry_mass = aero_particle_mass(particle, aero_data)
+      if (aero_data%i_water > 0) particle_dry_mass = particle_dry_mass &
+           - particle%vol(aero_data%i_water) * aero_data%density(aero_data%i_water)
+   end function particle_dry_mass
+
+
    !> Allocate the gas budget sums and record the content of each gas at the start. Does this
    !> once, at the first call.
    subroutine gas_budget_setup(domain)
@@ -5011,6 +5075,11 @@ contains
                              // 'total less this = $r', intArgs=(/itimestep/), &
                              realArgs=(/ch4_min, ch4_min/chem_s0, &
                                         (g_sums(1) + g_sums(2) - g_sums(4) - ch4_min)/chem_s0 - 1.0_RKIND/))
+         t_local = part_s_thin_var
+         call mpas_dmpar_sum_real(domain % dminfo, t_local, ch4_max)
+         call mpas_log_write('PartMC chemistry step $i: standard deviation of the thinning sulfate if unbiased ' &
+                             // '= $r mol, / total at start = $r', intArgs=(/itimestep/), &
+                             realArgs=(/sqrt(ch4_max), sqrt(ch4_max)/chem_s0/))
          call mpas_dmpar_sum_real_array(domain % dminfo, N_GRP, burden, g_burden)
          rem = reshape(rem_mass, (/ 3*N_GRP /))
          call mpas_dmpar_sum_real_array(domain % dminfo, 3*N_GRP, rem, g_rem)

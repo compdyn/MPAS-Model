@@ -72,6 +72,10 @@
 !                     to PMC_RESTART_DIR (default pmc_restart), one binary file per MPI task
 !   PMC_RESTART_READ  step number of the particle state to read at start-up, for a model
 !                     restart from the same time with the same number of tasks and partition
+!   PMC_DIAG_INTERVAL write time-mean aerosol fields of every cell (number, CCN, species
+!                     group masses, and the sums needed for the mixing state index chi) every
+!                     this many steps to PMC_DIAG_DIR (default pmc_diag), one NetCDF file per
+!                     task; the particles are sampled every PMC_DIAG_EVERY steps (default 5)
 !   PMC_OUT_INTERVAL  write particle files every this many steps (0 = never)
 !   PMC_OUT_FRAC      fraction of cells written each time (default 1)
 !   PMC_OUT_DIR       directory for particle files (default pmc_out)
@@ -204,7 +208,7 @@ module mpas_atm_partmc
    public :: atm_partmc_init, atm_partmc_check, atm_partmc_particles_init, atm_partmc_particles_transport, &
              atm_partmc_particles_to_scalar, atm_partmc_output, atm_partmc_vertical_mixing, &
              atm_partmc_convection, atm_partmc_surface, atm_partmc_gas_surface, atm_partmc_chemistry, &
-             atm_partmc_wet_removal, atm_partmc_restart_write, &
+             atm_partmc_wet_removal, atm_partmc_restart_write, atm_partmc_diag, &
              atm_partmc_coagulation
 
    integer, parameter :: MODE_FLUX = 1, MODE_LAGR = 2
@@ -334,6 +338,13 @@ module mpas_atm_partmc
    integer :: n_coag_total = 0
    !> Particle output: interval in steps (0 = off), fraction of cells written, directory.
    integer :: pmc_out_interval = 0
+   !> Time-mean aerosol fields: write interval and sampling interval (steps), directory, the
+   !> sums (variable, level, cell), the number of samples in them and the group of each species.
+   integer :: pmc_diag_interval = 0, pmc_diag_every = 5, n_diag_samples = 0
+   character(len=256) :: pmc_diag_dir = 'pmc_diag'
+   integer, parameter :: N_DIAG = 21
+   real (kind=RKIND), allocatable :: diag_acc(:,:,:)
+   integer, allocatable :: diag_group(:)
    !> Restart files for the particle state: write interval (steps), step to read at start-up,
    !> directory.
    integer :: pmc_restart_interval = 0, pmc_restart_read = 0
@@ -506,6 +517,12 @@ contains
       if (stat == 0) read(envval, *) pmc_restart_read
       call get_environment_variable('PMC_RESTART_DIR', envval, status=stat)
       if (stat == 0) pmc_restart_dir = envval
+      call get_environment_variable('PMC_DIAG_INTERVAL', envval, status=stat)
+      if (stat == 0) read(envval, *) pmc_diag_interval
+      call get_environment_variable('PMC_DIAG_EVERY', envval, status=stat)
+      if (stat == 0) read(envval, *) pmc_diag_every
+      call get_environment_variable('PMC_DIAG_DIR', envval, status=stat)
+      if (stat == 0) pmc_diag_dir = envval
       call get_environment_variable('PMC_OUT_INTERVAL', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_out_interval
       call get_environment_variable('PMC_OUT_FRAC', envval, status=stat)
@@ -4378,6 +4395,173 @@ contains
       end if
    end subroutine nc_check
 #endif
+
+
+   !> Time-mean aerosol fields of every cell, for maps.
+   !>
+   !> Every PMC_DIAG_EVERY steps the particles of each cell are added to sums; every
+   !> PMC_DIAG_INTERVAL steps the means are written and the sums start again. Variables (per
+   !> volume of air): number of all particles and of submicron ones (dry diameter below 1 um);
+   !> number that activates at 0.1%, 0.3% and 1.0% supersaturation; dry mass of six species
+   !> groups for all sizes and for submicron particles; and, for submicron particles, the
+   !> mass-weighted sums of the per-particle mixing entropy for three choices of "species":
+   !> the six groups (chi_a), black carbon against the rest (chi_o), and non-hygroscopic
+   !> (BC, dust, primary organic) against hygroscopic (sea salt, secondary organic, secondary
+   !> inorganic) (chi_h), as in Zheng et al. (2021). The mixing state index of the time and
+   !> space aggregate follows from these sums: D_alpha = exp(sum(m H) / sum(m)), D_gamma from
+   !> the group masses, chi = (D_alpha - 1) / (D_gamma - 1). Groups: BC; dust (OIN, Ca, CO3);
+   !> sea salt (Na, Cl); primary organic (OC); secondary organic (ARO1, ARO2, ALK1, OLE1, API1,
+   !> API2, LIM1, LIM2); secondary inorganic (SO4, NO3, NH4, MSA). Water is left out.
+   subroutine atm_partmc_diag(domain, itimestep)
+
+      type (domain_type), intent(inout) :: domain
+      integer, intent(in) :: itimestep
+
+#ifdef MPAS_PARTMC
+      type (mpas_pool_type), pointer :: mesh, state, diag
+      real (kind=RKIND), dimension(:,:,:), pointer :: scalars
+      real (kind=RKIND), dimension(:,:), pointer :: theta_m, exner, zgrid
+      real (kind=RKIND), dimension(:), pointer :: latCell, lonCell
+      integer, dimension(:), pointer :: indexToCellID
+      integer, pointer :: nCellsSolve, nVertLevels, index_qv
+      integer :: iCell, k, j, i_s, g, ncid, d_cell, d_lev, d_var, varid
+      real (kind=dp) :: nc, d_dry, s_crit, mg(6), m_tot, h_a, h_o, h_h, p, m_nh, m_hy
+      type(env_state_t) :: env_state
+      real (kind=R4KIND), allocatable :: out(:,:,:), zm(:,:)
+      character(len=512) :: fname
+      character(len=*), parameter :: var_names = 'num,num_sub,ccn_0p1,ccn_0p3,ccn_1p0,' &
+         // 'm_bc,m_dust,m_seasalt,m_pom,m_soa,m_sia,' &
+         // 'msub_bc,msub_dust,msub_seasalt,msub_pom,msub_soa,msub_sia,' &
+         // 'mh_a,mh_o,mh_h,m_water'
+
+      if (pmc_n_part <= 0 .or. pmc_diag_interval <= 0) return
+
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'state', state)
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'diag', diag)
+      call mpas_pool_get_dimension(mesh, 'nCellsSolve', nCellsSolve)
+      call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
+
+      if (.not. allocated(diag_acc)) then
+         allocate(diag_acc(N_DIAG, nVertLevels, nCellsSolve), diag_group(n_spec))
+         diag_acc = 0.0_RKIND
+         diag_group = 0
+         do i_s = 1, n_spec
+            select case (trim(aero_data%name(i_s)))
+            case ('BC')
+               diag_group(i_s) = 1
+            case ('OIN', 'Ca', 'CO3')
+               diag_group(i_s) = 2
+            case ('Na', 'Cl')
+               diag_group(i_s) = 3
+            case ('OC')
+               diag_group(i_s) = 4
+            case ('ARO1', 'ARO2', 'ALK1', 'OLE1', 'API1', 'API2', 'LIM1', 'LIM2')
+               diag_group(i_s) = 5
+            case ('SO4', 'NO3', 'NH4', 'MSA')
+               diag_group(i_s) = 6
+            end select
+         end do
+         call execute_command_line('mkdir -p ' // trim(pmc_diag_dir))
+      end if
+
+      if (mod(itimestep, pmc_diag_every) == 0) then
+         call mpas_pool_get_dimension(state, 'index_qv', index_qv)
+         call mpas_pool_get_array(state, 'scalars', scalars, 2)
+         call mpas_pool_get_array(state, 'theta_m', theta_m, 2)
+         call mpas_pool_get_array(diag, 'exner', exner)
+         do iCell = 1, nCellsSolve
+            do k = 1, nVertLevels
+               env_state%temp = theta_m(k,iCell) / (1.0_RKIND + rvord*max(0.0_RKIND, scalars(index_qv,k,iCell))) &
+                                * exner(k,iCell)
+               do j = 1, aero_state_n_part(aero_states(k,iCell))
+                  nc = aero_weight_array_num_conc(aero_states(k,iCell)%awa, aero_states(k,iCell)%apa%particle(j), &
+                                                  aero_data)
+                  mg = 0.0d0
+                  do i_s = 1, n_spec
+                     g = diag_group(i_s)
+                     if (g > 0) mg(g) = mg(g) + aero_states(k,iCell)%apa%particle(j)%vol(i_s) * aero_data%density(i_s)
+                  end do
+                  m_tot = sum(mg)
+                  d_dry = aero_particle_dry_diameter(aero_states(k,iCell)%apa%particle(j), aero_data)
+                  s_crit = aero_particle_crit_rel_humid(aero_states(k,iCell)%apa%particle(j), aero_data, env_state) &
+                           - 1.0d0
+                  diag_acc(1,k,iCell) = diag_acc(1,k,iCell) + nc
+                  if (s_crit <= 0.001d0) diag_acc(3,k,iCell) = diag_acc(3,k,iCell) + nc
+                  if (s_crit <= 0.003d0) diag_acc(4,k,iCell) = diag_acc(4,k,iCell) + nc
+                  if (s_crit <= 0.010d0) diag_acc(5,k,iCell) = diag_acc(5,k,iCell) + nc
+                  diag_acc(6:11,k,iCell) = diag_acc(6:11,k,iCell) + nc * mg
+                  diag_acc(21,k,iCell) = diag_acc(21,k,iCell) + nc &
+                     * aero_states(k,iCell)%apa%particle(j)%vol(aero_data%i_water) * aero_data%density(aero_data%i_water)
+                  if (d_dry >= 1.0d-6 .or. m_tot <= 0.0d0) cycle
+                  diag_acc(2,k,iCell) = diag_acc(2,k,iCell) + nc
+                  diag_acc(12:17,k,iCell) = diag_acc(12:17,k,iCell) + nc * mg
+                  ! per-particle mixing entropies
+                  h_a = 0.0d0
+                  do g = 1, 6
+                     p = mg(g) / m_tot
+                     if (p > 0.0d0) h_a = h_a - p * log(p)
+                  end do
+                  h_o = 0.0d0
+                  p = mg(1) / m_tot
+                  if (p > 0.0d0 .and. p < 1.0d0) h_o = -p * log(p) - (1.0d0 - p) * log(1.0d0 - p)
+                  h_h = 0.0d0
+                  m_nh = mg(1) + mg(2) + mg(4)
+                  m_hy = mg(3) + mg(5) + mg(6)
+                  p = m_nh / m_tot
+                  if (m_nh > 0.0d0 .and. m_hy > 0.0d0) h_h = -p * log(p) - (1.0d0 - p) * log(1.0d0 - p)
+                  diag_acc(18,k,iCell) = diag_acc(18,k,iCell) + nc * m_tot * h_a
+                  diag_acc(19,k,iCell) = diag_acc(19,k,iCell) + nc * m_tot * h_o
+                  diag_acc(20,k,iCell) = diag_acc(20,k,iCell) + nc * m_tot * h_h
+               end do
+            end do
+         end do
+         n_diag_samples = n_diag_samples + 1
+      end if
+
+      if (mod(itimestep, pmc_diag_interval) /= 0 .or. n_diag_samples == 0) return
+
+      call mpas_pool_get_array(mesh, 'latCell', latCell)
+      call mpas_pool_get_array(mesh, 'lonCell', lonCell)
+      call mpas_pool_get_array(mesh, 'zgrid', zgrid)
+      call mpas_pool_get_array(mesh, 'indexToCellID', indexToCellID)
+      allocate(out(N_DIAG, nVertLevels, nCellsSolve), zm(nVertLevels, nCellsSolve))
+      out = real(diag_acc / real(n_diag_samples, kind=RKIND), kind=R4KIND)
+      do iCell = 1, nCellsSolve
+         do k = 1, nVertLevels
+            zm(k,iCell) = real(0.5_RKIND * (zgrid(k,iCell) + zgrid(k+1,iCell)), kind=R4KIND)
+         end do
+      end do
+      write(fname, '(a,"/diag_s",i8.8,"_r",i5.5,".nc")') trim(pmc_diag_dir), itimestep, domain % dminfo % my_proc_id
+      call nc_check(nf90_create(trim(fname), NF90_NETCDF4, ncid), 'create ' // trim(fname))
+      call nc_check(nf90_def_dim(ncid, 'cell', nCellsSolve, d_cell), 'dim cell')
+      call nc_check(nf90_def_dim(ncid, 'level', nVertLevels, d_lev), 'dim level')
+      call nc_check(nf90_def_dim(ncid, 'variable', N_DIAG, d_var), 'dim variable')
+      call nc_check(nf90_put_att(ncid, NF90_GLOBAL, 'variables', var_names), 'att')
+      call nc_check(nf90_put_att(ncid, NF90_GLOBAL, 'units', 'number m-3; mass kg m-3; mh_* kg m-3 (mass times entropy)'), 'att')
+      call nc_check(nf90_put_att(ncid, NF90_GLOBAL, 'itimestep', itimestep), 'att')
+      call nc_check(nf90_put_att(ncid, NF90_GLOBAL, 'samples', n_diag_samples), 'att')
+      call nc_check(nf90_put_att(ncid, NF90_GLOBAL, 'steps_averaged', pmc_diag_interval), 'att')
+      call nc_check(nf90_def_var(ncid, 'cell_id', NF90_INT, (/d_cell/), varid), 'def cell_id')
+      call nc_check(nf90_put_var(ncid, varid, indexToCellID(1:nCellsSolve)), 'put cell_id')
+      call nc_check(nf90_def_var(ncid, 'lat', NF90_DOUBLE, (/d_cell/), varid), 'def lat')
+      call nc_check(nf90_put_var(ncid, varid, latCell(1:nCellsSolve)), 'put lat')
+      call nc_check(nf90_def_var(ncid, 'lon', NF90_DOUBLE, (/d_cell/), varid), 'def lon')
+      call nc_check(nf90_put_var(ncid, varid, lonCell(1:nCellsSolve)), 'put lon')
+      call nc_check(nf90_def_var(ncid, 'height', NF90_FLOAT, (/d_lev, d_cell/), varid), 'def height')
+      call nc_check(nf90_put_var(ncid, varid, zm), 'put height')
+      call nc_check(nf90_def_var(ncid, 'mean', NF90_FLOAT, (/d_var, d_lev, d_cell/), varid, deflate_level=1), 'def mean')
+      call nc_check(nf90_put_var(ncid, varid, out), 'put mean')
+      call nc_check(nf90_close(ncid), 'close')
+      if (domain % dminfo % my_proc_id == 0) then
+         call mpas_log_write('PartMC diag step $i: time-mean aerosol fields written, $i samples', &
+                             intArgs=(/itimestep, n_diag_samples/))
+      end if
+      diag_acc = 0.0_RKIND
+      n_diag_samples = 0
+#endif
+
+   end subroutine atm_partmc_diag
 
 
    !> Write the particles of a sample of cells, one NetCDF file per MPI task.

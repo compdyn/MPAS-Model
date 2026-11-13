@@ -33,6 +33,16 @@
 !                     up to this value (as a fraction, 0.002 = 0.2%) are removed (default: all).
 !                     PMC_GAS_WET: file of the fraction of each gas that is in cloud water
 !                     (species name, 0 to 1); needs PMC_MOSAIC=1.
+!   PMC_EMIS_FILE     NetCDF file of emissions for every cell of the mesh (dimension nCells in
+!                     global cell order): gas_<NAME> (mol m^-2 s^-1) for any gas species, bc and
+!                     oc (kg m^-2 s^-1). The gases need PMC_MOSAIC=1; BC and OC are emitted as
+!                     one carbonaceous mode (PMC_CARB_DG, default 6e-8 m, geometric standard
+!                     deviation 1.8) with the cell's BC/OC ratio. PMC_EMIS_SCALE multiplies all.
+!   PMC_SEASALT       1 = sea salt particles emitted over open water from the 10-m wind speed
+!                     with the flux of Gong (2003), dry diameters 0.07-10 um; PMC_SEASALT_SCALE
+!                     multiplies it
+!   PMC_Q_BACKGROUND, PMC_Q_BLOB  initial number mixing ratio (per kg) of the background particles
+!                     and of the blob (defaults 1e8 and 1e9)
 !   PMC_EMIT_FLUX     number flux (m^-2 s^-1) of soot-like particles emitted over land (default 0)
 !   PMC_EMIT_LEVELS   number of lowest layers the emission is spread over, uniformly in mixing
 !                     ratio (default 1)
@@ -318,6 +328,21 @@ module mpas_atm_partmc
    !> be removed (probability times number), number removed, and number-weighted sums of the
    !> deposition velocity and of one, for the mean velocity.
    logical :: pmc_drydep_scheme = .false.
+   !> Emissions per cell from an inventory file: file, scale, the carbonaceous mode, fluxes of
+   !> the owned cells (BC and OC in kg m^-2 s^-1, gases in mol m^-2 s^-1).
+   character(len=256) :: emis_file = ''
+   real (kind=RKIND) :: emis_scale = 1.0_RKIND, carb_dg = 6.0e-8_RKIND, carb_sigma = 1.8_RKIND
+   real (kind=RKIND), allocatable :: emis_bc(:), emis_oc(:), emis_gas(:,:)
+   logical :: emis_part_read = .false.
+   !> Sea salt: switch, scale, and the size distribution of the flux at 1 m/s: bin edges of
+   !> the dry diameter (m), cumulative share of the number, number flux (m^-2 s^-1).
+   logical :: pmc_seasalt = .false.
+   real (kind=RKIND) :: seasalt_scale = 1.0_RKIND, ss_unit = 0.0_RKIND
+   integer, parameter :: N_SS = 80
+   real (kind=RKIND) :: ss_edge(N_SS+1), ss_cum(N_SS)
+   !> Sums by this task so far: carbonaceous number (reference, particles) and mass (inventory,
+   !> particles, kg); sea salt number (expected, particles) and mass (particles, kg).
+   real (kind=RKIND) :: emis_sums(7) = 0.0_RKIND
    real (kind=RKIND) :: drydep_sums(4) = 0.0_RKIND
    !> Number of lowest layers that receive the emission.
    integer :: pmc_emit_levels = 1
@@ -491,6 +516,20 @@ contains
       if (stat == 0) read(envval, *) gas_emit_scale
       call get_environment_variable('PMC_GAS_DRYDEP', envval, status=stat)
       if (stat == 0) gas_drydep_file = envval
+      call get_environment_variable('PMC_EMIS_FILE', envval, status=stat)
+      if (stat == 0) emis_file = envval
+      call get_environment_variable('PMC_EMIS_SCALE', envval, status=stat)
+      if (stat == 0) read(envval, *) emis_scale
+      call get_environment_variable('PMC_CARB_DG', envval, status=stat)
+      if (stat == 0) read(envval, *) carb_dg
+      call get_environment_variable('PMC_SEASALT', envval, status=stat)
+      if (stat == 0) pmc_seasalt = (trim(envval) /= '0')
+      call get_environment_variable('PMC_SEASALT_SCALE', envval, status=stat)
+      if (stat == 0) read(envval, *) seasalt_scale
+      call get_environment_variable('PMC_Q_BACKGROUND', envval, status=stat)
+      if (stat == 0) read(envval, *) q_background
+      call get_environment_variable('PMC_Q_BLOB', envval, status=stat)
+      if (stat == 0) read(envval, *) q_blob
       call get_environment_variable('PMC_EMIT_FLUX', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_emit_flux
       call get_environment_variable('PMC_EMIT_LEVELS', envval, status=stat)
@@ -1018,6 +1057,8 @@ contains
       call fractal_set_spherical(aero_data%fractal)
       i_src = aero_data_source_by_name(aero_data, pad_name('background'))
       i_src = aero_data_source_by_name(aero_data, pad_name('blob'))
+      i_src = aero_data_source_by_name(aero_data, pad_name('carbon'))
+      i_src = aero_data_source_by_name(aero_data, pad_name('seasalt'))
       if (n_class == 1) then
          i_src = aero_data_weight_class_by_name(aero_data, 'all')
       else
@@ -3084,6 +3125,45 @@ contains
    end subroutine atm_partmc_convection
 
 
+   !> Read one variable of the emissions file (a value for every cell of the mesh, in global
+   !> cell order) for the owned cells. found is false if the file has no such variable.
+   subroutine emis_read(domain, name, vals, found)
+
+      type (domain_type), intent(inout) :: domain
+      character(len=*), intent(in) :: name
+      real (kind=RKIND), intent(out) :: vals(:)
+      logical, intent(out) :: found
+
+#ifdef MPAS_PARTMC
+      type (mpas_pool_type), pointer :: mesh
+      integer, dimension(:), pointer :: indexToCellID
+      integer :: ncid, varid, dimids(1), n_glob, iCell
+      real (kind=RKIND), allocatable :: glob(:)
+
+      found = .false.
+      vals = 0.0_RKIND
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
+      call mpas_pool_get_array(mesh, 'indexToCellID', indexToCellID)
+      call nc_check(nf90_open(trim(emis_file), NF90_NOWRITE, ncid), 'open ' // trim(emis_file))
+      if (nf90_inq_varid(ncid, name, varid) == NF90_NOERR) then
+         call nc_check(nf90_inquire_variable(ncid, varid, dimids=dimids), 'inquire ' // name)
+         call nc_check(nf90_inquire_dimension(ncid, dimids(1), len=n_glob), 'dimension of ' // name)
+         allocate(glob(n_glob))
+         call nc_check(nf90_get_var(ncid, varid, glob), 'read ' // name)
+         do iCell = 1, size(vals)
+            vals(iCell) = glob(indexToCellID(iCell))
+         end do
+         found = .true.
+      end if
+      call nc_check(nf90_close(ncid), 'close ' // trim(emis_file))
+#else
+      found = .false.
+      vals = 0.0_RKIND
+#endif
+
+   end subroutine emis_read
+
+
    !> Surface emission and dry deposition in the lowest layer, for the Eulerian number scalars
    !> and, in Lagrangian mode, the particles.
    !>
@@ -3126,7 +3206,14 @@ contains
       real (kind=dp), parameter :: test_diam(6) = (/ 1.0d-8, 3.0d-8, 1.0d-7, 3.0d-7, 1.0d-6, 1.0d-5 /)
       real (kind=RKIND) :: test_v(6)
 
-      if (pmc_emit_flux <= 0.0_RKIND .and. pmc_drydep_v <= 0.0_RKIND .and. .not. pmc_drydep_scheme) return
+      real (kind=RKIND), dimension(:), pointer :: u10, v10, xland
+      type (mpas_pool_type), pointer :: diag_phys2
+      real (kind=RKIND) :: f_bc, rho_mix, m_mean, n_flux, wind, r80, dfdr, esum(7), g_esum(7)
+      logical :: found
+      integer :: ib, i_na, i_cl
+
+      if (pmc_emit_flux <= 0.0_RKIND .and. pmc_drydep_v <= 0.0_RKIND .and. .not. pmc_drydep_scheme &
+          .and. len_trim(emis_file) == 0 .and. .not. pmc_seasalt) return
 
       call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
       call mpas_pool_get_subpool(domain % blocklist % structs, 'state', state)
@@ -3180,7 +3267,50 @@ contains
       end if
       i_oc = aero_data_spec_by_name(aero_data, 'OC')
       i_bc = aero_data_spec_by_name(aero_data, 'BC')
+      i_na = aero_data_spec_by_name(aero_data, 'Na')
+      i_cl = aero_data_spec_by_name(aero_data, 'Cl')
       allocate(vols(n_spec))
+
+      if (len_trim(emis_file) > 0 .and. .not. emis_part_read) then
+         emis_part_read = .true.
+         allocate(emis_bc(nCellsSolve), emis_oc(nCellsSolve))
+         call emis_read(domain, 'bc', emis_bc, found)
+         call emis_read(domain, 'oc', emis_oc, found)
+         emis_bc = max(0.0_RKIND, emis_bc) * emis_scale
+         emis_oc = max(0.0_RKIND, emis_oc) * emis_scale
+         call mpas_log_write('PartMC: BC and OC emissions from ' // trim(emis_file) // ' times $r, one mode with ' &
+                             // 'geometric mean diameter $r m', realArgs=(/emis_scale, carb_dg/))
+      end if
+      if (pmc_seasalt) then
+         call mpas_pool_get_subpool(domain % blocklist % structs, 'diag_physics', diag_phys2)
+         nullify(u10)
+         call mpas_pool_get_array(diag_phys2, 'u10', u10)
+         call mpas_pool_get_array(diag_phys2, 'v10', v10)
+         nullify(xland)
+         call mpas_pool_get_array(sfc_input, 'xland', xland)
+         if (.not. associated(u10) .or. .not. associated(xland)) then
+            call mpas_log_write('PartMC: PMC_SEASALT needs u10, v10 and xland', messageType=MPAS_LOG_CRIT)
+         end if
+         if (ss_unit <= 0.0_RKIND) then
+            ! Gong (2003) flux dF/dr (m^-2 s^-1 um^-1) at 1 m/s against the radius at 80% humidity
+            ! r (um), which is about the dry diameter; N_SS bins equal in log r from 0.07 to 10 um
+            do ib = 1, N_SS + 1
+               ss_edge(ib) = 0.07e-6_RKIND * (10.0_RKIND / 0.07_RKIND)**(real(ib - 1, kind=RKIND) / real(N_SS, kind=RKIND))
+            end do
+            do ib = 1, N_SS
+               r80 = sqrt(ss_edge(ib) * ss_edge(ib+1)) * 1.0e6_RKIND
+               dfdr = 1.373_RKIND * r80**(-4.7_RKIND * (1.0_RKIND + 30.0_RKIND*r80)**(-0.017_RKIND * r80**(-1.44_RKIND))) &
+                      * (1.0_RKIND + 0.057_RKIND * r80**3.45_RKIND) &
+                      * 10.0_RKIND**(1.607_RKIND * exp(-((0.433_RKIND - log10(r80)) / 0.433_RKIND)**2))
+               ss_cum(ib) = dfdr * (ss_edge(ib+1) - ss_edge(ib)) * 1.0e6_RKIND
+               if (ib > 1) ss_cum(ib) = ss_cum(ib) + ss_cum(ib-1)
+            end do
+            ss_unit = ss_cum(N_SS)
+            ss_cum = ss_cum / ss_unit
+            call mpas_log_write('PartMC: sea salt number flux at 10 m/s = $r m^-2 s^-1, times $r', &
+                                realArgs=(/ss_unit * 10.0_RKIND**3.41_RKIND, seasalt_scale/))
+         end if
+      end if
 
       do iCell = 1, nCellsSolve
          dz = 1.0_RKIND / (rdzw(1) * zz(1,iCell))
@@ -3277,6 +3407,31 @@ contains
             end if
          end if
 
+         ! carbonaceous particles from the inventory
+         if (allocated(emis_bc)) then
+            if (emis_bc(iCell) + emis_oc(iCell) > 0.0_RKIND) then
+               f_bc = emis_bc(iCell) / (emis_bc(iCell) + emis_oc(iCell))
+               rho_mix = 1.0_RKIND / (f_bc / aero_data%density(i_bc) + (1.0_RKIND - f_bc) / aero_data%density(i_oc))
+               m_mean = rho_mix * pii / 6.0_RKIND * carb_dg**3 * exp(4.5_RKIND * log(carb_sigma)**2)
+               n_flux = (emis_bc(iCell) + emis_oc(iCell)) / m_mean
+               emis_sums(3) = emis_sums(3) + (emis_bc(iCell) + emis_oc(iCell)) * config_dt * areaCell(iCell)
+               m_emit = 0.0_RKIND
+               do k = 1, pmc_emit_levels
+                  m_emit = m_emit + rho_zz(k,iCell) / rdzw(k)
+               end do
+               do k = 1, pmc_emit_levels
+                  call emit_kind(3, k, n_flux * config_dt * (rho_zz(k,iCell) / rdzw(k)) / m_emit)
+               end do
+            end if
+         end if
+         ! sea salt over open water
+         if (pmc_seasalt) then
+            if (nint(xland(iCell)) == 2) then
+               wind = sqrt(u10(iCell)**2 + v10(iCell)**2)
+               call emit_kind(4, 1, seasalt_scale * ss_unit * wind**3.41_RKIND * config_dt)
+            end if
+         end if
+
          if (pmc_n_part > 0 .and. pmc_mode == MODE_LAGR .and. lagr_control) then
             call lagr_rebalance(1, iCell, nCells, nEdgesOnCell, cellsOnCell)
          end if
@@ -3285,6 +3440,13 @@ contains
       call mpas_pool_get_field(state, 'scalars', scalars_field, 2)
       call mpas_dmpar_exch_halo_field(scalars_field)
 
+      if (mod(itimestep, 12) == 0 .and. (allocated(emis_bc) .or. pmc_seasalt)) then
+         esum = emis_sums
+         call mpas_dmpar_sum_real_array(domain % dminfo, 7, esum, g_esum)
+         call mpas_log_write('PartMC emission step $i: carbonaceous number so far: reference = $r, particles = $r; ' &
+                             // 'mass (kg): inventory = $r, particles = $r; sea salt number: expected = $r, ' &
+                             // 'particles = $r, mass (kg) = $r', intArgs=(/itimestep/), realArgs=g_esum)
+      end if
       if (mod(itimestep, 12) == 0) then
          sums = surf_sums
          call mpas_dmpar_sum_real_array(domain % dminfo, 4, sums, g_sums)
@@ -3300,6 +3462,76 @@ contains
                                 realArgs=(/g_dsum(1), g_dsum(2), g_dsum(3)/max(g_dsum(4), 1.0e-30_RKIND)/))
          end if
       end if
+
+   contains
+
+      !> Emit n_area real particles per m^2 of source i_kind (3 carbonaceous, 4 sea salt) into
+      !> layer kk of the current cell: the reference scalar gets the number, and computational
+      !> particles are made at the weight level that suits the cell, their number rounded at
+      !> random.
+      subroutine emit_kind(i_kind, kk, n_area)
+         integer, intent(in) :: i_kind, kk
+         real (kind=RKIND), intent(in) :: n_area
+         real (kind=RKIND) :: m_kk, n_have, w_new, f_new, u
+         integer :: g_new, n_new, i_new, jp, ibin
+         real (kind=dp) :: d_new, v_new, m_new
+
+         if (n_area <= 0.0_RKIND) return
+         m_kk = rho_zz(kk,iCell) / rdzw(kk)
+         scalars(index_ref,kk,iCell) = scalars(index_ref,kk,iCell) + n_area / m_kk
+         if (i_kind == 3) emis_sums(1) = emis_sums(1) + n_area * areaCell(iCell)
+         if (i_kind == 4) emis_sums(5) = emis_sums(5) + n_area * areaCell(iCell)
+         if (pmc_n_part <= 0 .or. pmc_mode /= MODE_LAGR) return
+         ! number of real particles the cell holds, from its particles if it has any
+         n_have = 0.0_RKIND
+         do jp = 1, pos(kk,iCell) % n
+            n_have = n_have + lagr_w * 2.0_RKIND**(aero_states(kk,iCell)%apa%particle(jp)%weight_class - LAGR_G0)
+         end do
+         n_have = max(n_have, n_area * areaCell(iCell))
+         g_new = LAGR_G0 + nint(log(n_have / (real(pmc_n_part, kind=RKIND) * lagr_w)) / log(2.0_RKIND))
+         g_new = max(1, min(LAGR_GROUPS, g_new))
+         w_new = lagr_w * 2.0_RKIND**(g_new - LAGR_G0)
+         f_new = n_area * areaCell(iCell) / w_new
+         n_new = int(f_new)
+         if (pmc_random() < f_new - real(n_new, kind=RKIND)) n_new = n_new + 1
+         do i_new = 1, n_new
+            call aero_particle_zero(particle, aero_data)
+            vols = 0.0d0
+            if (i_kind == 3) then
+               d_new = carb_dg * exp(log(carb_sigma) * rand_normal(0.0d0, 1.0d0))
+               v_new = pii / 6.0d0 * d_new**3
+               ! volumes from the mass fraction of BC
+               vols(i_bc) = v_new * (f_bc / aero_data%density(i_bc)) * rho_mix
+               vols(i_oc) = v_new - vols(i_bc)
+               m_new = v_new * rho_mix
+               emis_sums(2) = emis_sums(2) + w_new
+               emis_sums(4) = emis_sums(4) + w_new * m_new
+            else
+               u = pmc_random()
+               do ibin = 1, N_SS - 1
+                  if (u <= ss_cum(ibin)) exit
+               end do
+               d_new = ss_edge(ibin) * (ss_edge(ibin+1) / ss_edge(ibin))**pmc_random()
+               v_new = pii / 6.0d0 * d_new**3
+               ! NaCl by mass: 39.34% Na, 60.66% Cl
+               m_new = v_new / (0.3934d0 / aero_data%density(i_na) + 0.6066d0 / aero_data%density(i_cl))
+               vols(i_na) = 0.3934d0 * m_new / aero_data%density(i_na)
+               vols(i_cl) = 0.6066d0 * m_new / aero_data%density(i_cl)
+               emis_sums(6) = emis_sums(6) + w_new
+               emis_sums(7) = emis_sums(7) + w_new * m_new
+            end if
+            call aero_particle_set_component(particle, i_kind, 0.0d0)
+            particle%n_primary_parts = 1
+            call aero_particle_set_vols(particle, vols)
+            call aero_particle_new_id(particle)
+            call aero_particle_set_weight(particle, 1, g_new)
+            call aero_state_add_particle(aero_states(kk,iCell), particle, aero_data)
+            call random_in_cell(iCell, kk, nCells, nEdgesOnCell, cellsOnCell, x(1:4))
+            x(5:7) = x(1:3)
+            call pos_append(pos(kk,iCell), x)
+         end do
+         if (lagr_control .and. kk > 1) call lagr_rebalance(kk, iCell, nCells, nEdgesOnCell, cellsOnCell)
+      end subroutine emit_kind
 #endif
 
    end subroutine atm_partmc_surface
@@ -3435,11 +3667,14 @@ contains
       real (kind=dp), allocatable, save :: gas_emit_time(:), gas_emit_rate(:)
       real (kind=dp) :: rate
       logical, save :: gas_surface_read = .false.
+      real (kind=RKIND), allocatable :: cell_vals(:)
+      integer :: n_found
+      logical :: found
       real (kind=RKIND), allocatable :: g_wet(:)
       integer :: j_w
 
       if (.not. pmc_chem .or. pmc_n_part <= 0) return
-      if (len_trim(gas_emit_file) == 0 .and. len_trim(gas_drydep_file) == 0 &
+      if (len_trim(gas_emit_file) == 0 .and. len_trim(gas_drydep_file) == 0 .and. len_trim(emis_file) == 0 &
           .and. .not. (pmc_wet .and. len_trim(gas_wet_file) > 0)) return
 
       call gas_setup(domain)
@@ -3463,6 +3698,20 @@ contains
       call gas_budget_setup(domain)
       if (.not. gas_surface_read) then
          gas_surface_read = .true.
+         if (len_trim(emis_file) > 0) then
+            allocate(emis_gas(n_gas, nCellsSolve), cell_vals(nCellsSolve))
+            emis_gas = 0.0_RKIND
+            n_found = 0
+            do j = 1, n_gas
+               call emis_read(domain, 'gas_' // trim(gas_data%name(j)), cell_vals, found)
+               if (found) then
+                  emis_gas(j,:) = max(0.0_RKIND, cell_vals) * emis_scale
+                  n_found = n_found + 1
+               end if
+            end do
+            call mpas_log_write('PartMC: gas emissions for $i species from ' // trim(emis_file) // ' times $r', &
+                                intArgs=(/n_found/), realArgs=(/emis_scale/))
+         end if
          if (len_trim(gas_emit_file) > 0) then
             call spec_file_open(trim(gas_emit_file), file)
             call spec_file_read_gas_states_times_rates(file, gas_data, gas_emit_time, gas_emit_rate, gas_emit_states)
@@ -3508,6 +3757,18 @@ contains
                end do
                gas_emitted = gas_emitted + amount * areaCell(iCell)
             end if
+         end if
+         if (allocated(emis_gas)) then
+            ! the inventory's flux of this cell, mol per area this step
+            air_emit = 0.0_RKIND
+            do k = 1, pmc_emit_levels
+               air_emit = air_emit + rho_zz(k,iCell) / rdzw(k) / 0.028966_RKIND
+            end do
+            amount = emis_gas(:,iCell) * config_dt
+            do k = 1, pmc_emit_levels
+               scalars(gas_idx,k,iCell) = scalars(gas_idx,k,iCell) + amount / air_emit * 1.0e9_RKIND
+            end do
+            gas_emitted = gas_emitted + amount * areaCell(iCell)
          end if
       end do
 

@@ -385,6 +385,12 @@ module mpas_atm_partmc
    real (kind=RKIND) :: kind_mass(N_KIND) = 0.0_RKIND, gas_nat(3) = 0.0_RKIND
    real (kind=RKIND), allocatable :: gas_bb(:,:,:), dms_w(:,:), isop_ef(:), mterp_ef(:)
    real (kind=RKIND) :: bio_scale = 1.0_RKIND, dms_scale = 1.0_RKIND
+   !> Budget by species group (BC, POM, SO4, NO3, NH4, SOA, sea salt, dust, MSA): particle mass
+   !> (kg) removed by this task since the start of the run by dry deposition, grid-scale and
+   !> convective wet removal; the group of each aerosol species (0 = none, e.g. water).
+   integer, parameter :: N_GRP = 9
+   real (kind=RKIND) :: rem_mass(N_GRP,3) = 0.0_RKIND
+   integer, allocatable :: grp_of(:)
    !> Sea salt: switch, scale, and the size distribution of the flux at 1 m/s: bin edges of
    !> the dry diameter (m), cumulative share of the number, number flux (m^-2 s^-1).
    logical :: pmc_seasalt = .false.
@@ -2758,7 +2764,7 @@ contains
                conv_wet(3) = conv_wet(3) + p_rem(k) * w
                if (pmc_random() < p_rem(k)) then
                   conv_wet(2) = conv_wet(2) + w
-                  part_s_removed = part_s_removed + particle_sulfate(aero_states(k,iCell)%apa%particle(j)) * w
+                  call note_removal(aero_states(k,iCell)%apa%particle(j), w, 3)
                   call aero_state_remove_particle_no_info(aero_states(k,iCell), j)
                   call pos_remove(pos(k,iCell), j)
                   cycle
@@ -3474,7 +3480,7 @@ contains
                drydep_sums(4) = drydep_sums(4) + w
                if (pmc_random() >= p_dep) cycle
                drydep_sums(2) = drydep_sums(2) + w
-               part_s_removed = part_s_removed + particle_sulfate(aero_states(1,iCell)%apa%particle(j)) * w
+               call note_removal(aero_states(1,iCell)%apa%particle(j), w, 1)
                call aero_state_remove_particle_no_info(aero_states(1,iCell), j)
                call pos_remove(pos(1,iCell), j)
             end do
@@ -3489,8 +3495,7 @@ contains
                   if (pmc_random() >= p_dep) cycle
                   g = aero_states(1,iCell)%apa%particle(j)%weight_class
                   surf_sums(4) = surf_sums(4) + lagr_w * 2.0_RKIND**(g - LAGR_G0)
-                  part_s_removed = part_s_removed + particle_sulfate(aero_states(1,iCell)%apa%particle(j)) &
-                                                    * lagr_w * 2.0_RKIND**(g - LAGR_G0)
+                  call note_removal(aero_states(1,iCell)%apa%particle(j), lagr_w * 2.0_RKIND**(g - LAGR_G0), 1)
                   call aero_state_remove_particle_no_info(aero_states(1,iCell), j)
                   call pos_remove(pos(1,iCell), j)
                end do
@@ -4286,6 +4291,53 @@ contains
    end subroutine model_date
 
 
+   !> Mass (kg) of each species group in one real particle.
+   subroutine group_masses(particle, m)
+      type(aero_particle_t), intent(in) :: particle
+      real (kind=RKIND), intent(out) :: m(N_GRP)
+      integer :: i, g
+      character(len=8) :: nm
+
+      if (.not. allocated(grp_of)) then
+         allocate(grp_of(aero_data_n_spec(aero_data)))
+         do i = 1, aero_data_n_spec(aero_data)
+            nm = aero_data%name(i)
+            select case (trim(nm))
+            case ('BC'); g = 1
+            case ('OC'); g = 2
+            case ('SO4'); g = 3
+            case ('NO3'); g = 4
+            case ('NH4'); g = 5
+            case ('ARO1', 'ARO2', 'ALK1', 'OLE1', 'API1', 'API2', 'LIM1', 'LIM2'); g = 6
+            case ('Na', 'Cl'); g = 7
+            case ('OIN', 'Ca', 'CO3'); g = 8
+            case ('MSA'); g = 9
+            case default; g = 0
+            end select
+            grp_of(i) = g
+         end do
+      end if
+      m = 0.0_RKIND
+      do i = 1, size(grp_of)
+         if (grp_of(i) > 0) m(grp_of(i)) = m(grp_of(i)) + particle%vol(i) * aero_data%density(i)
+      end do
+   end subroutine group_masses
+
+
+   !> Book the removal of a computational particle standing for w real particles by process
+   !> proc (1 dry deposition, 2 grid-scale wet, 3 convective wet).
+   subroutine note_removal(particle, w, proc)
+      type(aero_particle_t), intent(in) :: particle
+      real (kind=RKIND), intent(in) :: w
+      integer, intent(in) :: proc
+      real (kind=RKIND) :: m(N_GRP)
+
+      part_s_removed = part_s_removed + particle_sulfate(particle) * w
+      call group_masses(particle, m)
+      rem_mass(:,proc) = rem_mass(:,proc) + m * w
+   end subroutine note_removal
+
+
    !> Sulfate (mol) in one real particle represented by a computational particle.
    function particle_sulfate(particle)
       type(aero_particle_t), intent(in) :: particle
@@ -4569,7 +4621,7 @@ contains
                g = aero_states(k,iCell)%apa%particle(j)%weight_class
                w = lagr_w * 2.0_RKIND**(g - LAGR_G0)
                wet_sums(2) = wet_sums(2) + w
-               part_s_removed = part_s_removed + particle_sulfate(aero_states(k,iCell)%apa%particle(j)) * w
+               call note_removal(aero_states(k,iCell)%apa%particle(j), w, 2)
                call aero_state_remove_particle_no_info(aero_states(k,iCell), j)
                call pos_remove(pos(k,iCell), j)
                removed = .true.
@@ -4669,6 +4721,7 @@ contains
       integer, pointer :: index_qc
       integer :: i_h2o2, i_o3
       real (kind=RKIND) :: qc, f_c, l_c, rho_d, d_h, d_o, d_ppb, aq_g(2)
+      real (kind=RKIND) :: burden(N_GRP), g_burden(N_GRP), m_grp(N_GRP), rem(3*N_GRP), g_rem(3*N_GRP)
 
       if (.not. pmc_chem .or. pmc_n_part <= 0) return
 
@@ -4719,6 +4772,7 @@ contains
 
       n_cells = 0
       sums = 0.0_RKIND
+      burden = 0.0_RKIND
       test_sums = 0.0_RKIND
       n_test = 0
       allocate(gas_a(n_gas), gas_pre(n_gas))
@@ -4866,6 +4920,9 @@ contains
                                       * aero_data%density(aero_data%i_water) &
                                       * aero_weight_array_num_conc(aero_states(k,iCell)%awa, &
                                            aero_states(k,iCell)%apa%particle(j), aero_data) * vol
+                  call group_masses(aero_states(k,iCell)%apa%particle(j), m_grp)
+                  burden = burden + m_grp * aero_weight_array_num_conc(aero_states(k,iCell)%awa, &
+                                           aero_states(k,iCell)%apa%particle(j), aero_data) * vol
                end do
             end if
          end do
@@ -4908,6 +4965,19 @@ contains
                              // 'total less this = $r', intArgs=(/itimestep/), &
                              realArgs=(/ch4_min, ch4_min/chem_s0, &
                                         (g_sums(1) + g_sums(2) - g_sums(4) - ch4_min)/chem_s0 - 1.0_RKIND/))
+         call mpas_dmpar_sum_real_array(domain % dminfo, N_GRP, burden, g_burden)
+         rem = reshape(rem_mass, (/ 3*N_GRP /))
+         call mpas_dmpar_sum_real_array(domain % dminfo, 3*N_GRP, rem, g_rem)
+         call mpas_log_write('PartMC budget step $i: burden (kg) BC $r POM $r SO4 $r NO3 $r NH4 $r SOA $r ' &
+                             // 'sea salt $r dust $r MSA $r', intArgs=(/itimestep/), realArgs=g_burden)
+         call mpas_log_write('PartMC budget step $i: dry deposition since start (kg) BC $r POM $r SO4 $r NO3 $r ' &
+                             // 'NH4 $r SOA $r sea salt $r dust $r MSA $r', intArgs=(/itimestep/), realArgs=g_rem(1:N_GRP))
+         call mpas_log_write('PartMC budget step $i: grid-scale wet removal since start (kg) BC $r POM $r SO4 $r ' &
+                             // 'NO3 $r NH4 $r SOA $r sea salt $r dust $r MSA $r', intArgs=(/itimestep/), &
+                             realArgs=g_rem(N_GRP+1:2*N_GRP))
+         call mpas_log_write('PartMC budget step $i: convective wet removal since start (kg) BC $r POM $r SO4 $r ' &
+                             // 'NO3 $r NH4 $r SOA $r sea salt $r dust $r MSA $r', intArgs=(/itimestep/), &
+                             realArgs=g_rem(2*N_GRP+1:3*N_GRP))
          if (pmc_aq) then
             call mpas_dmpar_sum_real_array(domain % dminfo, 2, aq_s, aq_g)
             call mpas_log_write('PartMC chemistry step $i: in-cloud sulfate made since the start of this run (mol): ' &

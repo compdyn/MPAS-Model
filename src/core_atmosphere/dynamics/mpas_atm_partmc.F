@@ -39,6 +39,9 @@
 !   PMC_DRYDEP_V      dry deposition velocity (m/s) applied to the lowest layer (default 0)
 !   PMC_CONV          1 = convective transport of tracers and particles with the cu_ntiedtke
 !                     scheme's mass fluxes (default 0)
+!   PMC_CONV_CHECK    1 = with PMC_CONV, compare the change of moist static energy that the column
+!                     transfer matrix gives with the convection scheme's own (its temperature
+!                     and vapour tendencies), as a check of the matrix; diagnostic only
 !   PMC_KZ_PHYS       1 = vertical mixing with the boundary-layer scheme's heat diffusivity
 !                     (kzh) in place of the prescribed profile (default 0)
 !   PMC_LAGR_SUBSTEPS lagrangian mode: trajectory sub-steps per model step (default 1)
@@ -258,6 +261,11 @@ module mpas_atm_partmc
    !> the surface, water condensed in the updraft, and the part of it counted as precipitation
    !> (kg).
    logical :: pmc_wet_conv = .true.
+   !> Check of the convective matrix against the scheme's moist static energy tendency: switch,
+   !> and mass-weighted sums of matrix*scheme, scheme^2, matrix^2 for layers below and above
+   !> 5 km, by this task so far.
+   logical :: pmc_conv_check = .false.
+   real (kind=RKIND) :: conv_chk(3,2) = 0.0_RKIND
    real (kind=RKIND) :: conv_wet(6) = 0.0_RKIND
    !> Fraction of each gas species that is in cloud water (from the PMC_GAS_WET file).
    real (kind=RKIND), allocatable :: gas_wet_frac(:)
@@ -434,6 +442,8 @@ contains
       call get_environment_variable('PMC_WET', envval, status=stat)
       if (stat == 0) pmc_wet = (trim(envval) /= '0')
       if (stat == 0) pmc_wet_diag_only = (trim(envval) == '2')
+      call get_environment_variable('PMC_CONV_CHECK', envval, status=stat)
+      if (stat == 0) pmc_conv_check = (trim(envval) /= '0')
       call get_environment_variable('PMC_WET_CONV', envval, status=stat)
       if (stat == 0) pmc_wet_conv = (trim(envval) /= '0')
       call get_environment_variable('PMC_WET_SCRIT', envval, status=stat)
@@ -2479,6 +2489,11 @@ contains
       integer, allocatable :: gas_of(:)
       real (kind=RKIND) :: w_cond, pe, es, pres, lost, e_gas, sums(6), g_sums(6)
       logical :: scav
+      type (mpas_pool_type), pointer :: tend_physics
+      real (kind=RKIND), dimension(:,:), pointer :: rthcuten, rqvcuten, zgrid
+      real (kind=RKIND), allocatable :: hm(:), dh_m(:), dh_s(:)
+      real (kind=RKIND) :: csum(6), g_csum(6), z_mid
+      integer :: ib
       integer, allocatable :: idx(:)
       real (kind=RKIND), allocatable :: m(:), mu_top(:), mu_bot(:), dn_top(:), dn_bot(:), e_u(:), d_u(:), &
                                         e_d(:), d_d(:), f_u(:), f_d(:), s_top(:), out(:), tsub(:,:), tmat(:,:), &
@@ -2524,6 +2539,17 @@ contains
       call mpas_pool_get_array(diag, 'pressure_base', pressure_base)
       nullify(raincv)
       call mpas_pool_get_array(diag_physics, 'raincv', raincv)
+      if (pmc_conv_check) then
+         call mpas_pool_get_subpool(domain % blocklist % structs, 'tend_physics', tend_physics)
+         nullify(rthcuten)
+         call mpas_pool_get_array(tend_physics, 'rthcuten', rthcuten)
+         call mpas_pool_get_array(tend_physics, 'rqvcuten', rqvcuten)
+         call mpas_pool_get_array(mesh, 'zgrid', zgrid)
+         if (.not. associated(rthcuten)) then
+            call mpas_log_write('PartMC: PMC_CONV_CHECK needs rthcuten and rqvcuten', messageType=MPAS_LOG_CRIT)
+         end if
+         allocate(hm(nz), dh_m(nz), dh_s(nz))
+      end if
       allocate(tsub_s(nz,nz), tmat_s(nz,nz), tk(nz), qs(nz), qv(nz), p_rem(nz), col_s(nz), gas_of(size(idx)))
       gas_of = 0
       if (pmc_wet .and. pmc_wet_conv) then
@@ -2661,6 +2687,25 @@ contains
             tnew = matmul(tsub, tmat)
             tmat = tnew
          end do
+         ! Check: moist static energy h = cp T + g z + Lv qv is carried by the scheme's plumes
+         ! without sources (condensation and evaporation move energy between its terms), so
+         ! the matrix applied to h should give the scheme's own change of h.
+         if (pmc_conv_check) then
+            do k = 1, nz
+               z_mid = 0.5_RKIND * (zgrid(k,iCell) + zgrid(k+1,iCell))
+               hm(k) = 1004.5_RKIND * theta_m(k,iCell) / (1.0_RKIND + rvord*max(0.0_RKIND, scalars(index_qv,k,iCell))) &
+                       * exner(k,iCell) + 9.80616_RKIND * z_mid + 2.5e6_RKIND * max(0.0_RKIND, scalars(index_qv,k,iCell))
+               dh_s(k) = config_dt * (1004.5_RKIND * rthcuten(k,iCell) * exner(k,iCell) + 2.5e6_RKIND * rqvcuten(k,iCell))
+            end do
+            dh_m = matmul(tmat, hm * m) / m - hm
+            do k = 1, nz
+               ib = merge(1, 2, 0.5_RKIND * (zgrid(k,iCell) + zgrid(k+1,iCell)) < 5000.0_RKIND)
+               conv_chk(1,ib) = conv_chk(1,ib) + m(k) * areaCell(iCell) * dh_m(k) * dh_s(k)
+               conv_chk(2,ib) = conv_chk(2,ib) + m(k) * areaCell(iCell) * dh_s(k)**2
+               conv_chk(3,ib) = conv_chk(3,ib) + m(k) * areaCell(iCell) * dh_m(k)**2
+            end do
+         end if
+
          ! the same with removal: tsub_s held the amounts removed
          if (scav) then
             tsub_s = tsub + tsub_s
@@ -2724,6 +2769,18 @@ contains
          call mpas_log_write('PartMC convection step $i: convective columns = $i, particle layer changes so far = $i, ' &
                              // 'largest layer outflow fraction so far = $r', &
                              intArgs=(/itimestep, g_n_col, g_n_conv/), realArgs=(/o_max_seen/))
+         if (pmc_conv_check) then
+            csum = reshape(conv_chk, (/6/))
+            call mpas_dmpar_sum_real_array(domain % dminfo, 6, csum, g_csum)
+            call mpas_log_write('PartMC convection check step $i: change of moist static energy, matrix against ' &
+                                // 'scheme: below 5 km slope = $r, correlation = $r; above 5 km slope = $r, ' &
+                                // 'correlation = $r', &
+                                intArgs=(/itimestep/), &
+                                realArgs=(/g_csum(1)/max(g_csum(2), 1.0e-30_RKIND), &
+                                           g_csum(1)/max(sqrt(g_csum(2)*g_csum(3)), 1.0e-30_RKIND), &
+                                           g_csum(4)/max(g_csum(5), 1.0e-30_RKIND), &
+                                           g_csum(4)/max(sqrt(g_csum(5)*g_csum(6)), 1.0e-30_RKIND)/))
+         end if
          if (pmc_wet .and. pmc_wet_conv) then
             sums = conv_wet
             call mpas_dmpar_sum_real_array(domain % dminfo, 6, sums, g_sums)

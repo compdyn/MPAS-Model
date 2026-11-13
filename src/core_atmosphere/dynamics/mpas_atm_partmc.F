@@ -269,6 +269,13 @@ module mpas_atm_partmc
    character(len=256) :: gas_data_file = 'gas_data.dat', gas_init_file = 'gas_init.dat'
    real (kind=RKIND) :: pmc_chem_top = 1.0e9_RKIND, chem_s0 = 0.0_RKIND
    integer, allocatable :: gas_idx(:)
+   !> Molar mass of dry air (kg/mol) used to turn the gas mixing ratios into moles. PartMC's
+   !> MOSAIC interface turns mixing ratios into concentrations with p/(R T), R = 82.056 atm cm3
+   !> mol-1 K-1 = 8.31432 J mol-1 K-1, and MPAS's pressure is rho_d * 287 * T * (1 + rvord qv),
+   !> so the moles MOSAIC moves between gas and particles match the moles counted here only with
+   !> M = 8.31432/287. The value 0.028966 used before differs by 1.5e-4, which showed as a
+   !> steady loss of sulfur while sulfate condensed.
+   real (kind=RKIND), parameter :: M_AIR = 82.056e-6_RKIND * 101325.0_RKIND / 287.0_RKIND
    !> Gas emission and dry deposition: files, scale, and the amounts (mol) emitted and
    !> deposited by this task so far for each species.
    character(len=256) :: gas_emit_file = '', gas_drydep_file = ''
@@ -3055,7 +3062,7 @@ contains
                scalars(idx(i_s),:,iCell) = (e_gas * col_s + (1.0_RKIND - e_gas) * matmul(tmat, col)) / m
                if (gas_of(i_s) > 0) then
                   gas_wetdep(gas_of(i_s)) = gas_wetdep(gas_of(i_s)) &
-                                            + lost * 1.0e-9_RKIND / 0.028966_RKIND * areaCell(iCell)
+                                            + lost * 1.0e-9_RKIND / M_AIR * areaCell(iCell)
                end if
             end if
          end do
@@ -3637,7 +3644,7 @@ contains
          do k = 1, nVertLevels
             ! mol of dry air in the cell times the mixing ratio
             content = content + scalars(gas_idx,k,iCell) * 1.0e-9_RKIND &
-                                * rho_zz(k,iCell) / rdzw(k) * areaCell(iCell) / 0.028966_RKIND
+                                * rho_zz(k,iCell) / rdzw(k) * areaCell(iCell) / M_AIR
          end do
       end do
 
@@ -3743,7 +3750,7 @@ contains
 
       do iCell = 1, nCellsSolve
          ! mol of dry air per area in the lowest layer
-         air1 = rho_zz(1,iCell) / rdzw(1) / 0.028966_RKIND
+         air1 = rho_zz(1,iCell) / rdzw(1) / M_AIR
          if (allocated(gas_drydep%mix_rat)) then
             dz = 1.0_RKIND / (rdzw(1) * zz(1,iCell))
             frac = 1.0_RKIND - exp(-gas_drydep%mix_rat * config_dt / dz)
@@ -3755,7 +3762,7 @@ contains
             if (landmask(iCell) == 1) then
                air_emit = 0.0_RKIND
                do k = 1, pmc_emit_levels
-                  air_emit = air_emit + rho_zz(k,iCell) / rdzw(k) / 0.028966_RKIND
+                  air_emit = air_emit + rho_zz(k,iCell) / rdzw(k) / M_AIR
                end do
                ! mol per area this step
                amount = emis%mix_rat * rate * gas_emit_scale * config_dt
@@ -3769,7 +3776,7 @@ contains
             ! the inventory's flux of this cell, mol per area this step
             air_emit = 0.0_RKIND
             do k = 1, pmc_emit_levels
-               air_emit = air_emit + rho_zz(k,iCell) / rdzw(k) / 0.028966_RKIND
+               air_emit = air_emit + rho_zz(k,iCell) / rdzw(k) / M_AIR
             end do
             amount = emis_gas(:,iCell) * config_dt
             do k = 1, pmc_emit_levels
@@ -4071,7 +4078,7 @@ contains
             if (n_gas > 0) then
                amount = gas_wet_frac * p * scalars(gas_idx,k,iCell)
                scalars(gas_idx,k,iCell) = scalars(gas_idx,k,iCell) - amount
-               gas_wetdep = gas_wetdep + amount * 1.0e-9_RKIND * mk / 0.028966_RKIND * areaCell(iCell)
+               gas_wetdep = gas_wetdep + amount * 1.0e-9_RKIND * mk / M_AIR * areaCell(iCell)
             end if
 #endif
             if (pmc_n_part <= 0 .or. pmc_mode /= MODE_LAGR) cycle
@@ -4335,7 +4342,7 @@ contains
             if (mod(itimestep, 12) == 0 .or. itimestep == 1) then
                ! sulfur (mol): gas, then particles
                sums(1) = sums(1) + (scalars(gas_idx(i_so2),k,iCell) + scalars(gas_idx(i_h2so4),k,iCell)) * 1.0d-9 &
-                                   * rho_zz(k,iCell) * zz(k,iCell) * vol / 0.028966_RKIND
+                                   * rho_zz(k,iCell) * zz(k,iCell) * vol / M_AIR
                do j = 1, aero_state_n_part(aero_states(k,iCell))
                   sums(2) = sums(2) + aero_states(k,iCell)%apa%particle(j)%vol(i_so4) &
                                       * aero_data%density(i_so4) / aero_data%molec_weight(i_so4) &

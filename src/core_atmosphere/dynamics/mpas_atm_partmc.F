@@ -28,7 +28,8 @@
 !   PMC_GAS_DRYDEP    file of gas dry deposition velocities (species name, m/s), applied to the
 !                     lowest layer. Needs PMC_MOSAIC=1.
 !   PMC_WET           1 = removal of particles and gases by grid-scale precipitation, in cloud
-!                     (default 0). 2 = only the diagnostics: nothing is removed. PMC_WET_SCRIT: only particles with a critical supersaturation
+!                     (default 0), and with PMC_CONV=1 also in the convective updraft unless
+!                     PMC_WET_CONV=0. 2 = only the diagnostics: nothing is removed. PMC_WET_SCRIT: only particles with a critical supersaturation
 !                     up to this value (as a fraction, 0.002 = 0.2%) are removed (default: all).
 !                     PMC_GAS_WET: file of the fraction of each gas that is in cloud water
 !                     (species name, 0 to 1); needs PMC_MOSAIC=1.
@@ -252,6 +253,14 @@ module mpas_atm_partmc
    !> surface (kg); last, the number of particles expected to be removed given the particles
    !> that were in the layers (the sum of probability times number).
    logical :: pmc_wet = .false., pmc_wet_diag_only = .false., lagr_shuffle = .false.
+   !> Removal in the convective updraft: switch, and sums by this task so far: number removed
+   !> (reference, particles, expected from the particles present), convective precipitation at
+   !> the surface, water condensed in the updraft, and the part of it counted as precipitation
+   !> (kg).
+   logical :: pmc_wet_conv = .true.
+   real (kind=RKIND) :: conv_wet(6) = 0.0_RKIND
+   !> Fraction of each gas species that is in cloud water (from the PMC_GAS_WET file).
+   real (kind=RKIND), allocatable :: gas_wet_frac(:)
    real (kind=RKIND) :: pmc_wet_scrit = 1.0e9_RKIND
    character(len=256) :: gas_wet_file = ''
    real (kind=RKIND) :: wet_sums(6) = 0.0_RKIND
@@ -425,6 +434,8 @@ contains
       call get_environment_variable('PMC_WET', envval, status=stat)
       if (stat == 0) pmc_wet = (trim(envval) /= '0')
       if (stat == 0) pmc_wet_diag_only = (trim(envval) == '2')
+      call get_environment_variable('PMC_WET_CONV', envval, status=stat)
+      if (stat == 0) pmc_wet_conv = (trim(envval) /= '0')
       call get_environment_variable('PMC_WET_SCRIT', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_wet_scrit
       call get_environment_variable('PMC_GAS_WET', envval, status=stat)
@@ -2355,28 +2366,56 @@ contains
 
    !> Move the particles of one column between layers: a particle in layer j goes to layer i
    !> with probability tmat(i,j), to a random height in that layer (Lagrangian mode only).
-   subroutine column_jump(iCell, nz, tmat, n_jump, nCells, nEdgesOnCell, cellsOnCell)
+   !>
+   !> With tmat_s, p_rem and temp (removal in the convective updraft): a particle in layer j
+   !> that counts as activated is removed with probability p_rem(j) and otherwise goes to
+   !> layer i with probability tmat_s(i,j); the others use tmat.
+   subroutine column_jump(iCell, nz, tmat, n_jump, nCells, nEdgesOnCell, cellsOnCell, tmat_s, p_rem, temp)
 
       integer, intent(in) :: iCell, nz, nCells
       real (kind=RKIND), intent(in) :: tmat(nz,nz)
       integer, intent(inout) :: n_jump
       integer, intent(in) :: nEdgesOnCell(:), cellsOnCell(:,:)
+      real (kind=RKIND), intent(in), optional :: tmat_s(nz,nz), p_rem(nz), temp(nz)
 
 #ifdef MPAS_PARTMC
-      integer :: k, kk, j
-      real (kind=RKIND) :: u, cum, xp(NPOS)
+      integer :: k, kk, j, g
+      real (kind=RKIND) :: u, cum, xp(NPOS), colp(nz), w
       type(aero_particle_t) :: particle
+      type(env_state_t) :: env_state
+      logical :: scav
 
       do k = 1, nz
          if (tmat(k,k) >= 1.0_RKIND) cycle
+         if (present(tmat_s)) env_state%temp = temp(k)
          do j = pos(k,iCell) % n, 1, -1
+            scav = present(tmat_s)
+            if (scav .and. pmc_wet_scrit < 1.0e8_RKIND) then
+               scav = (aero_particle_crit_rel_humid(aero_states(k,iCell)%apa%particle(j), aero_data, env_state) &
+                       - 1.0d0 <= pmc_wet_scrit)
+            end if
+            if (scav) then
+               g = aero_states(k,iCell)%apa%particle(j)%weight_class
+               w = lagr_w * 2.0_RKIND**(g - LAGR_G0)
+               conv_wet(3) = conv_wet(3) + p_rem(k) * w
+               if (pmc_random() < p_rem(k)) then
+                  conv_wet(2) = conv_wet(2) + w
+                  part_s_removed = part_s_removed + particle_sulfate(aero_states(k,iCell)%apa%particle(j)) * w
+                  call aero_state_remove_particle_no_info(aero_states(k,iCell), j)
+                  call pos_remove(pos(k,iCell), j)
+                  cycle
+               end if
+               colp = tmat_s(:,k)
+            else
+               colp = tmat(:,k)
+            end if
             u = pmc_random()
             ! try the particle's own layer first, since that is the usual outcome
-            if (u < tmat(k,k)) cycle
-            cum = tmat(k,k)
+            if (u < colp(k)) cycle
+            cum = colp(k)
             do kk = 1, nz
                if (kk == k) cycle
-               cum = cum + tmat(kk,k)
+               cum = cum + colp(kk)
                if (u < cum) exit
             end do
             kk = min(kk, nz)
@@ -2427,12 +2466,19 @@ contains
       type (field3DReal), pointer :: scalars_field
       real (kind=RKIND), dimension(:,:,:), pointer :: scalars
       real (kind=RKIND), dimension(:,:), pointer :: rho_zz, cu_mfu, cu_mfd, cu_ude, cu_dde
-      real (kind=RKIND), dimension(:), pointer :: rdzw
+      real (kind=RKIND), dimension(:,:), pointer :: theta_m, exner, pressure_p, pressure_base
+      real (kind=RKIND), dimension(:), pointer :: rdzw, areaCell, raincv
       real (kind=RKIND), pointer :: config_dt
       integer, dimension(:,:), pointer :: cellsOnCell
       integer, dimension(:), pointer :: nEdgesOnCell
       integer, pointer :: nCells, nCellsSolve, nVertLevels, index_pmc_num, index_pmc_num2, index_ref, index_src2
+      integer, pointer :: index_qv
       integer :: iCell, k, j, i_s, nz, n_sub, i_sub, n_col, g_n_col, g_n_conv
+      type (mpas_pool_type), pointer :: diag
+      real (kind=RKIND), allocatable :: tsub_s(:,:), tmat_s(:,:), tk(:), qs(:), qv(:), p_rem(:), col_s(:)
+      integer, allocatable :: gas_of(:)
+      real (kind=RKIND) :: w_cond, pe, es, pres, lost, e_gas, sums(6), g_sums(6)
+      logical :: scav
       integer, allocatable :: idx(:)
       real (kind=RKIND), allocatable :: m(:), mu_top(:), mu_bot(:), dn_top(:), dn_bot(:), e_u(:), d_u(:), &
                                         e_d(:), d_d(:), f_u(:), f_d(:), s_top(:), out(:), tsub(:,:), tmat(:,:), &
@@ -2468,6 +2514,29 @@ contains
       end if
       call mixed_scalars(state, idx)
       nz = nVertLevels
+      ! for removal in the updraft
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'diag', diag)
+      call mpas_pool_get_dimension(state, 'index_qv', index_qv)
+      call mpas_pool_get_array(mesh, 'areaCell', areaCell)
+      call mpas_pool_get_array(state, 'theta_m', theta_m, 2)
+      call mpas_pool_get_array(diag, 'exner', exner)
+      call mpas_pool_get_array(diag, 'pressure_p', pressure_p)
+      call mpas_pool_get_array(diag, 'pressure_base', pressure_base)
+      nullify(raincv)
+      call mpas_pool_get_array(diag_physics, 'raincv', raincv)
+      allocate(tsub_s(nz,nz), tmat_s(nz,nz), tk(nz), qs(nz), qv(nz), p_rem(nz), col_s(nz), gas_of(size(idx)))
+      gas_of = 0
+      if (pmc_wet .and. pmc_wet_conv) then
+         call gas_wet_setup(domain)
+         if (allocated(gas_wet_frac)) then
+            ! the PartMC species of each mixed scalar
+            do i_s = 5, size(idx)
+               do j = 1, size(gas_idx)
+                  if (gas_idx(j) == idx(i_s)) gas_of(i_s) = j
+               end do
+            end do
+         end if
+      end if
       allocate(m(nz), mu_top(nz), mu_bot(nz), dn_top(nz), dn_bot(nz), e_u(nz), d_u(nz), e_d(nz), d_d(nz), &
                f_u(nz), f_d(nz), s_top(nz), out(nz), tsub(nz,nz), tmat(nz,nz), tnew(nz,nz), col(nz))
       n_col = 0
@@ -2522,14 +2591,52 @@ contains
          n_sub = max(1, ceiling(maxval(out) / 0.5_RKIND))
          dt = config_dt / real(n_sub, kind=RKIND)
 
+         ! Removal in the updraft. Air taken in at layer j with vapour qv(j) that leaves the
+         ! updraft at layer k has condensed qv(j) - qs(k) on the way, if that is positive. The
+         ! fraction pe of all the water condensed like this in the step falls as the scheme's
+         ! convective precipitation at the surface; a tracer that is all in the condensate
+         ! loses that fraction on every path with condensation.
+         scav = .false.
+         pe = 0.0_RKIND
+         if (pmc_wet .and. pmc_wet_conv .and. associated(raincv)) then
+            do k = 1, nz
+               qv(k) = max(0.0_RKIND, scalars(index_qv,k,iCell))
+               tk(k) = theta_m(k,iCell) / (1.0_RKIND + rvord*qv(k)) * exner(k,iCell)
+               pres = pressure_p(k,iCell) + pressure_base(k,iCell)
+               es = 611.2_RKIND * exp(17.67_RKIND * (tk(k) - 273.15_RKIND) / (tk(k) - 29.65_RKIND))
+               qs(k) = 0.622_RKIND * es / max(pres - es, 1.0_RKIND)
+            end do
+            w_cond = 0.0_RKIND
+            do j = 1, nz
+               if (e_u(j) <= 0.0_RKIND) cycle
+               pass = e_u(j) * config_dt
+               do k = j, nz
+                  w_cond = w_cond + pass*f_u(k) * max(0.0_RKIND, qv(j) - qs(k))
+                  pass = pass*(1.0_RKIND - f_u(k))
+                  if (pass <= 0.0_RKIND) exit
+               end do
+            end do
+            conv_wet(4) = conv_wet(4) + max(0.0_RKIND, raincv(iCell)) * areaCell(iCell)
+            conv_wet(5) = conv_wet(5) + w_cond * areaCell(iCell)
+            if (w_cond > 0.0_RKIND .and. raincv(iCell) > 0.0_RKIND) then
+               pe = min(1.0_RKIND, raincv(iCell) / w_cond)
+               conv_wet(6) = conv_wet(6) + pe * w_cond * areaCell(iCell)
+               scav = .not. pmc_wet_diag_only
+            end if
+         end if
+
          ! one sub-step: column j holds where the air of layer j goes
          tsub = 0.0_RKIND
+         tsub_s = 0.0_RKIND
          do j = 1, nz
             tsub(j,j) = 1.0_RKIND - out(j)/real(n_sub, kind=RKIND)
             if (e_u(j) > 0.0_RKIND) then
                pass = e_u(j) * dt / m(j)
                do k = j, nz
                   tsub(k,j) = tsub(k,j) + pass*f_u(k)
+                  if (scav) then
+                     if (qv(j) > qs(k)) tsub_s(k,j) = tsub_s(k,j) - pe*pass*f_u(k)
+                  end if
                   pass = pass*(1.0_RKIND - f_u(k))
                   if (pass <= 0.0_RKIND) exit
                end do
@@ -2554,12 +2661,39 @@ contains
             tnew = matmul(tsub, tmat)
             tmat = tnew
          end do
+         ! the same with removal: tsub_s held the amounts removed
+         if (scav) then
+            tsub_s = tsub + tsub_s
+            tmat_s = tsub_s
+            do i_sub = 2, n_sub
+               tnew = matmul(tsub_s, tmat_s)
+               tmat_s = tnew
+            end do
+         end if
 
          ! Eulerian scalars: the mass of tracer in layer i is the sum over j of tmat(i,j) times
          ! the mass that was in layer j
          do i_s = 1, size(idx)
             col = scalars(idx(i_s),:,iCell) * m
-            scalars(idx(i_s),:,iCell) = matmul(tmat, col) / m
+            if (.not. scav) then
+               scalars(idx(i_s),:,iCell) = matmul(tmat, col) / m
+            else if (i_s <= 4) then
+               ! number scalars: all in the condensate
+               col_s = matmul(tmat_s, col)
+               if (idx(i_s) == index_ref) conv_wet(1) = conv_wet(1) + (sum(col) - sum(col_s)) * areaCell(iCell)
+               scalars(idx(i_s),:,iCell) = col_s / m
+            else
+               ! gases: the in-cloud fraction behaves as the number scalars, the rest is only moved
+               e_gas = 0.0_RKIND
+               if (gas_of(i_s) > 0) e_gas = gas_wet_frac(gas_of(i_s))
+               col_s = matmul(tmat_s, col)
+               lost = e_gas * (sum(col) - sum(col_s))
+               scalars(idx(i_s),:,iCell) = (e_gas * col_s + (1.0_RKIND - e_gas) * matmul(tmat, col)) / m
+               if (gas_of(i_s) > 0) then
+                  gas_wetdep(gas_of(i_s)) = gas_wetdep(gas_of(i_s)) &
+                                            + lost * 1.0e-9_RKIND / 0.028966_RKIND * areaCell(iCell)
+               end if
+            end if
          end do
 
          if (pmc_n_part <= 0 .or. pmc_mode /= MODE_LAGR) cycle
@@ -2567,7 +2701,16 @@ contains
             tmat(:,j) = max(0.0_RKIND, tmat(:,j))
             tmat(:,j) = tmat(:,j) / sum(tmat(:,j))
          end do
-         call column_jump(iCell, nz, tmat, n_conv, nCells, nEdgesOnCell, cellsOnCell)
+         if (scav) then
+            do j = 1, nz
+               tmat_s(:,j) = max(0.0_RKIND, tmat_s(:,j))
+               p_rem(j) = min(1.0_RKIND, max(0.0_RKIND, 1.0_RKIND - sum(tmat_s(:,j))))
+               if (p_rem(j) < 1.0_RKIND) tmat_s(:,j) = tmat_s(:,j) / sum(tmat_s(:,j))
+            end do
+            call column_jump(iCell, nz, tmat, n_conv, nCells, nEdgesOnCell, cellsOnCell, tmat_s, p_rem, tk)
+         else
+            call column_jump(iCell, nz, tmat, n_conv, nCells, nEdgesOnCell, cellsOnCell)
+         end if
       end do
 
       call mpas_pool_get_field(state, 'scalars', scalars_field, 2)
@@ -2581,6 +2724,14 @@ contains
          call mpas_log_write('PartMC convection step $i: convective columns = $i, particle layer changes so far = $i, ' &
                              // 'largest layer outflow fraction so far = $r', &
                              intArgs=(/itimestep, g_n_col, g_n_conv/), realArgs=(/o_max_seen/))
+         if (pmc_wet .and. pmc_wet_conv) then
+            sums = conv_wet
+            call mpas_dmpar_sum_real_array(domain % dminfo, 6, sums, g_sums)
+            call mpas_log_write('PartMC convective removal step $i: number removed so far: reference = $r, ' &
+                                // 'particles = $r, particles expected from the layers'' content = $r; so far (kg): ' &
+                                // 'convective precipitation = $r, condensed in the updraft = $r, of that counted ' &
+                                // 'as precipitation = $r', intArgs=(/itimestep/), realArgs=g_sums)
+         end if
       end if
 #endif
 
@@ -3004,6 +3155,29 @@ contains
    end subroutine gas_budget_setup
 
 
+   !> Read the in-cloud fractions of the gases for wet removal, once.
+   subroutine gas_wet_setup(domain)
+
+      type (domain_type), intent(inout) :: domain
+
+#ifdef MPAS_PARTMC_MOSAIC
+      type(spec_file_t) :: file
+      type(gas_state_t) :: gas_wet
+
+      if (allocated(gas_wet_frac)) return
+      if (.not. pmc_chem .or. pmc_n_part <= 0 .or. len_trim(gas_wet_file) == 0) return
+      call gas_budget_setup(domain)
+      call spec_file_open(trim(gas_wet_file), file)
+      call spec_file_read_gas_state(file, gas_data, gas_wet)
+      call spec_file_close(file)
+      allocate(gas_wet_frac(gas_data_n_spec(gas_data)))
+      gas_wet_frac = min(1.0d0, max(0.0d0, gas_wet%mix_rat))
+      call mpas_log_write('PartMC: wet removal of gases with the in-cloud fractions of ' // trim(gas_wet_file))
+#endif
+
+   end subroutine gas_wet_setup
+
+
    !> Removal of particles and gases in cloud by grid-scale precipitation.
    !>
    !> The microphysics gives, for each layer, the rate P at which cloud water and ice turn into
@@ -3050,10 +3224,6 @@ contains
       integer, dimension(:,:), pointer :: edgesOnCell
       type (field2DReal), pointer :: rainprod_field
       real (kind=RKIND) :: xs(NPOS)
-#ifdef MPAS_PARTMC_MOSAIC
-      type(spec_file_t) :: file
-      type(gas_state_t), save :: gas_wet
-#endif
 
       if (.not. pmc_wet) return
 
@@ -3099,19 +3269,11 @@ contains
       call mpas_dmpar_exch_halo_field(rainprod_field)
 
       n_gas = 0
-#ifdef MPAS_PARTMC_MOSAIC
-      if (pmc_chem .and. pmc_n_part > 0 .and. len_trim(gas_wet_file) > 0) then
-         call gas_budget_setup(domain)
-         n_gas = gas_data_n_spec(gas_data)
+      call gas_wet_setup(domain)
+      if (allocated(gas_wet_frac)) then
+         n_gas = size(gas_wet_frac)
          allocate(amount(n_gas))
-         if (.not. allocated(gas_wet%mix_rat)) then
-            call spec_file_open(trim(gas_wet_file), file)
-            call spec_file_read_gas_state(file, gas_data, gas_wet)
-            call spec_file_close(file)
-            call mpas_log_write('PartMC: wet removal of gases with the in-cloud fractions of ' // trim(gas_wet_file))
-         end if
       end if
-#endif
 
       if (lagr_shuffle .and. pmc_n_part > 0 .and. pmc_mode == MODE_LAGR) then
          do iCell = 1, nCellsSolve
@@ -3218,7 +3380,7 @@ contains
             end do
 #ifdef MPAS_PARTMC_MOSAIC
             if (n_gas > 0) then
-               amount = min(1.0d0, max(0.0d0, gas_wet%mix_rat)) * p * scalars(gas_idx,k,iCell)
+               amount = gas_wet_frac * p * scalars(gas_idx,k,iCell)
                scalars(gas_idx,k,iCell) = scalars(gas_idx,k,iCell) - amount
                gas_wetdep = gas_wetdep + amount * 1.0e-9_RKIND * mk / 0.028966_RKIND * areaCell(iCell)
             end if

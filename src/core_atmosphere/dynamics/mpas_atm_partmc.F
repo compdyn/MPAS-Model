@@ -267,6 +267,9 @@ module mpas_atm_partmc
    !> taken from the layer below, the same layer and the layer above (third index).
    logical :: pmc_conv_check = .false.
    real (kind=RKIND) :: conv_chk(3,3,3) = 0.0_RKIND
+   !> The same sums for the changes added up over slabs of each column (below 2 km, 2-6 km,
+   !> above 6 km; third index), which do not depend on how a change is spread within a slab.
+   real (kind=RKIND) :: conv_slab(3,3,3) = 0.0_RKIND
    real (kind=RKIND) :: conv_wet(6) = 0.0_RKIND
    !> Fraction of each gas species that is in cloud water (from the PMC_GAS_WET file).
    real (kind=RKIND), allocatable :: gas_wet_frac(:)
@@ -2493,7 +2496,8 @@ contains
       type (mpas_pool_type), pointer :: tend_physics
       real (kind=RKIND), dimension(:,:), pointer :: rthcuten, rqvcuten, zgrid, rucuten, rvcuten, u_zon, u_mer
       real (kind=RKIND), allocatable :: hm(:), dh_m(:), dh_s(:)
-      real (kind=RKIND) :: csum(27), g_csum(27), z_mid, wgt
+      real (kind=RKIND) :: csum(27), g_csum(27), z_mid, wgt, slab_m(3), slab_s(3)
+      integer :: i_sl
       integer :: i_f, i_sh, kk
       character(len=8), parameter :: chk_name(3) = (/ 'energy  ', 'u wind  ', 'v wind  ' /)
       integer, allocatable :: idx(:)
@@ -2726,6 +2730,21 @@ contains
                      conv_chk(3,i_f,i_sh) = conv_chk(3,i_f,i_sh) + wgt * dh_m(kk)**2
                   end do
                end do
+               slab_m = 0.0_RKIND
+               slab_s = 0.0_RKIND
+               do k = 1, nz
+                  z_mid = 0.5_RKIND * (zgrid(k,iCell) + zgrid(k+1,iCell))
+                  i_sl = 1
+                  if (z_mid > 2000.0_RKIND) i_sl = 2
+                  if (z_mid > 6000.0_RKIND) i_sl = 3
+                  slab_m(i_sl) = slab_m(i_sl) + m(k) * dh_m(k)
+                  slab_s(i_sl) = slab_s(i_sl) + m(k) * dh_s(k)
+               end do
+               do i_sl = 1, 3
+                  conv_slab(1,i_f,i_sl) = conv_slab(1,i_f,i_sl) + areaCell(iCell) * slab_m(i_sl) * slab_s(i_sl)
+                  conv_slab(2,i_f,i_sl) = conv_slab(2,i_f,i_sl) + areaCell(iCell) * slab_s(i_sl)**2
+                  conv_slab(3,i_f,i_sl) = conv_slab(3,i_f,i_sl) + areaCell(iCell) * slab_m(i_sl)**2
+               end do
             end do
          end if
 
@@ -2800,6 +2819,19 @@ contains
                call mpas_log_write('PartMC convection check step $i: ' // trim(chk_name(i_f)) // ', matrix against ' &
                                    // 'scheme, slope and correlation with the matrix result taken from the layer ' &
                                    // 'below = $r $r, the same layer = $r $r, the layer above = $r $r', &
+                                   intArgs=(/itimestep/), realArgs=(/ &
+                  g_csum(1+3*(i_f-1))    / max(g_csum(2+3*(i_f-1)), 1.0e-30_RKIND), &
+                  g_csum(1+3*(i_f-1))    / max(sqrt(g_csum(2+3*(i_f-1))*g_csum(3+3*(i_f-1))), 1.0e-30_RKIND), &
+                  g_csum(1+3*(i_f-1)+9)  / max(g_csum(2+3*(i_f-1)+9), 1.0e-30_RKIND), &
+                  g_csum(1+3*(i_f-1)+9)  / max(sqrt(g_csum(2+3*(i_f-1)+9)*g_csum(3+3*(i_f-1)+9)), 1.0e-30_RKIND), &
+                  g_csum(1+3*(i_f-1)+18) / max(g_csum(2+3*(i_f-1)+18), 1.0e-30_RKIND), &
+                  g_csum(1+3*(i_f-1)+18) / max(sqrt(g_csum(2+3*(i_f-1)+18)*g_csum(3+3*(i_f-1)+18)), 1.0e-30_RKIND)/))
+            end do
+            csum = reshape(conv_slab, (/27/))
+            call mpas_dmpar_sum_real_array(domain % dminfo, 27, csum, g_csum)
+            do i_f = 1, 3
+               call mpas_log_write('PartMC convection check step $i: ' // trim(chk_name(i_f)) // ', column slabs, ' &
+                                   // 'slope and correlation below 2 km = $r $r, 2-6 km = $r $r, above 6 km = $r $r', &
                                    intArgs=(/itimestep/), realArgs=(/ &
                   g_csum(1+3*(i_f-1))    / max(g_csum(2+3*(i_f-1)), 1.0e-30_RKIND), &
                   g_csum(1+3*(i_f-1))    / max(sqrt(g_csum(2+3*(i_f-1))*g_csum(3+3*(i_f-1))), 1.0e-30_RKIND), &

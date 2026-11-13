@@ -261,11 +261,12 @@ module mpas_atm_partmc
    !> the surface, water condensed in the updraft, and the part of it counted as precipitation
    !> (kg).
    logical :: pmc_wet_conv = .true.
-   !> Check of the convective matrix against the scheme's moist static energy tendency: switch,
-   !> and mass-weighted sums of matrix*scheme, scheme^2, matrix^2 for layers below and above
-   !> 5 km, by this task so far.
+   !> Check of the convective matrix against the scheme's own tendencies: switch, and
+   !> mass-weighted sums of matrix*scheme, scheme^2, matrix^2 by this task so far, for moist
+   !> static energy, zonal wind and meridional wind (second index), with the matrix result
+   !> taken from the layer below, the same layer and the layer above (third index).
    logical :: pmc_conv_check = .false.
-   real (kind=RKIND) :: conv_chk(3,2) = 0.0_RKIND
+   real (kind=RKIND) :: conv_chk(3,3,3) = 0.0_RKIND
    real (kind=RKIND) :: conv_wet(6) = 0.0_RKIND
    !> Fraction of each gas species that is in cloud water (from the PMC_GAS_WET file).
    real (kind=RKIND), allocatable :: gas_wet_frac(:)
@@ -2490,10 +2491,11 @@ contains
       real (kind=RKIND) :: w_cond, pe, es, pres, lost, e_gas, sums(6), g_sums(6)
       logical :: scav
       type (mpas_pool_type), pointer :: tend_physics
-      real (kind=RKIND), dimension(:,:), pointer :: rthcuten, rqvcuten, zgrid
+      real (kind=RKIND), dimension(:,:), pointer :: rthcuten, rqvcuten, zgrid, rucuten, rvcuten, u_zon, u_mer
       real (kind=RKIND), allocatable :: hm(:), dh_m(:), dh_s(:)
-      real (kind=RKIND) :: csum(6), g_csum(6), z_mid
-      integer :: ib
+      real (kind=RKIND) :: csum(27), g_csum(27), z_mid, wgt
+      integer :: i_f, i_sh, kk
+      character(len=8), parameter :: chk_name(3) = (/ 'energy  ', 'u wind  ', 'v wind  ' /)
       integer, allocatable :: idx(:)
       real (kind=RKIND), allocatable :: m(:), mu_top(:), mu_bot(:), dn_top(:), dn_bot(:), e_u(:), d_u(:), &
                                         e_d(:), d_d(:), f_u(:), f_d(:), s_top(:), out(:), tsub(:,:), tmat(:,:), &
@@ -2544,6 +2546,10 @@ contains
          nullify(rthcuten)
          call mpas_pool_get_array(tend_physics, 'rthcuten', rthcuten)
          call mpas_pool_get_array(tend_physics, 'rqvcuten', rqvcuten)
+         call mpas_pool_get_array(tend_physics, 'rucuten', rucuten)
+         call mpas_pool_get_array(tend_physics, 'rvcuten', rvcuten)
+         call mpas_pool_get_array(diag, 'uReconstructZonal', u_zon)
+         call mpas_pool_get_array(diag, 'uReconstructMeridional', u_mer)
          call mpas_pool_get_array(mesh, 'zgrid', zgrid)
          if (.not. associated(rthcuten)) then
             call mpas_log_write('PartMC: PMC_CONV_CHECK needs rthcuten and rqvcuten', messageType=MPAS_LOG_CRIT)
@@ -2687,22 +2693,39 @@ contains
             tnew = matmul(tsub, tmat)
             tmat = tnew
          end do
-         ! Check: moist static energy h = cp T + g z + Lv qv is carried by the scheme's plumes
-         ! without sources (condensation and evaporation move energy between its terms), so
-         ! the matrix applied to h should give the scheme's own change of h.
+         ! Check against the scheme. Moist static energy h = cp T + g z + Lv qv is carried by
+         ! the plumes almost without sources (condensation and evaporation move energy between
+         ! its terms), and the scheme carries the horizontal wind as a passive quantity, so the
+         ! matrix applied to them should give about the scheme's own changes.
          if (pmc_conv_check) then
-            do k = 1, nz
-               z_mid = 0.5_RKIND * (zgrid(k,iCell) + zgrid(k+1,iCell))
-               hm(k) = 1004.5_RKIND * theta_m(k,iCell) / (1.0_RKIND + rvord*max(0.0_RKIND, scalars(index_qv,k,iCell))) &
-                       * exner(k,iCell) + 9.80616_RKIND * z_mid + 2.5e6_RKIND * max(0.0_RKIND, scalars(index_qv,k,iCell))
-               dh_s(k) = config_dt * (1004.5_RKIND * rthcuten(k,iCell) * exner(k,iCell) + 2.5e6_RKIND * rqvcuten(k,iCell))
-            end do
-            dh_m = matmul(tmat, hm * m) / m - hm
-            do k = 1, nz
-               ib = merge(1, 2, 0.5_RKIND * (zgrid(k,iCell) + zgrid(k+1,iCell)) < 5000.0_RKIND)
-               conv_chk(1,ib) = conv_chk(1,ib) + m(k) * areaCell(iCell) * dh_m(k) * dh_s(k)
-               conv_chk(2,ib) = conv_chk(2,ib) + m(k) * areaCell(iCell) * dh_s(k)**2
-               conv_chk(3,ib) = conv_chk(3,ib) + m(k) * areaCell(iCell) * dh_m(k)**2
+            do i_f = 1, 3
+               do k = 1, nz
+                  if (i_f == 1) then
+                     z_mid = 0.5_RKIND * (zgrid(k,iCell) + zgrid(k+1,iCell))
+                     hm(k) = 1004.5_RKIND * theta_m(k,iCell) &
+                             / (1.0_RKIND + rvord*max(0.0_RKIND, scalars(index_qv,k,iCell))) * exner(k,iCell) &
+                             + 9.80616_RKIND * z_mid + 2.5e6_RKIND * max(0.0_RKIND, scalars(index_qv,k,iCell))
+                     dh_s(k) = config_dt * (1004.5_RKIND * rthcuten(k,iCell) * exner(k,iCell) &
+                                            + 2.5e6_RKIND * rqvcuten(k,iCell))
+                  else if (i_f == 2) then
+                     hm(k) = u_zon(k,iCell)
+                     dh_s(k) = config_dt * rucuten(k,iCell)
+                  else
+                     hm(k) = u_mer(k,iCell)
+                     dh_s(k) = config_dt * rvcuten(k,iCell)
+                  end if
+               end do
+               dh_m = matmul(tmat, hm * m) / m - hm
+               do i_sh = 1, 3
+                  do k = 1, nz
+                     kk = k + i_sh - 2
+                     if (kk < 1 .or. kk > nz) cycle
+                     wgt = m(k) * areaCell(iCell)
+                     conv_chk(1,i_f,i_sh) = conv_chk(1,i_f,i_sh) + wgt * dh_m(kk) * dh_s(k)
+                     conv_chk(2,i_f,i_sh) = conv_chk(2,i_f,i_sh) + wgt * dh_s(k)**2
+                     conv_chk(3,i_f,i_sh) = conv_chk(3,i_f,i_sh) + wgt * dh_m(kk)**2
+                  end do
+               end do
             end do
          end if
 
@@ -2770,16 +2793,21 @@ contains
                              // 'largest layer outflow fraction so far = $r', &
                              intArgs=(/itimestep, g_n_col, g_n_conv/), realArgs=(/o_max_seen/))
          if (pmc_conv_check) then
-            csum = reshape(conv_chk, (/6/))
-            call mpas_dmpar_sum_real_array(domain % dminfo, 6, csum, g_csum)
-            call mpas_log_write('PartMC convection check step $i: change of moist static energy, matrix against ' &
-                                // 'scheme: below 5 km slope = $r, correlation = $r; above 5 km slope = $r, ' &
-                                // 'correlation = $r', &
-                                intArgs=(/itimestep/), &
-                                realArgs=(/g_csum(1)/max(g_csum(2), 1.0e-30_RKIND), &
-                                           g_csum(1)/max(sqrt(g_csum(2)*g_csum(3)), 1.0e-30_RKIND), &
-                                           g_csum(4)/max(g_csum(5), 1.0e-30_RKIND), &
-                                           g_csum(4)/max(sqrt(g_csum(5)*g_csum(6)), 1.0e-30_RKIND)/))
+            csum = reshape(conv_chk, (/27/))
+            call mpas_dmpar_sum_real_array(domain % dminfo, 27, csum, g_csum)
+            do i_f = 1, 3
+               ! element (a, i_f, i_sh) of conv_chk is at a + 3*(i_f-1) + 9*(i_sh-1)
+               call mpas_log_write('PartMC convection check step $i: ' // trim(chk_name(i_f)) // ', matrix against ' &
+                                   // 'scheme, slope and correlation with the matrix result taken from the layer ' &
+                                   // 'below = $r $r, the same layer = $r $r, the layer above = $r $r', &
+                                   intArgs=(/itimestep/), realArgs=(/ &
+                  g_csum(1+3*(i_f-1))    / max(g_csum(2+3*(i_f-1)), 1.0e-30_RKIND), &
+                  g_csum(1+3*(i_f-1))    / max(sqrt(g_csum(2+3*(i_f-1))*g_csum(3+3*(i_f-1))), 1.0e-30_RKIND), &
+                  g_csum(1+3*(i_f-1)+9)  / max(g_csum(2+3*(i_f-1)+9), 1.0e-30_RKIND), &
+                  g_csum(1+3*(i_f-1)+9)  / max(sqrt(g_csum(2+3*(i_f-1)+9)*g_csum(3+3*(i_f-1)+9)), 1.0e-30_RKIND), &
+                  g_csum(1+3*(i_f-1)+18) / max(g_csum(2+3*(i_f-1)+18), 1.0e-30_RKIND), &
+                  g_csum(1+3*(i_f-1)+18) / max(sqrt(g_csum(2+3*(i_f-1)+18)*g_csum(3+3*(i_f-1)+18)), 1.0e-30_RKIND)/))
+            end do
          end if
          if (pmc_wet .and. pmc_wet_conv) then
             sums = conv_wet

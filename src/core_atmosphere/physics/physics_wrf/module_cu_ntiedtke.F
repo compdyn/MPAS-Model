@@ -31,7 +31,7 @@
                 ,ims,ime,jms,jme,kms,kme                 &
                 ,its,ite,jts,jte,kts,kte                 &
                 ,errmsg,errflg                           &
-                ,cu_mfu,cu_mfd,cu_ude,cu_dde)
+                ,cu_mfu,cu_mfd,cu_ude,cu_dde,cu_trc)
 !=================================================================================================================
 !-- u3d         3d u-velocity interpolated to theta points (m/s)
 !-- v3d         3d v-velocity interpolated to theta points (m/s)
@@ -120,7 +120,9 @@
 !--- optional output: updraft and downdraft mass fluxes at the top of each layer and the
 !    detrainment rates of each layer (kg m-2 s-1), in model level order:
  real(kind=kind_phys),intent(out),dimension(ims:ime,kms:kme,jms:jme),optional:: cu_mfu,cu_mfd,cu_ude,cu_dde
- real(kind=kind_phys),dimension(its:ite,kts:kte):: mfu_hv,mfd_hv,ude_hv,dde_hv
+!--- optional output: the scheme's tendency (s-1) of its passive test tracer, in model level order:
+ real(kind=kind_phys),intent(out),dimension(ims:ime,kms:kme,jms:jme),optional:: cu_trc
+ real(kind=kind_phys),dimension(its:ite,kts:kte):: mfu_hv,mfd_hv,ude_hv,dde_hv,trc_hv
 
  logical,intent(inout),dimension(ims:ime,jms:jme):: cu_act_flag
 
@@ -230,8 +232,16 @@
                      paph = prsi   , evap = qfx_hv , hfx    = hfx_hv  , zprecc = rn      , &
                      lndj = slimsk , lq   = im     , km     = kx      , km1    = kx1     , &
                      dt   = delt   , dx   = dx_hv  , errmsg = errmsg  , errflg = errflg  , &
-                     pmfu_o = mfu_hv , pmfd_o = mfd_hv , pude_o = ude_hv , pdde_o = dde_hv   &
+                     pmfu_o = mfu_hv , pmfd_o = mfd_hv , pude_o = ude_hv , pdde_o = dde_hv , &
+                     ptrc_o = trc_hv                                                         &
                         )
+    if(present(cu_trc)) then
+       do k = kts,kte
+          do i = its,ite
+             cu_trc(i,k,j) = trc_hv(i,kte+kts-k)
+          enddo
+       enddo
+    endif
     if(present(cu_mfu)) then
        ! the scheme's levels run from the top down; its downdraft detrainment at index
        ! jk belongs to the layer above

@@ -273,13 +273,14 @@ module mpas_atm_partmc
    logical :: pmc_wet_conv = .true.
    !> Check of the convective matrix against the scheme's own tendencies: switch, and
    !> mass-weighted sums of matrix*scheme, scheme^2, matrix^2 by this task so far, for moist
-   !> static energy, zonal wind and meridional wind (second index), with the matrix result
+   !> static energy, zonal wind, meridional wind and the scheme's passive test tracer
+   !> exp(-z/3000 m) (second index), with the matrix result
    !> taken from the layer below, the same layer and the layer above (third index).
    logical :: pmc_conv_check = .false.
-   real (kind=RKIND) :: conv_chk(3,3,3) = 0.0_RKIND
+   real (kind=RKIND) :: conv_chk(3,4,3) = 0.0_RKIND
    !> The same sums for the changes added up over slabs of each column (below 2 km, 2-6 km,
    !> above 6 km; third index), which do not depend on how a change is spread within a slab.
-   real (kind=RKIND) :: conv_slab(3,3,3) = 0.0_RKIND
+   real (kind=RKIND) :: conv_slab(3,4,3) = 0.0_RKIND
    real (kind=RKIND) :: conv_wet(6) = 0.0_RKIND
    !> Fraction of each gas species that is in cloud water (from the PMC_GAS_WET file).
    real (kind=RKIND), allocatable :: gas_wet_frac(:)
@@ -2700,12 +2701,12 @@ contains
       real (kind=RKIND) :: w_cond, pe, es, pres, lost, e_gas, sums(6), g_sums(6)
       logical :: scav
       type (mpas_pool_type), pointer :: tend_physics
-      real (kind=RKIND), dimension(:,:), pointer :: rthcuten, rqvcuten, zgrid, rucuten, rvcuten, u_zon, u_mer
+      real (kind=RKIND), dimension(:,:), pointer :: rthcuten, rqvcuten, zgrid, rucuten, rvcuten, u_zon, u_mer, cu_trc
       real (kind=RKIND), allocatable :: hm(:), dh_m(:), dh_s(:)
-      real (kind=RKIND) :: csum(27), g_csum(27), z_mid, wgt, slab_m(3), slab_s(3)
+      real (kind=RKIND) :: csum(36), g_csum(36), z_mid, wgt, slab_m(3), slab_s(3)
       integer :: i_sl
       integer :: i_f, i_sh, kk
-      character(len=8), parameter :: chk_name(3) = (/ 'energy  ', 'u wind  ', 'v wind  ' /)
+      character(len=8), parameter :: chk_name(4) = (/ 'energy  ', 'u wind  ', 'v wind  ', 'tracer  ' /)
       integer, allocatable :: idx(:)
       real (kind=RKIND), allocatable :: m(:), mu_top(:), mu_bot(:), dn_top(:), dn_bot(:), e_u(:), d_u(:), &
                                         e_d(:), d_d(:), f_u(:), f_d(:), s_top(:), out(:), tsub(:,:), tmat(:,:), &
@@ -2758,6 +2759,7 @@ contains
          call mpas_pool_get_array(tend_physics, 'rqvcuten', rqvcuten)
          call mpas_pool_get_array(tend_physics, 'rucuten', rucuten)
          call mpas_pool_get_array(tend_physics, 'rvcuten', rvcuten)
+         call mpas_pool_get_array(diag_physics, 'cu_trc', cu_trc)
          call mpas_pool_get_array(diag, 'uReconstructZonal', u_zon)
          call mpas_pool_get_array(diag, 'uReconstructMeridional', u_mer)
          call mpas_pool_get_array(mesh, 'zgrid', zgrid)
@@ -2908,9 +2910,13 @@ contains
          ! its terms), and the scheme carries the horizontal wind as a passive quantity, so the
          ! matrix applied to them should give about the scheme's own changes.
          if (pmc_conv_check) then
-            do i_f = 1, 3
+            do i_f = 1, 4
                do k = 1, nz
-                  if (i_f == 1) then
+                  if (i_f == 4) then
+                     ! the scheme's own passive tracer: height above the ground
+                     hm(k) = exp(-(0.5_RKIND * (zgrid(k,iCell) + zgrid(k+1,iCell)) - zgrid(1,iCell)) / 3000.0_RKIND)
+                     dh_s(k) = config_dt * cu_trc(k,iCell)
+                  else if (i_f == 1) then
                      z_mid = 0.5_RKIND * (zgrid(k,iCell) + zgrid(k+1,iCell))
                      hm(k) = 1004.5_RKIND * theta_m(k,iCell) &
                              / (1.0_RKIND + rvord*max(0.0_RKIND, scalars(index_qv,k,iCell))) * exner(k,iCell) &
@@ -3018,33 +3024,33 @@ contains
                              // 'largest layer outflow fraction so far = $r', &
                              intArgs=(/itimestep, g_n_col, g_n_conv/), realArgs=(/o_max_seen/))
          if (pmc_conv_check) then
-            csum = reshape(conv_chk, (/27/))
-            call mpas_dmpar_sum_real_array(domain % dminfo, 27, csum, g_csum)
-            do i_f = 1, 3
-               ! element (a, i_f, i_sh) of conv_chk is at a + 3*(i_f-1) + 9*(i_sh-1)
+            csum = reshape(conv_chk, (/36/))
+            call mpas_dmpar_sum_real_array(domain % dminfo, 36, csum, g_csum)
+            do i_f = 1, 4
+               ! element (a, i_f, i_sh) of conv_chk is at a + 3*(i_f-1) + 12*(i_sh-1)
                call mpas_log_write('PartMC convection check step $i: ' // trim(chk_name(i_f)) // ', matrix against ' &
                                    // 'scheme, slope and correlation with the matrix result taken from the layer ' &
                                    // 'below = $r $r, the same layer = $r $r, the layer above = $r $r', &
                                    intArgs=(/itimestep/), realArgs=(/ &
                   g_csum(1+3*(i_f-1))    / max(g_csum(2+3*(i_f-1)), 1.0e-30_RKIND), &
                   g_csum(1+3*(i_f-1))    / max(sqrt(g_csum(2+3*(i_f-1))*g_csum(3+3*(i_f-1))), 1.0e-30_RKIND), &
-                  g_csum(1+3*(i_f-1)+9)  / max(g_csum(2+3*(i_f-1)+9), 1.0e-30_RKIND), &
-                  g_csum(1+3*(i_f-1)+9)  / max(sqrt(g_csum(2+3*(i_f-1)+9)*g_csum(3+3*(i_f-1)+9)), 1.0e-30_RKIND), &
-                  g_csum(1+3*(i_f-1)+18) / max(g_csum(2+3*(i_f-1)+18), 1.0e-30_RKIND), &
-                  g_csum(1+3*(i_f-1)+18) / max(sqrt(g_csum(2+3*(i_f-1)+18)*g_csum(3+3*(i_f-1)+18)), 1.0e-30_RKIND)/))
+                  g_csum(1+3*(i_f-1)+12)  / max(g_csum(2+3*(i_f-1)+12), 1.0e-30_RKIND), &
+                  g_csum(1+3*(i_f-1)+12)  / max(sqrt(g_csum(2+3*(i_f-1)+12)*g_csum(3+3*(i_f-1)+12)), 1.0e-30_RKIND), &
+                  g_csum(1+3*(i_f-1)+24) / max(g_csum(2+3*(i_f-1)+24), 1.0e-30_RKIND), &
+                  g_csum(1+3*(i_f-1)+24) / max(sqrt(g_csum(2+3*(i_f-1)+24)*g_csum(3+3*(i_f-1)+24)), 1.0e-30_RKIND)/))
             end do
-            csum = reshape(conv_slab, (/27/))
-            call mpas_dmpar_sum_real_array(domain % dminfo, 27, csum, g_csum)
-            do i_f = 1, 3
+            csum = reshape(conv_slab, (/36/))
+            call mpas_dmpar_sum_real_array(domain % dminfo, 36, csum, g_csum)
+            do i_f = 1, 4
                call mpas_log_write('PartMC convection check step $i: ' // trim(chk_name(i_f)) // ', column slabs, ' &
                                    // 'slope and correlation below 2 km = $r $r, 2-6 km = $r $r, above 6 km = $r $r', &
                                    intArgs=(/itimestep/), realArgs=(/ &
                   g_csum(1+3*(i_f-1))    / max(g_csum(2+3*(i_f-1)), 1.0e-30_RKIND), &
                   g_csum(1+3*(i_f-1))    / max(sqrt(g_csum(2+3*(i_f-1))*g_csum(3+3*(i_f-1))), 1.0e-30_RKIND), &
-                  g_csum(1+3*(i_f-1)+9)  / max(g_csum(2+3*(i_f-1)+9), 1.0e-30_RKIND), &
-                  g_csum(1+3*(i_f-1)+9)  / max(sqrt(g_csum(2+3*(i_f-1)+9)*g_csum(3+3*(i_f-1)+9)), 1.0e-30_RKIND), &
-                  g_csum(1+3*(i_f-1)+18) / max(g_csum(2+3*(i_f-1)+18), 1.0e-30_RKIND), &
-                  g_csum(1+3*(i_f-1)+18) / max(sqrt(g_csum(2+3*(i_f-1)+18)*g_csum(3+3*(i_f-1)+18)), 1.0e-30_RKIND)/))
+                  g_csum(1+3*(i_f-1)+12)  / max(g_csum(2+3*(i_f-1)+12), 1.0e-30_RKIND), &
+                  g_csum(1+3*(i_f-1)+12)  / max(sqrt(g_csum(2+3*(i_f-1)+12)*g_csum(3+3*(i_f-1)+12)), 1.0e-30_RKIND), &
+                  g_csum(1+3*(i_f-1)+24) / max(g_csum(2+3*(i_f-1)+24), 1.0e-30_RKIND), &
+                  g_csum(1+3*(i_f-1)+24) / max(sqrt(g_csum(2+3*(i_f-1)+24)*g_csum(3+3*(i_f-1)+24)), 1.0e-30_RKIND)/))
             end do
          end if
          if (pmc_wet .and. pmc_wet_conv) then

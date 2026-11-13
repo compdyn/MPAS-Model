@@ -1,5 +1,5 @@
 diff --git a/cu_ntiedtke.F90 b/cu_ntiedtke.F90
-index e1d266d..72b4957 100644
+index e1d266d..d5e4388 100644
 --- a/cu_ntiedtke.F90
 +++ b/cu_ntiedtke.F90
 @@ -146,7 +146,8 @@
@@ -8,38 +8,43 @@ index e1d266d..72b4957 100644
        subroutine cu_ntiedtke_run(pu,pv,pt,pqv,pqc,pqi,pqvf,ptf,poz,pzz,pomg, &
 -     &         pap,paph,evap,hfx,zprecc,lndj,lq,km,km1,dt,dx,errmsg,errflg)
 +     &         pap,paph,evap,hfx,zprecc,lndj,lq,km,km1,dt,dx,errmsg,errflg,  &
-+     &         pmfu_o,pmfd_o,pude_o,pdde_o)
++     &         pmfu_o,pmfd_o,pude_o,pdde_o,ptrc_o)
  !=================================================================================================================
  !     this is the interface between the model and the mass flux convection module
  !     m.tiedtke      e.c.m.w.f.      1989
-@@ -203,8 +204,12 @@
+@@ -203,8 +204,16 @@
  !--- output arguments:
        character(len=*),intent(out):: errmsg
        integer,intent(out):: errflg
 +!     updraft and downdraft mass fluxes at the top of each layer and detrainment rates of
 +!     each layer (kg m-2 s-1), top-down, zero where there is no convection:
 +      real(kind=kind_phys),intent(out),dimension(:,:),optional:: pmfu_o,pmfd_o,pude_o,pdde_o
++!     tendency (s-1) of a passive test tracer with the profile exp(-z/3000 m), carried by the
++!     scheme's own updraft and downdraft equations; for checking tracer transport done elsewhere
++!     with the mass fluxes above:
++      real(kind=kind_phys),intent(out),dimension(:,:),optional:: ptrc_o
  
  !--- local variables and arrays:
-+      real(kind=kind_phys),dimension(lq,km):: zude,zdde
++      real(kind=kind_phys),dimension(lq,km):: zude,zdde,ztrcte
        logical,dimension(lq):: locum
        integer:: i,j,k
        integer,dimension(lq):: icbot,ictop,ktype
-@@ -280,6 +285,8 @@
+@@ -280,6 +289,9 @@
  !-----------------------------------------------------------------------
  !*    2.     call 'cumastrn'(master-routine for cumulus parameterization)
  !
 +      zude = 0.
 +      zdde = 0.
++      ztrcte = 0.
        call cumastrn        &
       &    (lq,       km,       km1,      km-1,    ztp1,  &
       &     zqp1,     pum1,     pvm1,     pverv,   zqsat, &
-@@ -289,7 +296,24 @@
+@@ -289,7 +301,32 @@
       &     ktype,    icbot,    ictop,    ztu,     zqu,   &
       &     zlu,      zlude,    zmfu,     zmfd,    zrain, &
       &     pcte,     phhfl,    lndj,     pgeoh,   dx,    &
 -     &     scale_fac, scale_fac2)
-+     &     scale_fac, scale_fac2, zude, zdde)
++     &     scale_fac, scale_fac2, zude, zdde, ztrcte)
 +
 +      if(present(pmfu_o)) then
 +        do k=1,km
@@ -57,24 +62,94 @@ index e1d266d..72b4957 100644
 +        end do
 +        end do
 +      end if
++      if(present(ptrc_o)) then
++        do k=1,km
++        do j=1,lq
++          ptrc_o(j,k) = 0.
++          if(locum(j)) ptrc_o(j,k) = ztrcte(j,k)
++        end do
++        end do
++      end if
  !
  !     to include the cloud water and cloud ice detrained from convection
  !
-@@ -348,7 +372,7 @@
+@@ -348,7 +385,7 @@
       &     ktype,    kcbot,    kctop,    ptu,      pqu,   &
       &     plu,      plude,    pmfu,     pmfd,     prain, &
       &     pcte,     phhfl,    lndj,     zgeoh,    dx,    &
 -     &     scale_fac,  scale_fac2)
-+     &     scale_fac,  scale_fac2, pmfude_rate, pmfdde_rate)
++     &     scale_fac,  scale_fac2, pmfude_rate, pmfdde_rate, ptrcte)
        implicit none
  !
  !***cumastrn*  master routine for cumulus massflux-scheme
-@@ -454,7 +478,7 @@
+@@ -454,7 +491,9 @@
        real(kind=kind_phys),dimension(klon):: zmfuvb,zsum12,zsum22
        real(kind=kind_phys),dimension(klon):: zrfl
        real(kind=kind_phys),dimension(klev):: pmean
 -      real(kind=kind_phys),dimension(klon,klev):: pmfude_rate,pmfdde_rate
 +      real(kind=kind_phys),intent(inout),dimension(klon,klev):: pmfude_rate,pmfdde_rate
++      real(kind=kind_phys),intent(inout),dimension(klon,klev):: ptrcte
++      real(kind=kind_phys),dimension(klon,klev):: zcen,zcu,zcd,zcdum
        real(kind=kind_phys),dimension(klon,klev):: zdpmel
        real(kind=kind_phys),dimension(klon,klev):: zmfuus,zmfdus,zuv2,ztenu,ztenv
        real(kind=kind_phys),dimension(klon,klev):: ztenh,zqenh,zqsenh,ztd,zqd
+@@ -1027,6 +1066,59 @@
+                   ldcum,ztmst,paph,puen,pven,zmfuus,zmfdus,zuu,  &
+                   zud,zvu,zvd,pvom,pvol)
+ 
++!*  9.2          passive test tracer, as the momentum above but without the pressure-gradient
++!                term: values in the updraft and downdraft from entrainment and detrainment
++!                only, then the same flux form (cududvn)
++!-------------------------------------------------------------------
++      do jk = 1 , klev
++        do jl = 1, klon
++          zcen(jl,jk) = exp(-pgeo(jl,jk)/(g*3000.))
++          zcu(jl,jk) = zcen(jl,jk)
++          zcd(jl,jk) = zcen(jl,jk)
++          zcdum(jl,jk) = 0.
++        end do
++      end do
++      do jk = klev-1 , 2 , -1
++        ik = jk + 1
++        do jl = 1,klon
++          if ( ldcum(jl) ) then
++            if ( jk == kcbot(jl) .and. ktype(jl) < 3 ) then
++              ikb = kdpl(jl)
++              zcu(jl,jk) = zcen(jl,ikb-1)
++            else if ( jk == kcbot(jl) .and. ktype(jl) == 3 ) then
++              zcu(jl,jk) = zcen(jl,jk-1)
++            end if
++            if ( jk < kcbot(jl) .and. jk >= kctop(jl) ) then
++              zerate = pmfu(jl,jk) - pmfu(jl,ik) + pmfude_rate(jl,jk)
++              zderate = pmfude_rate(jl,jk)
++              zmfa = 1./max(cmfcmin,pmfu(jl,jk))
++              zcu(jl,jk) = (zcu(jl,ik)*pmfu(jl,ik) + &
++                zerate*zcen(jl,jk)-zderate*zcu(jl,ik))*zmfa
++            end if
++          end if
++        end do
++      end do
++      if(lmfdd) then
++      do jk = 3 , klev
++        ik = jk - 1
++        do jl = 1,klon
++          if ( ldcum(jl) ) then
++            if ( jk == idtop(jl) ) then
++              zcd(jl,jk) = 0.5*(zcu(jl,jk)+zcen(jl,ik))
++            else if ( jk > idtop(jl) ) then
++              zerate = -pmfd(jl,jk) + pmfd(jl,ik) + pmfdde_rate(jl,jk)
++              zmfa = 1./min(-cmfcmin,pmfd(jl,jk))
++              zcd(jl,jk) = (zcd(jl,ik)*pmfd(jl,ik) - &
++                zerate*zcen(jl,ik)+pmfdde_rate(jl,jk)*zcd(jl,ik))*zmfa
++            end if
++          end if
++        end do
++      end do
++      end if
++      call cududvn(klon,klev,itopm2,ktype,kcbot,kctop, &
++                  ldcum,ztmst,paph,zcen,zcen,zmfuus,zmfdus,zcu,  &
++                  zcd,zcu,zcd,ptrcte,zcdum)
++
+ !  calculate KE dissipation
+       do jl = 1, klon
+         zsum12(jl) = 0.

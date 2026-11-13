@@ -3299,6 +3299,10 @@
                      description="convective downdraft detrainment rate of each layer"
                      packages="cu_ntiedtke_in"/>
 
+		<var name="cu_trc" type="real" dimensions="nVertLevels nCells Time" units="s^{-1}"
+                     description="tendency of the convection scheme's passive test tracer exp(-z/3000 m)"
+                     packages="cu_ntiedtke_in"/>
+
 		<var name="kzh" type="real" dimensions="nVertLevels nCells Time" units="m^{2} s^{-1}"
                      description="vertical diffusion coefficient of potential temperature"
                      packages="bl_mynn_in;bl_ysu_in"/>

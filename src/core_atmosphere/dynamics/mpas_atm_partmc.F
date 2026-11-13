@@ -54,8 +54,9 @@
 !                     and light factors. Dust: flux PMC_DUST_SCALE * 1e-9 * source * u10^2
 !                     (u10 - PMC_DUST_UT) kg m^-2 s^-1 (default threshold 6.5 m/s), sizes from
 !                     Kok (2011). PMC_BIO_SCALE and PMC_DMS_SCALE scale those fluxes.
-!                     Every emitted particle carries source_id = source + 16 * (global cell ID
-!                     of the cell it was emitted in) and its emission time (s since 2000-01-01).
+!                     Every emitted particle carries source_id = source + 16 * region + 256 *
+!                     (global cell ID of the cell it was emitted in) and its emission time (s
+!                     since 2000-01-01); regions as in region_of.
 !   PMC_SEASALT       1 = sea salt particles emitted over open water from the 10-m wind speed
 !                     with the flux of Gong (2003), dry diameters 0.07-10 um; PMC_SEASALT_SCALE
 !                     multiplies it
@@ -424,7 +425,7 @@ module mpas_atm_partmc
    !> sums (variable, level, cell), the number of samples in them and the group of each species.
    integer :: pmc_diag_interval = 0, pmc_diag_every = 5, n_diag_samples = 0
    character(len=256) :: pmc_diag_dir = 'pmc_diag'
-   integer, parameter :: N_DIAG = 21
+   integer, parameter :: N_DIAG = 38, N_REG = 11
    real (kind=RKIND), allocatable :: diag_acc(:,:,:)
    integer, allocatable :: diag_group(:)
    !> Restart files for the particle state: write interval (steps), step to read at start-up,
@@ -3299,7 +3300,7 @@ contains
       ! emissions by source
       integer :: i_sec, i_mo, i_oin, mo_now
       integer, dimension(:), pointer :: indexToCellID
-      real (kind=RKIND), dimension(:), pointer :: latCell, snowh
+      real (kind=RKIND), dimension(:), pointer :: latCell, lonCell_s, snowh
       real (kind=RKIND) :: cur_dg, prof(200), fm, km(N_KIND), g_km(N_KIND), dd, cum
       real (kind=RKIND), dimension(:,:), pointer :: zgrid_s
       real (kind=dp) :: t_now
@@ -3369,6 +3370,7 @@ contains
       call mpas_pool_get_array(mesh, 'indexToCellID', indexToCellID)
       call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
       call mpas_pool_get_array(mesh, 'latCell', latCell)
+      call mpas_pool_get_array(mesh, 'lonCell', lonCell_s)
       call mpas_pool_get_array(mesh, 'zgrid', zgrid_s)
       nullify(snowh)
       call mpas_pool_get_array(sfc_input, 'snowh', snowh)
@@ -3694,7 +3696,7 @@ contains
                emis_sums(7) = emis_sums(7) + w_new * m_new
                kind_mass(4) = kind_mass(4) + w_new * m_new
             end if
-            call aero_particle_set_component(particle, i_kind + SRC_STRIDE * indexToCellID(iCell), t_now)
+            call aero_particle_set_component(particle, source_code(i_kind, iCell), t_now)
             particle%n_primary_parts = 1
             call aero_particle_set_vols(particle, vols)
             call aero_particle_new_id(particle)
@@ -3789,7 +3791,7 @@ contains
             call aero_particle_zero(particle, aero_data)
             vols = 0.0d0
             vols(i_oin) = v_new
-            call aero_particle_set_component(particle, K_DUST + SRC_STRIDE * indexToCellID(iCell), t_now)
+            call aero_particle_set_component(particle, source_code(K_DUST, iCell), t_now)
             particle%n_primary_parts = 1
             call aero_particle_set_vols(particle, vols)
             call aero_particle_new_id(particle)
@@ -3800,6 +3802,16 @@ contains
             call pos_append(pos(1,iCell), x)
          end do
       end subroutine emit_dust
+
+
+      !> source_id of a particle of source i_kind emitted in cell jCell: kind + 16 * region
+      !> + 256 * global cell ID (regions as in region_of).
+      integer function source_code(i_kind, jCell)
+         integer, intent(in) :: i_kind, jCell
+         source_code = i_kind + SRC_STRIDE * region_of(latCell(jCell) * 180.0_RKIND / pii, &
+                                                       lonCell_s(jCell) * 180.0_RKIND / pii) &
+                       + SRC_STRIDE * SRC_STRIDE * indexToCellID(jCell)
+      end function source_code
 #endif
 
    end subroutine atm_partmc_surface
@@ -4268,6 +4280,40 @@ contains
       cc = 1.0d0 + 2.0d0 * lam / d * (1.257d0 + 0.4d0 * exp(-0.55d0 * d / lam))
       settling_velocity = real(rho_p * 9.81d0 * d**2 * cc / (18.0d0 * 1.8d-5), kind=RKIND)
    end function settling_velocity
+
+
+   !> Source region of an emission at latitude lat and longitude lon (degrees): 0 other (and
+   !> ocean), 1 North America, 2 Europe, 3 Russia and northern Asia, 4 East Asia, 5 South Asia,
+   !> 6 Southeast Asia and Oceania, 7 Middle East and Central Asia, 8 Africa, 9 Central and
+   !> South America, 10 Arctic (north of 66 N). Boxes in the spirit of the HTAP regions.
+   integer function region_of(lat, lon_in)
+      real (kind=RKIND), intent(in) :: lat, lon_in
+      real (kind=RKIND) :: lon
+
+      lon = modulo(lon_in + 180.0_RKIND, 360.0_RKIND) - 180.0_RKIND
+      region_of = 0
+      if (lat >= 66.0_RKIND) then
+         region_of = 10
+      else if (lat >= 15.0_RKIND .and. lon >= -170.0_RKIND .and. lon < -50.0_RKIND) then
+         region_of = 1
+      else if (lat >= 35.0_RKIND .and. lon >= -25.0_RKIND .and. lon < 45.0_RKIND) then
+         region_of = 2
+      else if (lat >= 45.0_RKIND .and. lon >= 45.0_RKIND) then
+         region_of = 3
+      else if (lat >= 20.0_RKIND .and. lat < 45.0_RKIND .and. lon >= 95.0_RKIND .and. lon < 150.0_RKIND) then
+         region_of = 4
+      else if (lat >= 5.0_RKIND .and. lat < 35.0_RKIND .and. lon >= 60.0_RKIND .and. lon < 95.0_RKIND) then
+         region_of = 5
+      else if (lat < 20.0_RKIND .and. lat >= -50.0_RKIND .and. lon >= 95.0_RKIND) then
+         region_of = 6
+      else if (lat >= 12.0_RKIND .and. lat < 45.0_RKIND .and. lon >= 35.0_RKIND .and. lon < 95.0_RKIND) then
+         region_of = 7
+      else if (lat >= -35.0_RKIND .and. lat < 37.0_RKIND .and. lon >= -20.0_RKIND .and. lon < 52.0_RKIND) then
+         region_of = 8
+      else if (lat < 15.0_RKIND .and. lat >= -60.0_RKIND .and. lon >= -120.0_RKIND .and. lon < -30.0_RKIND) then
+         region_of = 9
+      end if
+   end function region_of
 
 
    !> Current model month and time in seconds since 2000-01-01 00:00 UTC.
@@ -5298,13 +5344,16 @@ contains
       integer, pointer :: nCellsSolve, nVertLevels, index_qv
       integer :: iCell, k, j, i_s, g, ncid, d_cell, d_lev, d_var, varid
       real (kind=dp) :: nc, d_dry, s_crit, mg(6), m_tot, h_a, h_o, h_h, p, m_nh, m_hy
+      real (kind=dp) :: t_now
+      integer :: mo_d, i_so4_d, i_no3_d, i_nh4_d, src, reg
       type(env_state_t) :: env_state
       real (kind=R4KIND), allocatable :: out(:,:,:), zm(:,:)
       character(len=512) :: fname
       character(len=*), parameter :: var_names = 'num,num_sub,ccn_0p1,ccn_0p3,ccn_1p0,' &
          // 'm_bc,m_dust,m_seasalt,m_pom,m_soa,m_sia,' &
          // 'msub_bc,msub_dust,msub_seasalt,msub_pom,msub_soa,msub_sia,' &
-         // 'mh_a,mh_o,mh_h,m_water'
+         // 'mh_a,mh_o,mh_h,m_water,m_so4,m_no3,m_nh4,mbc_ccn0p1,mbc_ccn0p3,mage_bc,' &
+         // 'mbc_r0,mbc_r1,mbc_r2,mbc_r3,mbc_r4,mbc_r5,mbc_r6,mbc_r7,mbc_r8,mbc_r9,mbc_r10'
 
       if (pmc_n_part <= 0 .or. pmc_diag_interval <= 0) return
 
@@ -5342,6 +5391,10 @@ contains
          call mpas_pool_get_array(state, 'scalars', scalars, 2)
          call mpas_pool_get_array(state, 'theta_m', theta_m, 2)
          call mpas_pool_get_array(diag, 'exner', exner)
+         call model_date(domain, mo_d, t_now)
+         i_so4_d = aero_data_spec_by_name(aero_data, 'SO4')
+         i_no3_d = aero_data_spec_by_name(aero_data, 'NO3')
+         i_nh4_d = aero_data_spec_by_name(aero_data, 'NH4')
          do iCell = 1, nCellsSolve
             do k = 1, nVertLevels
                env_state%temp = theta_m(k,iCell) / (1.0_RKIND + rvord*max(0.0_RKIND, scalars(index_qv,k,iCell))) &
@@ -5362,6 +5415,21 @@ contains
                   if (s_crit <= 0.001d0) diag_acc(3,k,iCell) = diag_acc(3,k,iCell) + nc
                   if (s_crit <= 0.003d0) diag_acc(4,k,iCell) = diag_acc(4,k,iCell) + nc
                   if (s_crit <= 0.010d0) diag_acc(5,k,iCell) = diag_acc(5,k,iCell) + nc
+                  if (i_so4_d > 0) diag_acc(22,k,iCell) = diag_acc(22,k,iCell) + nc &
+                     * aero_states(k,iCell)%apa%particle(j)%vol(i_so4_d) * aero_data%density(i_so4_d)
+                  if (i_no3_d > 0) diag_acc(23,k,iCell) = diag_acc(23,k,iCell) + nc &
+                     * aero_states(k,iCell)%apa%particle(j)%vol(i_no3_d) * aero_data%density(i_no3_d)
+                  if (i_nh4_d > 0) diag_acc(24,k,iCell) = diag_acc(24,k,iCell) + nc &
+                     * aero_states(k,iCell)%apa%particle(j)%vol(i_nh4_d) * aero_data%density(i_nh4_d)
+                  if (mg(1) > 0.0d0) then
+                     if (s_crit <= 0.001d0) diag_acc(25,k,iCell) = diag_acc(25,k,iCell) + nc * mg(1)
+                     if (s_crit <= 0.003d0) diag_acc(26,k,iCell) = diag_acc(26,k,iCell) + nc * mg(1)
+                     src = aero_states(k,iCell)%apa%particle(j)%component(1)%source_id
+                     diag_acc(27,k,iCell) = diag_acc(27,k,iCell) + nc * mg(1) &
+                        * (t_now - aero_states(k,iCell)%apa%particle(j)%component(1)%create_time) / 86400.0d0
+                     reg = min(N_REG - 1, max(0, mod(src / SRC_STRIDE, SRC_STRIDE)))
+                     diag_acc(28 + reg,k,iCell) = diag_acc(28 + reg,k,iCell) + nc * mg(1)
+                  end if
                   diag_acc(6:11,k,iCell) = diag_acc(6:11,k,iCell) + nc * mg
                   diag_acc(21,k,iCell) = diag_acc(21,k,iCell) + nc &
                      * aero_states(k,iCell)%apa%particle(j)%vol(aero_data%i_water) * aero_data%density(aero_data%i_water)

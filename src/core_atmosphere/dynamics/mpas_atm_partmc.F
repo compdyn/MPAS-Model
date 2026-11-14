@@ -351,6 +351,9 @@ module mpas_atm_partmc
    !> Sum of the squares of the single thinning changes (mol^2): the variance of part_s_thin
    !> if the thinning has no bias.
    real (kind=RKIND) :: part_s_thin_var = 0.0_RKIND
+   !> The same for independent coins on the same particles (each particle kept or removed on
+   !> its own), for comparison.
+   real (kind=RKIND) :: part_s_thin_var_ind = 0.0_RKIND
    !> Repeat sample cells' chemistry after another cell to check MOSAIC carries nothing over.
    logical :: pmc_chem_selftest = .false.
    !> Cells (global cell ID and level) whose state is saved in PartMC's own file format before
@@ -2592,6 +2595,10 @@ contains
             end if
             ! sulfate (mol) gained by the doubled particle and lost with the removed one
             s_w = 0.0_RKIND
+            if (jk > 0) part_s_thin_var_ind = part_s_thin_var_ind &
+                 + (particle_sulfate(aero_states(k,iCell)%apa%particle(jk)) * w_sel)**2
+            if (jd > 0) part_s_thin_var_ind = part_s_thin_var_ind &
+                 + (particle_sulfate(aero_states(k,iCell)%apa%particle(jd)) * w_sel)**2
             if (jk > 0) then
                s_w = s_w + particle_sulfate(aero_states(k,iCell)%apa%particle(jk)) * w_sel
                aero_states(k,iCell)%apa%particle(jk)%weight_class = g_sel + 1
@@ -5077,9 +5084,12 @@ contains
                                         (g_sums(1) + g_sums(2) - g_sums(4) - ch4_min)/chem_s0 - 1.0_RKIND/))
          t_local = part_s_thin_var
          call mpas_dmpar_sum_real(domain % dminfo, t_local, ch4_max)
+         t_local = part_s_thin_var_ind
+         call mpas_dmpar_sum_real(domain % dminfo, t_local, ch4_min)
          call mpas_log_write('PartMC chemistry step $i: standard deviation of the thinning sulfate if unbiased ' &
-                             // '= $r mol, / total at start = $r', intArgs=(/itimestep/), &
-                             realArgs=(/sqrt(ch4_max), sqrt(ch4_max)/chem_s0/))
+                             // '= $r mol, / total at start = $r; with independent coins it would be $r', &
+                             intArgs=(/itimestep/), &
+                             realArgs=(/sqrt(ch4_max), sqrt(ch4_max)/chem_s0, sqrt(ch4_min)/chem_s0/))
          call mpas_dmpar_sum_real_array(domain % dminfo, N_GRP, burden, g_burden)
          rem = reshape(rem_mass, (/ 3*N_GRP /))
          call mpas_dmpar_sum_real_array(domain % dminfo, 3*N_GRP, rem, g_rem)

@@ -1864,6 +1864,7 @@ contains
          do iCell = 1, nCellsSolve
             do k = 1, nVertLevels
                do i = 1, pos(k,iCell) % n
+                  if (sum(pos(k,iCell) % x(5:7,i)**2) < 0.5_RKIND) cycle   ! copy made by splitting
                   if (lagr_wind == WIND_SOLID) then
                      xe = solid_rotate(pos(k,iCell) % x(5:7,i), &
                                        2.0_RKIND*pii/test_period * real(itimestep, kind=RKIND)*config_dt)
@@ -2633,7 +2634,9 @@ contains
             call aero_particle_new_id(twin)
             call aero_state_add_particle(aero_states(k,iCell), twin, aero_data)
             call random_in_cell(iCell, k, nCells, nEdgesOnCell, cellsOnCell, xp(1:4))
-            xp(5:7) = pos(k,iCell) % x(5:7,j)
+            ! x(5:7) is the start position for the trajectory test; the copy starts at a random
+            ! point of the cell, so it has no known start and is left out of the test (zero vector)
+            xp(5:7) = 0.0_RKIND
             call pos_append(pos(k,iCell), xp)
             n_split = n_split + 1
          end do

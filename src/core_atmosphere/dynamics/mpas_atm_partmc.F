@@ -431,7 +431,7 @@ module mpas_atm_partmc
    !> sums (variable, level, cell), the number of samples in them and the group of each species.
    integer :: pmc_diag_interval = 0, pmc_diag_every = 5, n_diag_samples = 0
    character(len=256) :: pmc_diag_dir = 'pmc_diag'
-   integer, parameter :: N_DIAG = 42, N_REG = 11
+   integer, parameter :: N_DIAG = 44, N_REG = 11
    real (kind=RKIND), allocatable :: diag_acc(:,:,:)
    integer, allocatable :: diag_group(:)
    !> Restart files for the particle state: write interval (steps), step to read at start-up,
@@ -5428,6 +5428,7 @@ contains
       real (kind=dp) :: nc, d_dry, s_crit, mg(6), m_tot, h_a, h_o, h_h, p, m_nh, m_hy
       real (kind=dp) :: t_now, kap, kv_sum, v_sum, k_cell, a_k, sc_own, sc_int
       integer :: mo_d, i_so4_d, i_no3_d, i_nh4_d, src, reg
+      real (kind=RKIND) :: age_d
       type(env_state_t) :: env_state
       real (kind=R4KIND), allocatable :: out(:,:,:), zm(:,:)
       character(len=512) :: fname
@@ -5436,7 +5437,7 @@ contains
          // 'msub_bc,msub_dust,msub_seasalt,msub_pom,msub_soa,msub_sia,' &
          // 'mh_a,mh_o,mh_h,m_water,m_so4,m_no3,m_nh4,mbc_ccn0p1,mbc_ccn0p3,mage_bc,' &
          // 'mbc_r0,mbc_r1,mbc_r2,mbc_r3,mbc_r4,mbc_r5,mbc_r6,mbc_r7,mbc_r8,mbc_r9,mbc_r10,' &
-         // 'ccnk_0p1,ccnk_0p3,ccni_0p1,ccni_0p3'
+         // 'ccnk_0p1,ccnk_0p3,ccni_0p1,ccni_0p3,mage_bc_ccn0p1,mage_bc_ccn0p3'
 
       if (pmc_n_part <= 0 .or. pmc_diag_interval <= 0) return
 
@@ -5540,8 +5541,12 @@ contains
                      if (s_crit <= 0.001d0) diag_acc(25,k,iCell) = diag_acc(25,k,iCell) + nc * mg(1)
                      if (s_crit <= 0.003d0) diag_acc(26,k,iCell) = diag_acc(26,k,iCell) + nc * mg(1)
                      src = aero_states(k,iCell)%apa%particle(j)%component(1)%source_id
-                     diag_acc(27,k,iCell) = diag_acc(27,k,iCell) + nc * mg(1) &
-                        * (t_now - aero_states(k,iCell)%apa%particle(j)%component(1)%create_time) / 86400.0d0
+                     age_d = (t_now - aero_states(k,iCell)%apa%particle(j)%component(1)%create_time) / 86400.0d0
+                     diag_acc(27,k,iCell) = diag_acc(27,k,iCell) + nc * mg(1) * age_d
+                     ! BC mass times age for the BC that activates: with diag 25-27 the mean
+                     ! ages of activating and non-activating BC
+                     if (s_crit <= 0.001d0) diag_acc(43,k,iCell) = diag_acc(43,k,iCell) + nc * mg(1) * age_d
+                     if (s_crit <= 0.003d0) diag_acc(44,k,iCell) = diag_acc(44,k,iCell) + nc * mg(1) * age_d
                      reg = min(N_REG - 1, max(0, mod(src / SRC_STRIDE, SRC_STRIDE)))
                      diag_acc(28 + reg,k,iCell) = diag_acc(28 + reg,k,iCell) + nc * mg(1)
                   end if

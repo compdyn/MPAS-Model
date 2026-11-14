@@ -22,7 +22,8 @@
 !   PMC_AQCHEM        1 = in-cloud oxidation of SO2 by H2O2 and O3 in the grid-scale cloud water
 !                     (bulk, fixed pH PMC_AQ_PH, default 4.5); the sulfate goes in equal amounts
 !                     to the real particles that activate at supersaturation PMC_AQ_SMAX
-!                     (default 0.002). Needs PMC_MOSAIC=1.
+!                     (default 0.002). Needs PMC_MOSAIC=1. PMC_AQ_TMIN: lowest temperature (K)
+!                     of the liquid cloud water used (default 258.15).
 !   PMC_CHEM_BOX      "id:level,id:level": save these cells (global cell ID and level) before and
 !                     after each of the first PMC_CHEM_BOX_STEPS (60) chemistry steps in
 !                     PartMC's output format, in the directory box/
@@ -300,7 +301,7 @@ module mpas_atm_partmc
    !> In-cloud sulfate: switch, cloud pH, activation supersaturation, and the sulfate (mol)
    !> made by this task since the start of the run via H2O2 and via O3.
    logical :: pmc_aq = .false.
-   real (kind=RKIND) :: pmc_aq_ph = 4.5_RKIND, pmc_aq_smax = 0.002_RKIND, aq_s(2) = 0.0_RKIND
+   real (kind=RKIND) :: pmc_aq_ph = 4.5_RKIND, pmc_aq_tmin = 258.15_RKIND, pmc_aq_smax = 0.002_RKIND, aq_s(2) = 0.0_RKIND
    real (kind=RKIND), parameter :: M_AIR = 82.056e-6_RKIND * 101325.0_RKIND / 287.0_RKIND
    !> Gas emission and dry deposition: files, scale, and the amounts (mol) emitted and
    !> deposited by this task so far for each species.
@@ -567,6 +568,8 @@ contains
       if (stat == 0) pmc_aq = (trim(envval) /= '0')
       call get_environment_variable('PMC_AQ_PH', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_aq_ph
+      call get_environment_variable('PMC_AQ_TMIN', envval, status=stat)
+      if (stat == 0) read(envval, *) pmc_aq_tmin
       call get_environment_variable('PMC_AQ_SMAX', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_aq_smax
       call get_environment_variable('PMC_WET', envval, status=stat)
@@ -4957,7 +4960,7 @@ contains
                ! in-cloud sulfate in the liquid cloud water of the cell
                if (pmc_aq) then
                   qc = max(0.0_RKIND, scalars(index_qc,k,iCell))
-                  if (qc > 1.0e-8_RKIND .and. env_state%temp > 258.15d0) then
+                  if (qc > 1.0e-8_RKIND .and. env_state%temp > pmc_aq_tmin) then
                      f_c = 1.0_RKIND
                      if (associated(cldfrac)) f_c = min(1.0_RKIND, max(0.1_RKIND, cldfrac(k,iCell)))
                      rho_d = rho_zz(k,iCell) * zz(k,iCell)

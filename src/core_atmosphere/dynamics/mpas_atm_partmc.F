@@ -23,7 +23,10 @@
 !                     (bulk, fixed pH PMC_AQ_PH, default 4.5); the sulfate goes in equal amounts
 !                     to the real particles that activate at supersaturation PMC_AQ_SMAX
 !                     (default 0.002). Needs PMC_MOSAIC=1. PMC_AQ_TMIN: lowest temperature (K)
-!                     of the liquid cloud water used (default 258.15).
+!                     of the liquid cloud water used (default 258.15). PMC_AQ_PH < 0: the pH is
+!                     computed in each cloudy cell from the charge balance of the cloud water
+!                     (aq_cloud_ph), in PMC_AQ_NSUB sub-steps (default 4) so that the sulfate made
+!                     lowers it.
 !   PMC_CHEM_BOX      "id:level,id:level": save these cells (global cell ID and level) before and
 !                     after each of the first PMC_CHEM_BOX_STEPS (60) chemistry steps in
 !                     PartMC's output format, in the directory box/
@@ -302,6 +305,10 @@ module mpas_atm_partmc
    !> made by this task since the start of the run via H2O2 and via O3.
    logical :: pmc_aq = .false.
    real (kind=RKIND) :: pmc_aq_ph = 4.5_RKIND, pmc_aq_tmin = 258.15_RKIND, pmc_aq_smax = 0.002_RKIND, aq_s(2) = 0.0_RKIND
+   !> Sums for the mean cloud pH of the step: pH times liquid water volume, the volume, pH times
+   !> the sulfate made, and the sulfate made (since the start of the run)
+   real (kind=RKIND) :: aq_ph(4) = 0.0_RKIND
+   integer :: pmc_aq_nsub = 4
    real (kind=RKIND), parameter :: M_AIR = 82.056e-6_RKIND * 101325.0_RKIND / 287.0_RKIND
    !> Gas emission and dry deposition: files, scale, and the amounts (mol) emitted and
    !> deposited by this task so far for each species.
@@ -570,6 +577,8 @@ contains
       if (stat == 0) read(envval, *) pmc_aq_ph
       call get_environment_variable('PMC_AQ_TMIN', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_aq_tmin
+      call get_environment_variable('PMC_AQ_NSUB', envval, status=stat)
+      if (stat == 0) read(envval, *) pmc_aq_nsub
       call get_environment_variable('PMC_AQ_SMAX', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_aq_smax
       call get_environment_variable('PMC_WET', envval, status=stat)
@@ -4230,13 +4239,13 @@ contains
 
    !> SO2 oxidised in cloud water in a step of dt (s), as mixing ratios (mol/mol) of the
    !> cloudy air: by H2O2 (d_h) and then by O3 (d_o). Bulk scheme of GEOS-Chem's AQCHEM_SO2
-   !> (Seinfeld and Pandis; Jacob 1986) at the fixed pH pmc_aq_ph: Henry's law with the
+   !> (Seinfeld and Pandis; Jacob 1986) at the pH ph: Henry's law with the
    !> dissociation of SO2 and H2O2, the gas fractions left in the gas phase, the H2O2 path as
    !> an exact second-order step (so it stops when SO2 or H2O2 runs out) and the O3 path
    !> first order in the SO2 left. temp (K), pres (Pa), l_c liquid water volume fraction
    !> (m^3/m^3) in the cloud, so2/h2o2/o3 mixing ratios (mol/mol).
-   subroutine aq_sulfate_rate(temp, pres, l_c, dt, so2, h2o2, o3, d_h, d_o)
-      real (kind=RKIND), intent(in) :: temp, pres, l_c, dt, so2, h2o2, o3
+   subroutine aq_sulfate_rate(temp, pres, l_c, dt, so2, h2o2, o3, ph, d_h, d_o)
+      real (kind=RKIND), intent(in) :: temp, pres, l_c, dt, so2, h2o2, o3, ph
       real (kind=RKIND), intent(out) :: d_h, d_o
       real (kind=RKIND), parameter :: R_ATM = 0.08205_RKIND
       real (kind=RKIND) :: x, hp, p_atm, h_so2, ks1, ks2, hs_so2, h_h2o2, kh1, hs_h2o2, h_o3, &
@@ -4246,7 +4255,7 @@ contains
       d_o = 0.0_RKIND
       if (so2 <= 0.0_RKIND .or. l_c <= 0.0_RKIND) return
       x = 298.15_RKIND / temp - 1.0_RKIND
-      hp = 10.0_RKIND**(-pmc_aq_ph)
+      hp = 10.0_RKIND**(-ph)
       p_atm = pres / 101325.0_RKIND
       h_so2 = 1.22_RKIND * exp(10.55_RKIND * x)
       ks1 = 1.30e-2_RKIND * exp(6.75_RKIND * x)
@@ -4284,6 +4293,103 @@ contains
              * hs_so2 * xg_so2 * p_atm * h_o3 * xg_o3 * l_c * R_ATM * temp
       d_o = (so2 - d_h) * (1.0_RKIND - exp(-k_o3 * max(0.0_RKIND, o3) * dt))
    end subroutine aq_sulfate_rate
+
+
+   !> Strong ions of the particles that activate at pmc_aq_smax (taken as dissolved in the cloud
+   !> water), as mol per m^3 of air: a_s = 2 SO4 + NO3 + Cl + MSA - Na - 2 Ca (net strong
+   !> anions; Ca is dust carbonate whose CO2 has gone, so it counts as base) and n_a = NH4.
+   subroutine aq_particle_ions(aero_state, env_state, a_s, n_a)
+      type(aero_state_t), intent(in) :: aero_state
+      type(env_state_t), intent(in) :: env_state
+      real (kind=RKIND), intent(out) :: a_s, n_a
+      integer, save :: ix(7) = -1
+      real (kind=dp), parameter :: z(7) = (/ 2.0d0, 1.0d0, 1.0d0, 1.0d0, -1.0d0, -2.0d0, 0.0d0 /)
+      character(len=3), parameter :: nm(7) = (/ 'SO4', 'NO3', 'Cl ', 'MSA', 'Na ', 'Ca ', 'NH4' /)
+      integer :: j, i
+      real (kind=dp) :: nc, mol
+
+      if (ix(1) < 0) then
+         do i = 1, 7
+            ix(i) = aero_data_spec_by_name(aero_data, trim(nm(i)))
+         end do
+      end if
+      a_s = 0.0_RKIND
+      n_a = 0.0_RKIND
+      do j = 1, aero_state_n_part(aero_state)
+         if (aero_particle_crit_rel_humid(aero_state%apa%particle(j), aero_data, env_state) - 1.0d0 &
+             > pmc_aq_smax) cycle
+         nc = aero_weight_array_num_conc(aero_state%awa, aero_state%apa%particle(j), aero_data)
+         do i = 1, 7
+            if (ix(i) <= 0) cycle
+            mol = aero_state%apa%particle(j)%vol(ix(i)) * aero_data%density(ix(i)) &
+                  / aero_data%molec_weight(ix(i))
+            if (i == 7) then
+               n_a = n_a + real(nc * mol, kind=RKIND)
+            else
+               a_s = a_s + real(z(i) * nc * mol, kind=RKIND)
+            end if
+         end do
+      end do
+   end subroutine aq_particle_ions
+
+
+   !> pH of cloud water from its charge balance,
+   !>   [H+] + [NH4+] = [OH-] + [HSO3-] + 2 [SO3--] + [HCO3-] + A,
+   !> with A the net strong anions (mol per m^3 of air, a_s; HNO3 taken as dissolved), NH3 + NH4
+   !> (mol per m^3 of air, n_t) and SO2 (s_t) shared between gas and drops by Henry's law with
+   !> dissociation, and CO2 at 415 ppm. Solved by bisection in pH between 2 and 7 (the residual
+   !> grows with [H+]). temp (K), pres (Pa), l_c liquid water volume fraction in the cloud.
+   function aq_cloud_ph(temp, pres, l_c, a_s, n_t, s_t) result(ph)
+      real (kind=RKIND), intent(in) :: temp, pres, l_c, a_s, n_t, s_t
+      real (kind=RKIND) :: ph
+      real (kind=RKIND), parameter :: R_ATM = 0.08205_RKIND
+      real (kind=RKIND) :: x, rtl, wl, h_nh3, kb, kw, h_so2, ks1, ks2, h_co2, kc1, p_co2, &
+                           lo, hi, mid, f
+      integer :: it
+
+      x = 298.15_RKIND / temp - 1.0_RKIND
+      rtl = R_ATM * temp * l_c
+      wl = 1000.0_RKIND * l_c                    ! litres of water per m^3 of air
+      h_nh3 = 60.7_RKIND * exp(13.74_RKIND * x)
+      kb = 1.7e-5_RKIND * exp(-14.5_RKIND * x)
+      kw = 1.0e-14_RKIND * exp(-22.52_RKIND * x)
+      h_so2 = 1.22_RKIND * exp(10.55_RKIND * x)
+      ks1 = 1.30e-2_RKIND * exp(6.75_RKIND * x)
+      ks2 = 6.31e-8_RKIND * exp(5.05_RKIND * x)
+      h_co2 = 3.4e-2_RKIND * exp(8.19_RKIND * x)
+      kc1 = 4.3e-7_RKIND * exp(-3.13_RKIND * x)
+      p_co2 = 415.0e-6_RKIND * pres / 101325.0_RKIND
+      lo = 2.0_RKIND
+      hi = 7.0_RKIND
+      do it = 1, 30
+         mid = 0.5_RKIND * (lo + hi)
+         f = ph_residual(10.0_RKIND**(-mid))
+         ! f grows with [H+], i.e. falls with pH
+         if (f > 0.0_RKIND) then
+            lo = mid
+         else
+            hi = mid
+         end if
+      end do
+      ph = 0.5_RKIND * (lo + hi)
+
+   contains
+
+      real (kind=RKIND) function ph_residual(hp)
+         real (kind=RKIND), intent(in) :: hp
+         real (kind=RKIND) :: r, he, nh4, d, so2t, hso3, so3
+         r = kb * hp / kw
+         he = h_nh3 * (1.0_RKIND + r)
+         nh4 = n_t * he * rtl / (1.0_RKIND + he * rtl) / wl * r / (1.0_RKIND + r)
+         d = 1.0_RKIND + ks1 / hp + ks1 * ks2 / hp**2
+         he = h_so2 * d
+         so2t = s_t * he * rtl / (1.0_RKIND + he * rtl) / wl
+         hso3 = so2t * (ks1 / hp) / d
+         so3 = so2t * (ks1 * ks2 / hp**2) / d
+         ph_residual = hp + nh4 - kw / hp - hso3 - 2.0_RKIND * so3 - h_co2 * p_co2 * kc1 / hp - a_s / wl
+      end function ph_residual
+
+   end function aq_cloud_ph
 
 
    !> Give mol (mol) of new sulfate in a cell of volume vol (m^3) to the particles that
@@ -4844,6 +4950,8 @@ contains
       integer, pointer :: index_qc
       integer :: i_h2o2, i_o3
       real (kind=RKIND) :: qc, f_c, l_c, rho_d, d_h, d_o, d_ppb, aq_g(2)
+      real (kind=RKIND) :: temp_r, pres_r, so2_c, h2o2_c, ph_c, c_air, a_ion, n_ion, d_h1, d_o1, aq_phg(4)
+      integer :: n_sub_aq, i_sub_aq, i_nh3, i_hno3
       real (kind=RKIND) :: burden(N_GRP), g_burden(N_GRP), m_grp(N_GRP), rem(3*N_GRP), g_rem(3*N_GRP)
 
       if (.not. pmc_chem .or. pmc_n_part <= 0) return
@@ -4891,6 +4999,8 @@ contains
       i_h2so4 = gas_data_spec_by_name(gas_data, 'H2SO4')
       i_so4 = aero_data_spec_by_name(aero_data, 'SO4')
       i_h2o2 = gas_data_spec_by_name(gas_data, 'H2O2')
+      i_nh3 = gas_data_spec_by_name(gas_data, 'NH3')
+      i_hno3 = gas_data_spec_by_name(gas_data, 'HNO3')
       i_o3 = gas_data_spec_by_name(gas_data, 'O3')
 
       n_cells = 0
@@ -4966,11 +5076,42 @@ contains
                      rho_d = rho_zz(k,iCell) * zz(k,iCell)
                      ! in-cloud liquid water volume fraction, at most 2 g/m^3
                      l_c = min(2.0e-6_RKIND, rho_d * qc / 1000.0_RKIND / f_c)
-                     call aq_sulfate_rate(real(env_state%temp, kind=RKIND), real(env_state%pressure, kind=RKIND), &
-                                          l_c, real(del_t, kind=RKIND), &
-                                          scalars(gas_idx(i_so2),k,iCell) / moist_fac * 1.0e-9_RKIND, &
-                                          scalars(gas_idx(i_h2o2),k,iCell) / moist_fac * 1.0e-9_RKIND, &
-                                          scalars(gas_idx(i_o3),k,iCell) / moist_fac * 1.0e-9_RKIND, d_h, d_o)
+                     temp_r = real(env_state%temp, kind=RKIND)
+                     pres_r = real(env_state%pressure, kind=RKIND)
+                     so2_c = scalars(gas_idx(i_so2),k,iCell) / moist_fac * 1.0e-9_RKIND
+                     h2o2_c = scalars(gas_idx(i_h2o2),k,iCell) / moist_fac * 1.0e-9_RKIND
+                     ph_c = pmc_aq_ph
+                     c_air = pres_r / (8.314_RKIND * temp_r)
+                     n_sub_aq = 1
+                     if (pmc_aq_ph < 0.0_RKIND) then
+                        ! the cloud's own pH: strong ions of the activating particles and HNO3, and
+                        ! NH3 + NH4, per m^3 of air (c_air: mol of air per m^3)
+                        n_sub_aq = max(1, pmc_aq_nsub)
+                        call aq_particle_ions(aero_states(k,iCell), env_state, a_ion, n_ion)
+                        if (i_hno3 > 0) a_ion = a_ion &
+                             + c_air * scalars(gas_idx(i_hno3),k,iCell) / moist_fac * 1.0e-9_RKIND
+                        if (i_nh3 > 0) n_ion = n_ion &
+                             + c_air * scalars(gas_idx(i_nh3),k,iCell) / moist_fac * 1.0e-9_RKIND
+                     end if
+                     d_h = 0.0_RKIND
+                     d_o = 0.0_RKIND
+                     do i_sub_aq = 1, n_sub_aq
+                        if (pmc_aq_ph < 0.0_RKIND) ph_c = aq_cloud_ph(temp_r, pres_r, l_c, &
+                             a_ion + 2.0_RKIND * c_air * (d_h + d_o), n_ion, c_air * so2_c)
+                        call aq_sulfate_rate(temp_r, pres_r, l_c, real(del_t, kind=RKIND) / n_sub_aq, &
+                                             so2_c, h2o2_c, &
+                                             scalars(gas_idx(i_o3),k,iCell) / moist_fac * 1.0e-9_RKIND, ph_c, d_h1, d_o1)
+                        so2_c = max(0.0_RKIND, so2_c - d_h1 - d_o1)
+                        h2o2_c = max(0.0_RKIND, h2o2_c - d_h1)
+                        d_h = d_h + d_h1
+                        d_o = d_o + d_o1
+                        if (i_sub_aq == 1) then
+                           aq_ph(1) = aq_ph(1) + ph_c * l_c * f_c * vol
+                           aq_ph(2) = aq_ph(2) + l_c * f_c * vol
+                        end if
+                        aq_ph(3) = aq_ph(3) + ph_c * (d_h1 + d_o1) * f_c * c_air * vol
+                        aq_ph(4) = aq_ph(4) + (d_h1 + d_o1) * f_c * c_air * vol
+                     end do
                      ! cell means in ppb of dry air
                      d_h = f_c * d_h * 1.0e9_RKIND * moist_fac
                      d_o = f_c * d_o * 1.0e9_RKIND * moist_fac
@@ -5113,6 +5254,12 @@ contains
             call mpas_dmpar_sum_real_array(domain % dminfo, 2, aq_s, aq_g)
             call mpas_log_write('PartMC chemistry step $i: in-cloud sulfate made since the start of this run (mol): ' &
                                 // 'by H2O2 = $r, by O3 = $r', intArgs=(/itimestep/), realArgs=aq_g)
+            call mpas_dmpar_sum_real_array(domain % dminfo, 4, aq_ph, aq_phg)
+            if (aq_phg(2) > 0.0_RKIND .and. aq_phg(4) > 0.0_RKIND) then
+               call mpas_log_write('PartMC chemistry step $i: mean cloud pH since the start of this run, weighted '&
+                                   // 'by liquid water = $r, by sulfate made = $r', intArgs=(/itimestep/), &
+                                   realArgs=(/ aq_phg(1) / aq_phg(2), aq_phg(3) / aq_phg(4) /))
+            end if
          end if
          call mpas_log_write('PartMC chemistry step $i: cells = $i, sulfur (mol) gas = $r, particles = $r, ' &
                              // 'total less net surface input, rel change = $r, particle water (kg) = $r, ' &

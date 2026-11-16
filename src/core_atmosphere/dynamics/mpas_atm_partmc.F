@@ -370,6 +370,13 @@ module mpas_atm_partmc
    !> composition (group masses relative to the class total in the cell), searched among the
    !> next PAIR_WIN particles in dry-mass order.
    integer :: pmc_thin_pair = 0
+   !> Merging in the thinning (PMC_THIN_MERGE = tolerance, 0 = off): a pair whose dry-mass
+   !> fractions of the species groups differ by less than the tolerance (sum of squared
+   !> differences) and whose dry masses are within a factor PMC_THIN_MERGE_R becomes one
+   !> particle of twice the weight with the mean composition, which conserves every species
+   !> exactly. Other pairs keep one of the two at random. Pairs merged and thinned so far.
+   real (kind=RKIND) :: pmc_thin_merge = 0.0_RKIND, pmc_thin_merge_r = 2.0_RKIND
+   real (kind=RKIND) :: n_merged = 0.0_RKIND, n_pairs = 0.0_RKIND
    integer, parameter :: PAIR_WIN = 64
    !> Prescribed oxidants (PMC_OX_FILE): O3 and H2O2 are relaxed toward monthly means (dry
    !> mixing ratio in ppb on the model levels, variables o3 and h2o2 of dimensions month, level,
@@ -570,6 +577,10 @@ contains
       if (stat == 0) pmc_coag = (trim(envval) /= '0')
       call get_environment_variable('PMC_THIN_PAIR', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_thin_pair
+      call get_environment_variable('PMC_THIN_MERGE', envval, status=stat)
+      if (stat == 0) read(envval, *) pmc_thin_merge
+      call get_environment_variable('PMC_THIN_MERGE_R', envval, status=stat)
+      if (stat == 0) read(envval, *) pmc_thin_merge_r
       call get_environment_variable('PMC_OX_FILE', envval, status=stat)
       if (stat == 0) ox_file = envval
       call get_environment_variable('PMC_OX_TAU', envval, status=stat)
@@ -2702,8 +2713,27 @@ contains
             md = 0.0_RKIND
             if (jk > 0) call group_masses(aero_states(k,iCell)%apa%particle(jk), mk)
             if (jd > 0) call group_masses(aero_states(k,iCell)%apa%particle(jd), md)
-            thin_var_g = thin_var_g + ((mk - md) * w_sel)**2
             thin_var_ind_g = thin_var_ind_g + (mk * w_sel)**2 + (md * w_sel)**2
+            if (jk > 0 .and. jd > 0) then
+               n_pairs = n_pairs + 1.0_RKIND
+               if (pmc_thin_merge > 0.0_RKIND .and. sum(mk) > 0.0_RKIND .and. sum(md) > 0.0_RKIND) then
+                  d = sum((mk / sum(mk) - md / sum(md))**2)
+                  kt = max(sum(mk), sum(md)) / min(sum(mk), sum(md))
+                  if (d < pmc_thin_merge .and. kt < pmc_thin_merge_r) then
+                     ! merge: the kept particle takes the mean of the two and twice the weight
+                     aero_states(k,iCell)%apa%particle(jk)%vol = 0.5_RKIND &
+                          * (aero_states(k,iCell)%apa%particle(jk)%vol + aero_states(k,iCell)%apa%particle(jd)%vol)
+                     aero_states(k,iCell)%apa%particle(jk)%weight_class = g_sel + 1
+                     drop(jd) = .true.
+                     n_merged = n_merged + 1.0_RKIND
+                     part_s_thin_var_ind = part_s_thin_var_ind &
+                          + (particle_sulfate(aero_states(k,iCell)%apa%particle(jd)) * w_sel)**2 &
+                          + (particle_sulfate(aero_states(k,iCell)%apa%particle(jk)) * w_sel)**2
+                     cycle
+                  end if
+               end if
+            end if
+            thin_var_g = thin_var_g + ((mk - md) * w_sel)**2
             ! sulfate (mol) gained by the doubled particle and lost with the removed one
             s_w = 0.0_RKIND
             if (jk > 0) part_s_thin_var_ind = part_s_thin_var_ind &
@@ -5506,6 +5536,11 @@ contains
             call mpas_log_write('PartMC chemistry step $i: thinning noise relative to independent coins ' &
                                 // '(pairing $i) BC $r POM $r SO4 $r NO3 $r NH4 $r SOA $r sea salt $r dust $r MSA $r', &
                                 intArgs=(/itimestep, pmc_thin_pair/), realArgs=r)
+            call mpas_dmpar_sum_real(domain % dminfo, n_pairs, v(1))
+            call mpas_dmpar_sum_real(domain % dminfo, n_merged, v(2))
+            call mpas_log_write('PartMC chemistry step $i: thinning pairs so far = $r, merged = $r (tolerance $r, ' &
+                                // 'mass ratio $r)', intArgs=(/itimestep/), &
+                                realArgs=(/v(1), v(2), pmc_thin_merge, pmc_thin_merge_r/))
          end block
          call mpas_dmpar_sum_real_array(domain % dminfo, N_GRP, burden, g_burden)
          rem = reshape(rem_mass, (/ 3*N_GRP /))

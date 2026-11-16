@@ -378,13 +378,13 @@ module mpas_atm_partmc
    real (kind=RKIND) :: pmc_thin_merge = 0.0_RKIND, pmc_thin_merge_r = 2.0_RKIND
    real (kind=RKIND) :: n_merged = 0.0_RKIND, n_pairs = 0.0_RKIND
    integer, parameter :: PAIR_WIN = 64
-   !> Fraction of a weight class thinned at a time (PMC_THIN_FRAC, default 1 = the whole class):
+   !> Fraction of a weight class thinned at a time (PMC_THIN_FRAC, default 0.5; 1 = the whole class):
    !> with f < 1 only the lightest fraction f of the class in dry mass is paired and thinned
    !> (pairing 0 and 2). Which particles are thinned does not depend on the coins, so the
    !> expected content is unchanged, but the heavy particles that carry most of the thinning
    !> noise keep their weight. They stay in the lighter weight classes, so the coarse mode
    !> keeps more computational particles, as with a mass-dependent weight.
-   real (kind=RKIND) :: pmc_thin_frac = 1.0_RKIND
+   real (kind=RKIND) :: pmc_thin_frac = 0.5_RKIND
    !> Prescribed oxidants (PMC_OX_FILE): O3 and H2O2 are relaxed toward monthly means (dry
    !> mixing ratio in ppb on the model levels, variables o3 and h2o2 of dimensions month, level,
    !> cell in global cell order; tools/make_ox.py) with time scale ox_tau (s), or ox_tau_bl in

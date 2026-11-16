@@ -378,6 +378,13 @@ module mpas_atm_partmc
    real (kind=RKIND) :: pmc_thin_merge = 0.0_RKIND, pmc_thin_merge_r = 2.0_RKIND
    real (kind=RKIND) :: n_merged = 0.0_RKIND, n_pairs = 0.0_RKIND
    integer, parameter :: PAIR_WIN = 64
+   !> Fraction of a weight class thinned at a time (PMC_THIN_FRAC, default 1 = the whole class):
+   !> with f < 1 only the lightest fraction f of the class in dry mass is paired and thinned
+   !> (pairing 0 and 2). Which particles are thinned does not depend on the coins, so the
+   !> expected content is unchanged, but the heavy particles that carry most of the thinning
+   !> noise keep their weight. They stay in the lighter weight classes, so the coarse mode
+   !> keeps more computational particles, as with a mass-dependent weight.
+   real (kind=RKIND) :: pmc_thin_frac = 1.0_RKIND
    !> Prescribed oxidants (PMC_OX_FILE): O3 and H2O2 are relaxed toward monthly means (dry
    !> mixing ratio in ppb on the model levels, variables o3 and h2o2 of dimensions month, level,
    !> cell in global cell order; tools/make_ox.py) with time scale ox_tau (s), or ox_tau_bl in
@@ -581,6 +588,8 @@ contains
       if (stat == 0) read(envval, *) pmc_thin_merge
       call get_environment_variable('PMC_THIN_MERGE_R', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_thin_merge_r
+      call get_environment_variable('PMC_THIN_FRAC', envval, status=stat)
+      if (stat == 0) read(envval, *) pmc_thin_frac
       call get_environment_variable('PMC_OX_FILE', envval, status=stat)
       if (stat == 0) ox_file = envval
       call get_environment_variable('PMC_OX_TAU', envval, status=stat)
@@ -2650,6 +2659,9 @@ contains
             sel(b+1) = jt
             key(b+1) = kt
          end do
+         ! thin only the lightest fraction of the class (sorted by dry mass, pairings 0 and 2)
+         if (pmc_thin_frac < 1.0_RKIND .and. pmc_thin_pair /= 1) &
+              m = min(m, max(2, nint(pmc_thin_frac * real(m, RKIND))))
          w_sel = lagr_w * 2.0_RKIND**(g_sel - LAGR_G0)
          drop(1:n) = .false.
          ! the pairs: (sel(a), sel(a+1)) in sorted order, or greedy nearest in composition

@@ -380,6 +380,13 @@ module mpas_atm_partmc
    integer :: ox_month = 0
    real (kind=RKIND), allocatable :: ox_o3(:,:), ox_h2o2(:,:)
    logical :: ox_has_h2o2 = .false.
+   !> In-cloud sulfate in convective updrafts (PMC_AQ_CONV=1): the fraction of each layer's air
+   !> that enters the updraft in a step and reaches liquid cloud (condensation at a level warmer
+   !> than pmc_aq_tmin) before it is detrained, from the convection step; in that air SO2 and
+   !> H2O2 react until one is used up. Sulfate made (mol) by this task so far.
+   logical :: pmc_aq_conv = .false.
+   real (kind=RKIND), allocatable :: conv_aq_frac(:,:)
+   real (kind=RKIND) :: aq_s_conv = 0.0_RKIND
    !> O3 and H2O2 (mol) added by the relaxation since the start of this run, this task.
    real (kind=RKIND) :: ox_added(2) = 0.0_RKIND
    !> Repeat sample cells' chemistry after another cell to check MOSAIC carries nothing over.
@@ -607,6 +614,8 @@ contains
       if (stat == 0) read(envval, *) pmc_aq_ph
       call get_environment_variable('PMC_AQ_TMIN', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_aq_tmin
+      call get_environment_variable('PMC_AQ_CONV', envval, status=stat)
+      if (stat == 0) pmc_aq_conv = (trim(envval) /= '0')
       call get_environment_variable('PMC_AQ_NSUB', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_aq_nsub
       call get_environment_variable('PMC_AQ_SMAX', envval, status=stat)
@@ -3091,6 +3100,10 @@ contains
                f_u(nz), f_d(nz), s_top(nz), out(nz), tsub(nz,nz), tmat(nz,nz), tnew(nz,nz), col(nz))
       n_col = 0
       o_max = 0.0_RKIND
+      if (pmc_aq_conv) then
+         if (.not. allocated(conv_aq_frac)) allocate(conv_aq_frac(nz, nCells))
+         conv_aq_frac = 0.0_RKIND
+      end if
 
       do iCell = 1, nCellsSolve
          if (maxval(cu_mfu(:,iCell)) <= 1.0e-8_RKIND) cycle
@@ -3173,6 +3186,31 @@ contains
                conv_wet(6) = conv_wet(6) + pe * w_cond * areaCell(iCell)
                scav = .not. pmc_wet_diag_only
             end if
+         end if
+
+         ! fraction of the air of each layer that passes through liquid cloud in the updraft:
+         ! the air entrained at j that is still in the updraft at the first level kc with
+         ! condensation (qv(j) > qs(kc)), if kc is warmer than pmc_aq_tmin
+         if (pmc_aq_conv) then
+            do k = 1, nz
+               qv(k) = max(0.0_RKIND, scalars(index_qv,k,iCell))
+               tk(k) = theta_m(k,iCell) / (1.0_RKIND + rvord*qv(k)) * exner(k,iCell)
+               pres = pressure_p(k,iCell) + pressure_base(k,iCell)
+               es = 611.2_RKIND * exp(17.67_RKIND * (tk(k) - 273.15_RKIND) / (tk(k) - 29.65_RKIND))
+               qs(k) = 0.622_RKIND * es / max(pres - es, 1.0_RKIND)
+            end do
+            do j = 1, nz
+               if (e_u(j) <= 0.0_RKIND) cycle
+               pass = min(1.0_RKIND, e_u(j) * config_dt / m(j))
+               do k = j, nz
+                  if (qv(j) > qs(k)) then
+                     if (tk(k) > pmc_aq_tmin) conv_aq_frac(j,iCell) = pass
+                     exit
+                  end if
+                  pass = pass*(1.0_RKIND - f_u(k))
+                  if (pass <= 0.0_RKIND) exit
+               end do
+            end do
          end if
 
          ! one sub-step: column j holds where the air of layer j goes
@@ -5291,6 +5329,25 @@ contains
                   end if
                end if
 
+               ! in-cloud sulfate in the convective updraft: SO2 + H2O2 to completion in the air
+               ! that passes through liquid convective cloud this step
+               if (pmc_aq .and. pmc_aq_conv) then
+                  if (allocated(conv_aq_frac)) then
+                     if (conv_aq_frac(k,iCell) > 0.0_RKIND) then
+                        rho_d = rho_zz(k,iCell) * zz(k,iCell)
+                        d_ppb = conv_aq_frac(k,iCell) * min(scalars(gas_idx(i_so2),k,iCell), &
+                                                            scalars(gas_idx(i_h2o2),k,iCell))
+                        if (d_ppb > 0.0_RKIND) then
+                           scalars(gas_idx(i_so2),k,iCell) = scalars(gas_idx(i_so2),k,iCell) - d_ppb
+                           scalars(gas_idx(i_h2o2),k,iCell) = scalars(gas_idx(i_h2o2),k,iCell) - d_ppb
+                           call add_sulfate(aero_states(k,iCell), env_state, &
+                                            d_ppb * 1.0e-9_RKIND * rho_d * vol / M_AIR, vol)
+                           aq_s_conv = aq_s_conv + d_ppb * 1.0e-9_RKIND * rho_d * vol / M_AIR
+                        end if
+                     end if
+                  end if
+               end if
+
                if (pmc_chem_selftest .and. mod(iCell, 97) == 0 .and. mod(k, 9) == 1) then
                   ! Repeat this cell's step from the saved state after MOSAIC has worked on a
                   ! different cell: MOSAIC keeps its working state in module variables, so this
@@ -5432,6 +5489,11 @@ contains
             call mpas_dmpar_sum_real_array(domain % dminfo, 2, aq_s, aq_g)
             call mpas_log_write('PartMC chemistry step $i: in-cloud sulfate made since the start of this run (mol): ' &
                                 // 'by H2O2 = $r, by O3 = $r', intArgs=(/itimestep/), realArgs=aq_g)
+            if (pmc_aq_conv) then
+               call mpas_dmpar_sum_real(domain % dminfo, aq_s_conv, t_local)
+               call mpas_log_write('PartMC chemistry step $i: convective in-cloud sulfate made since the start of ' &
+                                   // 'this run = $r mol', intArgs=(/itimestep/), realArgs=(/t_local/))
+            end if
             call mpas_dmpar_sum_real_array(domain % dminfo, 4, aq_ph, aq_phg)
             if (aq_phg(2) > 0.0_RKIND .and. aq_phg(4) > 0.0_RKIND) then
                call mpas_log_write('PartMC chemistry step $i: mean cloud pH since the start of this run, weighted '&

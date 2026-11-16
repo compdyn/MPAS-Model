@@ -5719,10 +5719,13 @@ contains
                call mpas_log_write('PartMC sulfur budget step $i band $i (mol S since the start of this run): ' &
                                    // 'gas burden start $r now $r, particle burden start $r now $r, emitted $r, ' &
                                    // 'gas dry dep $r, gas wet dep $r, SO2 gas-phase oxidation $r, condensation $r, ' &
-                                   // 'in-cloud grid $r, in-cloud convective $r, particle dry dep $r, wet grid $r, ' &
-                                   // 'wet convective $r, thinning $r, transport in gas $r, particles $r', &
+                                   // 'in-cloud grid $r, in-cloud convective $r', &
                                    intArgs=(/itimestep, ib/), &
-                                   realArgs=(/s_burd0(1,ib), gb(1,ib), s_burd0(2,ib), gb(2,ib), gs(:,ib), tr_g, tr_p/))
+                                   realArgs=(/s_burd0(1,ib), gb(1,ib), s_burd0(2,ib), gb(2,ib), gs(1:SB_AQC,ib)/))
+               ! the log truncates long lines, so the rest goes on a second one
+               call mpas_log_write('PartMC sulfur budget step $i band $i, continued: particle dry dep $r, wet grid ' &
+                                   // '$r, wet convective $r, thinning $r, transport in gas $r, particles $r', &
+                                   intArgs=(/itimestep, ib/), realArgs=(/gs(SB_PDRY:N_SB,ib), tr_g, tr_p/))
             end do
          end block
          call mpas_log_write('PartMC chemistry step $i: cells = $i, sulfur (mol) gas = $r, particles = $r, ' &

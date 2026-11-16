@@ -379,6 +379,7 @@ module mpas_atm_partmc
    real (kind=RKIND) :: ox_tau = 172800.0_RKIND, ox_tau_bl = -1.0_RKIND, ox_zbl = 1500.0_RKIND
    integer :: ox_month = 0
    real (kind=RKIND), allocatable :: ox_o3(:,:), ox_h2o2(:,:)
+   logical :: ox_has_h2o2 = .false.
    !> O3 and H2O2 (mol) added by the relaxation since the start of this run, this task.
    real (kind=RKIND) :: ox_added(2) = 0.0_RKIND
    !> Repeat sample cells' chemistry after another cell to check MOSAIC carries nothing over.
@@ -3390,8 +3391,13 @@ contains
       if (.not. allocated(ox_o3)) allocate(ox_o3(nVertLevels, size(indexToCellID)), &
                                             ox_h2o2(nVertLevels, size(indexToCellID)))
       call nc_check(nf90_open(trim(ox_file), NF90_NOWRITE, ncid), 'open ' // trim(ox_file))
+      ox_has_h2o2 = .false.
       do v = 1, 2
-         call nc_check(nf90_inq_varid(ncid, trim(vname(v)), varid), 'find ' // trim(vname(v)))
+         if (nf90_inq_varid(ncid, trim(vname(v)), varid) /= NF90_NOERR) then
+            if (v == 1) call nc_check(nf90_inq_varid(ncid, trim(vname(v)), varid), 'find o3')
+            cycle
+         end if
+         if (v == 2) ox_has_h2o2 = .true.
          call nc_check(nf90_inquire_variable(ncid, varid, dimids=dimids), 'inquire ' // trim(vname(v)))
          call nc_check(nf90_inquire_dimension(ncid, dimids(1), len=n_glob), 'cells of ' // trim(vname(v)))
          allocate(glob(n_glob, nVertLevels))
@@ -3408,8 +3414,8 @@ contains
       end do
       call nc_check(nf90_close(ncid), 'close ' // trim(ox_file))
       ox_month = month
-      call mpas_log_write('PartMC: O3 and H2O2 relaxed toward month $i of ' // trim(ox_file) &
-                          // ', time scale $r s ($r s in the lowest $r m)', intArgs=(/month/), &
+      call mpas_log_write('PartMC: O3 (and H2O2 if in the file: $l) relaxed toward month $i of ' // trim(ox_file) &
+                          // ', time scale $r s ($r s in the lowest $r m)', intArgs=(/month/), logicArgs=(/ox_has_h2o2/), &
                           realArgs=(/ox_tau, merge(ox_tau_bl, ox_tau, ox_tau_bl > 0.0_RKIND), ox_zbl/))
 #endif
    end subroutine ox_read
@@ -5173,10 +5179,12 @@ contains
                d_ppb = t_local * (ox_o3(k,iCell) * moist_fac - scalars(j,k,iCell))
                scalars(j,k,iCell) = scalars(j,k,iCell) + d_ppb
                ox_added(1) = ox_added(1) + d_ppb / moist_fac * c_air
-               j = gas_idx(i_h2o2)
-               d_ppb = t_local * (ox_h2o2(k,iCell) * moist_fac - scalars(j,k,iCell))
-               scalars(j,k,iCell) = scalars(j,k,iCell) + d_ppb
-               ox_added(2) = ox_added(2) + d_ppb / moist_fac * c_air
+               if (ox_has_h2o2) then
+                  j = gas_idx(i_h2o2)
+                  d_ppb = t_local * (ox_h2o2(k,iCell) * moist_fac - scalars(j,k,iCell))
+                  scalars(j,k,iCell) = scalars(j,k,iCell) + d_ppb
+                  ox_added(2) = ox_added(2) + d_ppb / moist_fac * c_air
+               end if
             end if
 
             if (env_state%altitude < pmc_chem_top) then

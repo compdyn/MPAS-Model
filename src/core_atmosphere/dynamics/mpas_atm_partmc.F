@@ -356,6 +356,14 @@ module mpas_atm_partmc
    !> Net sulfate (mol) added to the particles by the thinning of the population control
    !> since the start of this run (not kept over restarts). Zero in expectation.
    real (kind=RKIND) :: part_s_thin = 0.0_RKIND
+   !> Sulfur budget by latitude band (1 south of the equator, 2 0-40N, 3 40-66N, 4 north of 66N)
+   !> since the start of this run (mol of S, summed by this task): the terms SB_* below. The
+   !> band of each owned cell, and the global burdens (gas S, particle sulfate) by band at the
+   !> first check of this run.
+   integer, parameter :: SB_EMIT = 1, SB_GDRY = 2, SB_GWET = 3, SB_GOX = 4, SB_COND = 5, SB_AQ = 6, &
+                         SB_AQC = 7, SB_PDRY = 8, SB_PWET = 9, SB_PWETC = 10, SB_THIN = 11, N_SB = 11
+   real (kind=RKIND) :: s_bud(N_SB,4) = 0.0_RKIND, s_burd0(2,4) = -1.0_RKIND
+   integer, allocatable :: band_of(:)
    !> Sum of the squares of the single thinning changes (mol^2): the variance of part_s_thin
    !> if the thinning has no bias.
    real (kind=RKIND) :: part_s_thin_var = 0.0_RKIND
@@ -795,6 +803,11 @@ contains
          call mpas_pool_get_array(mesh, 'latCell', latCell)
          call mpas_pool_get_array(mesh, 'lonCell', lonCell)
          call mpas_pool_get_array(mesh, 'zgrid', zgrid)
+         if (allocated(band_of)) deallocate(band_of)
+         allocate(band_of(nCells))
+         do iCell = 1, nCells
+            band_of(iCell) = sulfur_band(latCell(iCell))
+         end do
          call mpas_pool_get_array(state, 'scalars', scalars, 1)
 
          if (maxval(scalars(index_pmc_ref,:,1:nCells)) <= 0.0_RKIND) then
@@ -2787,6 +2800,7 @@ contains
                drop(jd) = .true.
             end if
             part_s_thin = part_s_thin + s_w
+            s_bud(SB_THIN, band_of(iCell)) = s_bud(SB_THIN, band_of(iCell)) + s_w
             part_s_thin_var = part_s_thin_var + s_w**2
          end do
          ! remove from the end down: the particle moved into a freed slot comes from beyond it
@@ -3007,7 +3021,7 @@ contains
                conv_wet(3) = conv_wet(3) + p_rem(k) * w
                if (pmc_random() < p_rem(k)) then
                   conv_wet(2) = conv_wet(2) + w
-                  call note_removal(aero_states(k,iCell)%apa%particle(j), w, 3)
+                  call note_removal(aero_states(k,iCell)%apa%particle(j), w, 3, band_of(iCell))
                   call aero_state_remove_particle_no_info(aero_states(k,iCell), j)
                   call pos_remove(pos(k,iCell), j)
                   cycle
@@ -3406,6 +3420,8 @@ contains
                if (gas_of(i_s) > 0) then
                   gas_wetdep(gas_of(i_s)) = gas_wetdep(gas_of(i_s)) &
                                             + lost * 1.0e-9_RKIND / M_AIR * areaCell(iCell)
+                  if (is_sulfur_gas(gas_of(i_s))) s_bud(SB_GWET, band_of(iCell)) = s_bud(SB_GWET, band_of(iCell)) &
+                       + lost * 1.0e-9_RKIND / M_AIR * areaCell(iCell)
                end if
             end if
          end do
@@ -3830,7 +3846,7 @@ contains
                drydep_sums(4) = drydep_sums(4) + w
                if (pmc_random() >= p_dep) cycle
                drydep_sums(2) = drydep_sums(2) + w
-               call note_removal(aero_states(1,iCell)%apa%particle(j), w, 1)
+               call note_removal(aero_states(1,iCell)%apa%particle(j), w, 1, band_of(iCell))
                call aero_state_remove_particle_no_info(aero_states(1,iCell), j)
                call pos_remove(pos(1,iCell), j)
             end do
@@ -3845,7 +3861,8 @@ contains
                   if (pmc_random() >= p_dep) cycle
                   g = aero_states(1,iCell)%apa%particle(j)%weight_class
                   surf_sums(4) = surf_sums(4) + lagr_w * 2.0_RKIND**(g - LAGR_G0)
-                  call note_removal(aero_states(1,iCell)%apa%particle(j), lagr_w * 2.0_RKIND**(g - LAGR_G0), 1)
+                  call note_removal(aero_states(1,iCell)%apa%particle(j), lagr_w * 2.0_RKIND**(g - LAGR_G0), 1, &
+                                    band_of(iCell))
                   call aero_state_remove_particle_no_info(aero_states(1,iCell), j)
                   call pos_remove(pos(1,iCell), j)
                end do
@@ -4449,6 +4466,8 @@ contains
             amount = frac * scalars(gas_idx,1,iCell)
             scalars(gas_idx,1,iCell) = scalars(gas_idx,1,iCell) - amount
             gas_deposited = gas_deposited + amount * 1.0e-9_RKIND * air1 * areaCell(iCell)
+            s_bud(SB_GDRY, band_of(iCell)) = s_bud(SB_GDRY, band_of(iCell)) &
+                 + sulfur_gas_sum(amount) * 1.0e-9_RKIND * air1 * areaCell(iCell)
          end if
          if (allocated(gas_emit_states) .and. associated(landmask)) then
             if (landmask(iCell) == 1) then
@@ -4462,6 +4481,7 @@ contains
                   scalars(gas_idx,k,iCell) = scalars(gas_idx,k,iCell) + amount / air_emit * 1.0e9_RKIND
                end do
                gas_emitted = gas_emitted + amount * areaCell(iCell)
+               s_bud(SB_EMIT, band_of(iCell)) = s_bud(SB_EMIT, band_of(iCell)) + sulfur_gas_sum(amount) * areaCell(iCell)
             end if
          end if
          if (allocated(emis_gas)) then
@@ -4475,6 +4495,7 @@ contains
                scalars(gas_idx,k,iCell) = scalars(gas_idx,k,iCell) + amount / air_emit * 1.0e9_RKIND
             end do
             gas_emitted = gas_emitted + amount * areaCell(iCell)
+            s_bud(SB_EMIT, band_of(iCell)) = s_bud(SB_EMIT, band_of(iCell)) + sulfur_gas_sum(amount) * areaCell(iCell)
          end if
       end do
 
@@ -4819,14 +4840,15 @@ contains
 
 
    !> Book the removal of a computational particle standing for w real particles by process
-   !> proc (1 dry deposition, 2 grid-scale wet, 3 convective wet).
-   subroutine note_removal(particle, w, proc)
+   !> proc (1 dry deposition, 2 grid-scale wet, 3 convective wet) in latitude band ib.
+   subroutine note_removal(particle, w, proc, ib)
       type(aero_particle_t), intent(in) :: particle
       real (kind=RKIND), intent(in) :: w
-      integer, intent(in) :: proc
+      integer, intent(in) :: proc, ib
       real (kind=RKIND) :: m(N_GRP)
 
       part_s_removed = part_s_removed + particle_sulfate(particle) * w
+      s_bud(SB_PDRY + proc - 1, ib) = s_bud(SB_PDRY + proc - 1, ib) + particle_sulfate(particle) * w
       call group_masses(particle, m)
       rem_mass(:,proc) = rem_mass(:,proc) + m * w
    end subroutine note_removal
@@ -4841,6 +4863,60 @@ contains
       particle_sulfate = 0.0_RKIND
       if (i_so4 > 0) particle_sulfate = particle%vol(i_so4) * aero_data%density(i_so4) / aero_data%molec_weight(i_so4)
    end function particle_sulfate
+
+
+   !> Latitude band of the sulfur budget for a latitude in radians: 1 south of the equator,
+   !> 2 0-40N, 3 40-66N, 4 north of 66N.
+   integer function sulfur_band(lat)
+      real (kind=RKIND), intent(in) :: lat
+      real (kind=RKIND) :: d
+      d = lat * 180.0_RKIND / pii
+      if (d < 0.0_RKIND) then
+         sulfur_band = 1
+      else if (d < 40.0_RKIND) then
+         sulfur_band = 2
+      else if (d < 66.0_RKIND) then
+         sulfur_band = 3
+      else
+         sulfur_band = 4
+      end if
+   end function sulfur_band
+
+
+   !> Whether gas species j (index in gas_data) carries sulfur that the budget counts (SO2, H2SO4).
+   logical function is_sulfur_gas(j)
+      integer, intent(in) :: j
+      integer, save :: j_so2 = -1, j_h2so4 = -1
+      if (j_so2 < 0) then
+         j_so2 = gas_data_spec_by_name(gas_data, 'SO2')
+         j_h2so4 = gas_data_spec_by_name(gas_data, 'H2SO4')
+      end if
+      is_sulfur_gas = (j > 0 .and. (j == j_so2 .or. j == j_h2so4))
+   end function is_sulfur_gas
+
+
+   !> SO2 plus H2SO4 of an array over the gas species.
+   real (kind=RKIND) function sulfur_gas_sum(a)
+      real (kind=RKIND), intent(in) :: a(:)
+      integer :: j
+      sulfur_gas_sum = 0.0_RKIND
+      do j = 1, size(a)
+         if (is_sulfur_gas(j)) sulfur_gas_sum = sulfur_gas_sum + a(j)
+      end do
+   end function sulfur_gas_sum
+
+
+   !> Particle sulfate (mol) in a cell of volume vol (m3).
+   real (kind=RKIND) function cell_sulfate(state, vol)
+      type(aero_state_t), intent(in) :: state
+      real (kind=RKIND), intent(in) :: vol
+      integer :: j
+      cell_sulfate = 0.0_RKIND
+      do j = 1, aero_state_n_part(state)
+         cell_sulfate = cell_sulfate + particle_sulfate(state%apa%particle(j)) &
+                        * aero_weight_array_num_conc(state%awa, state%apa%particle(j), aero_data) * vol
+      end do
+   end function cell_sulfate
 
 
    !> Dry mass of a particle (kg): total mass less water.
@@ -5106,6 +5182,8 @@ contains
                amount = gas_wet_frac * p * scalars(gas_idx,k,iCell)
                scalars(gas_idx,k,iCell) = scalars(gas_idx,k,iCell) - amount
                gas_wetdep = gas_wetdep + amount * 1.0e-9_RKIND * mk / M_AIR * areaCell(iCell)
+               s_bud(SB_GWET, band_of(iCell)) = s_bud(SB_GWET, band_of(iCell)) &
+                    + sulfur_gas_sum(amount) * 1.0e-9_RKIND * mk / M_AIR * areaCell(iCell)
             end if
 #endif
             if (pmc_n_part <= 0 .or. pmc_mode /= MODE_LAGR) cycle
@@ -5125,7 +5203,7 @@ contains
                g = aero_states(k,iCell)%apa%particle(j)%weight_class
                w = lagr_w * 2.0_RKIND**(g - LAGR_G0)
                wet_sums(2) = wet_sums(2) + w
-               call note_removal(aero_states(k,iCell)%apa%particle(j), w, 2)
+               call note_removal(aero_states(k,iCell)%apa%particle(j), w, 2, band_of(iCell))
                call aero_state_remove_particle_no_info(aero_states(k,iCell), j)
                call pos_remove(pos(k,iCell), j)
                removed = .true.
@@ -5202,6 +5280,7 @@ contains
       character (len=StrKIND), pointer :: config_start_time
       integer, pointer :: nCellsSolve, nVertLevels, index_qv
       integer :: iCell, k, j, n_before, n_cells, g_n_cells, n_gas, yr, mo, dy, hr, mi, sc, i_so2, i_h2so4, i_so4
+      real (kind=RKIND) :: so2_pre, so4_pre, s_burd(2,4)
       integer, parameter :: days_before(12) = (/ 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 /)
       type(spec_file_t) :: file
       type(env_state_t) :: env_state
@@ -5291,6 +5370,7 @@ contains
 
       n_cells = 0
       sums = 0.0_RKIND
+      s_burd = 0.0_RKIND
       burden = 0.0_RKIND
       test_sums = 0.0_RKIND
       n_test = 0
@@ -5358,7 +5438,11 @@ contains
                                     gas_data, gas_state, env_state, itimestep, env_state%elapsed_time, del_t, 1, &
                                     .false., .false., uuid)
                end if
+               so2_pre = scalars(gas_idx(i_so2),k,iCell)
+               so4_pre = cell_sulfate(aero_states(k,iCell), vol)
                call mosaic_timestep(env_state, aero_data, aero_states(k,iCell), gas_data, gas_state, .false., uuid)
+               s_bud(SB_COND, band_of(iCell)) = s_bud(SB_COND, band_of(iCell)) &
+                    + cell_sulfate(aero_states(k,iCell), vol) - so4_pre
                if (i_box > 0) then
                   call output_state(trim(box_prefix) // '_post', OUTPUT_TYPE_DIST, aero_data_box, aero_states(k,iCell), &
                                     gas_data, gas_state, env_state, itimestep, env_state%elapsed_time, del_t, 1, &
@@ -5369,6 +5453,9 @@ contains
                                       messageType=MPAS_LOG_CRIT)
                end if
                scalars(gas_idx,k,iCell) = gas_state%mix_rat * moist_fac
+               s_bud(SB_GOX, band_of(iCell)) = s_bud(SB_GOX, band_of(iCell)) &
+                    + (so2_pre - scalars(gas_idx(i_so2),k,iCell)) * 1.0e-9_RKIND * rho_zz(k,iCell) * zz(k,iCell) &
+                      * vol / M_AIR
                n_cells = n_cells + 1
 
                ! in-cloud sulfate in the liquid cloud water of the cell
@@ -5427,6 +5514,8 @@ contains
                         scalars(gas_idx(i_h2o2),k,iCell) = max(0.0_RKIND, scalars(gas_idx(i_h2o2),k,iCell) - d_h)
                         call add_sulfate(aero_states(k,iCell), env_state, d_ppb * 1.0e-9_RKIND * rho_d * vol / M_AIR, vol)
                         aq_s(1) = aq_s(1) + d_h * 1.0e-9_RKIND * rho_d * vol / M_AIR
+                        s_bud(SB_AQ, band_of(iCell)) = s_bud(SB_AQ, band_of(iCell)) &
+                             + d_ppb * 1.0e-9_RKIND * rho_d * vol / M_AIR
                         aq_s(2) = aq_s(2) + d_o * 1.0e-9_RKIND * rho_d * vol / M_AIR
                      end if
                   end if
@@ -5446,6 +5535,8 @@ contains
                            call add_sulfate(aero_states(k,iCell), env_state, &
                                             d_ppb * 1.0e-9_RKIND * rho_d * vol / M_AIR, vol)
                            aq_s_conv = aq_s_conv + d_ppb * 1.0e-9_RKIND * rho_d * vol / M_AIR
+                           s_bud(SB_AQC, band_of(iCell)) = s_bud(SB_AQC, band_of(iCell)) &
+                                + d_ppb * 1.0e-9_RKIND * rho_d * vol / M_AIR
                         end if
                      end if
                   end if
@@ -5498,6 +5589,10 @@ contains
                ! sulfur (mol): gas, then particles
                sums(1) = sums(1) + (scalars(gas_idx(i_so2),k,iCell) + scalars(gas_idx(i_h2so4),k,iCell)) * 1.0d-9 &
                                    * rho_zz(k,iCell) * zz(k,iCell) * vol / M_AIR
+               s_burd(1, band_of(iCell)) = s_burd(1, band_of(iCell)) &
+                    + (scalars(gas_idx(i_so2),k,iCell) + scalars(gas_idx(i_h2so4),k,iCell)) * 1.0d-9 &
+                      * rho_zz(k,iCell) * zz(k,iCell) * vol / M_AIR
+               s_burd(2, band_of(iCell)) = s_burd(2, band_of(iCell)) + cell_sulfate(aero_states(k,iCell), vol)
                do j = 1, aero_state_n_part(aero_states(k,iCell))
                   sums(2) = sums(2) + aero_states(k,iCell)%apa%particle(j)%vol(i_so4) &
                                       * aero_data%density(i_so4) / aero_data%molec_weight(i_so4) &
@@ -5609,6 +5704,27 @@ contains
                                    realArgs=(/ aq_phg(1) / aq_phg(2), aq_phg(3) / aq_phg(4) /))
             end if
          end if
+         block
+            real (kind=RKIND) :: gb(2,4), gs(N_SB,4), tr_g, tr_p
+            integer :: ib
+            call mpas_dmpar_sum_real_array(domain % dminfo, 8, reshape(s_burd, (/8/)), gb)
+            call mpas_dmpar_sum_real_array(domain % dminfo, 4*N_SB, reshape(s_bud, (/4*N_SB/)), gs)
+            if (s_burd0(1,1) < 0.0_RKIND) s_burd0 = gb
+            do ib = 1, 4
+               ! transport into the band: the change of the burden less the local terms
+               tr_g = gb(1,ib) - s_burd0(1,ib) - gs(SB_EMIT,ib) + gs(SB_GDRY,ib) + gs(SB_GWET,ib) &
+                      + gs(SB_COND,ib) + gs(SB_AQ,ib) + gs(SB_AQC,ib)
+               tr_p = gb(2,ib) - s_burd0(2,ib) - gs(SB_COND,ib) - gs(SB_AQ,ib) - gs(SB_AQC,ib) &
+                      + gs(SB_PDRY,ib) + gs(SB_PWET,ib) + gs(SB_PWETC,ib) - gs(SB_THIN,ib)
+               call mpas_log_write('PartMC sulfur budget step $i band $i (mol S since the start of this run): ' &
+                                   // 'gas burden start $r now $r, particle burden start $r now $r, emitted $r, ' &
+                                   // 'gas dry dep $r, gas wet dep $r, SO2 gas-phase oxidation $r, condensation $r, ' &
+                                   // 'in-cloud grid $r, in-cloud convective $r, particle dry dep $r, wet grid $r, ' &
+                                   // 'wet convective $r, thinning $r, transport in gas $r, particles $r', &
+                                   intArgs=(/itimestep, ib/), &
+                                   realArgs=(/s_burd0(1,ib), gb(1,ib), s_burd0(2,ib), gb(2,ib), gs(:,ib), tr_g, tr_p/))
+            end do
+         end block
          call mpas_log_write('PartMC chemistry step $i: cells = $i, sulfur (mol) gas = $r, particles = $r, ' &
                              // 'total less net surface input, rel change = $r, particle water (kg) = $r, ' &
                              // 'slowest task = $r s', &

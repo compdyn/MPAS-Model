@@ -385,6 +385,9 @@ module mpas_atm_partmc
    !> than pmc_aq_tmin) before it is detrained, from the convection step; in that air SO2 and
    !> H2O2 react until one is used up. Sulfate made (mol) by this task so far.
    logical :: pmc_aq_conv = .false.
+   !> Months of the monthly emission fields (fires, DMS) held in slots 1 and 2: the month of
+   !> the model date when the emissions are first read, and the next month. 0 until read.
+   integer :: emis_mo(2) = 0
    real (kind=RKIND), allocatable :: conv_aq_frac(:,:)
    real (kind=RKIND) :: aq_s_conv = 0.0_RKIND
    !> O3 and H2O2 (mol) added by the relaxation since the start of this run, this task.
@@ -3459,6 +3462,34 @@ contains
    end subroutine ox_read
 
 
+   !> Read the monthly field prefix_MM of the emissions file for slot ib (month emis_mo(ib)). An
+   !> older file with only some months (the first runs had 02 and 03): the nearest month it has
+   !> is used instead, and the substitution is logged.
+   subroutine emis_read_month(domain, prefix, ib, vals, found)
+      type (domain_type), intent(inout) :: domain
+      character(len=*), intent(in) :: prefix
+      integer, intent(in) :: ib
+      real (kind=RKIND), intent(out) :: vals(:)
+      logical, intent(out) :: found
+      character(len=2) :: mm
+      integer :: d, m, sgn
+
+      do d = 0, 6
+         do sgn = 1, -1, -2
+            if (d == 0 .and. sgn == -1) cycle
+            m = modulo(emis_mo(ib) - 1 + sgn*d, 12) + 1
+            write(mm, '(i2.2)') m
+            call emis_read(domain, prefix // '_' // mm, vals, found)
+            if (found) then
+               if (d > 0) call mpas_log_write('PartMC: no ' // prefix // ' for month $i in the emissions file; ' &
+                                              // 'month $i used', intArgs=(/emis_mo(ib), m/))
+               return
+            end if
+         end do
+      end do
+   end subroutine emis_read_month
+
+
    !> Read one variable of the emissions file (a value for every cell of the mesh, in global
    !> cell order) for the owned cells. found is false if the file has no such variable.
    subroutine emis_read(domain, name, vals, found)
@@ -3622,8 +3653,9 @@ contains
       call mpas_pool_get_array(mesh, 'zgrid', zgrid_s)
       nullify(snowh)
       call mpas_pool_get_array(sfc_input, 'snowh', snowh)
-      ! the months held for fires and DMS are February and March
-      i_mo = merge(1, 2, mo_now <= 2)
+      ! the months held for fires and DMS: that of the first emission step and the next
+      if (emis_mo(1) == 0) emis_mo = (/ mo_now, modulo(mo_now, 12) + 1 /)
+      i_mo = merge(1, 2, mo_now == emis_mo(1))
       cur_dg = carb_dg
 
       if (len_trim(emis_file) > 0 .and. .not. emis_part_read) then
@@ -3647,9 +3679,9 @@ contains
                sec_oc(:,i_sec) = max(0.0_RKIND, cell_vals) * emis_scale
             end do
             do ib = 1, 2
-               call emis_read(domain, 'bc_bb_0' // char(ichar('1') + ib), cell_vals, found)
+               call emis_read_month(domain, 'bc_bb', ib, cell_vals, found)
                bb_bc(:,ib) = max(0.0_RKIND, cell_vals) * emis_scale
-               call emis_read(domain, 'oc_bb_0' // char(ichar('1') + ib), cell_vals, found)
+               call emis_read_month(domain, 'oc_bb', ib, cell_vals, found)
                bb_oc(:,ib) = max(0.0_RKIND, cell_vals) * emis_scale
             end do
             call emis_read(domain, 'dust_src', cell_vals, found)
@@ -4250,13 +4282,16 @@ contains
                allocate(gas_bb(n_gas, nCellsSolve, 2), dms_w(nCellsSolve, 2), isop_ef(nCellsSolve), &
                         mterp_ef(nCellsSolve))
                gas_bb = 0.0_RKIND
+               if (emis_mo(1) == 0) then
+                  call model_date(domain, mo_now, t_now)
+                  emis_mo = (/ mo_now, modulo(mo_now, 12) + 1 /)
+               end if
                do ib = 1, 2
                   do j = 1, n_gas
-                     call emis_read(domain, 'gas_bb_' // trim(gas_data%name(j)) // '_0' // char(ichar('1') + ib), &
-                                    cell_vals, found)
+                     call emis_read_month(domain, 'gas_bb_' // trim(gas_data%name(j)), ib, cell_vals, found)
                      if (found) gas_bb(j,:,ib) = max(0.0_RKIND, cell_vals) * emis_scale
                   end do
-                  call emis_read(domain, 'dms_0' // char(ichar('1') + ib), cell_vals, found)
+                  call emis_read_month(domain, 'dms', ib, cell_vals, found)
                   dms_w(:,ib) = max(0.0_RKIND, cell_vals)
                end do
                call emis_read(domain, 'isop_ef', cell_vals, found)
@@ -4293,7 +4328,7 @@ contains
       extra = 0.0_RKIND
       if (allocated(gas_bb)) then
          call model_date(domain, mo_now, t_now)
-         i_mo = merge(1, 2, mo_now <= 2)
+         i_mo = merge(1, 2, mo_now == emis_mo(1))
          call mpas_pool_get_subpool(domain % blocklist % structs, 'diag_physics', dphys)
          call mpas_pool_get_array(dphys, 'u10', u10)
          call mpas_pool_get_array(dphys, 'v10', v10)

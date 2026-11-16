@@ -371,6 +371,16 @@ module mpas_atm_partmc
    !> next PAIR_WIN particles in dry-mass order.
    integer :: pmc_thin_pair = 0
    integer, parameter :: PAIR_WIN = 64
+   !> Prescribed oxidants (PMC_OX_FILE): O3 and H2O2 are relaxed toward monthly means (dry
+   !> mixing ratio in ppb on the model levels, variables o3 and h2o2 of dimensions month, level,
+   !> cell in global cell order; tools/make_ox.py) with time scale ox_tau (s), or ox_tau_bl in
+   !> the lowest ox_zbl metres above ground. The month is that of the current model date.
+   character(len=256) :: ox_file = ''
+   real (kind=RKIND) :: ox_tau = 172800.0_RKIND, ox_tau_bl = -1.0_RKIND, ox_zbl = 1500.0_RKIND
+   integer :: ox_month = 0
+   real (kind=RKIND), allocatable :: ox_o3(:,:), ox_h2o2(:,:)
+   !> O3 and H2O2 (mol) added by the relaxation since the start of this run, this task.
+   real (kind=RKIND) :: ox_added(2) = 0.0_RKIND
    !> Repeat sample cells' chemistry after another cell to check MOSAIC carries nothing over.
    logical :: pmc_chem_selftest = .false.
    !> Cells (global cell ID and level) whose state is saved in PartMC's own file format before
@@ -549,6 +559,14 @@ contains
       if (stat == 0) pmc_coag = (trim(envval) /= '0')
       call get_environment_variable('PMC_THIN_PAIR', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_thin_pair
+      call get_environment_variable('PMC_OX_FILE', envval, status=stat)
+      if (stat == 0) ox_file = envval
+      call get_environment_variable('PMC_OX_TAU', envval, status=stat)
+      if (stat == 0) read(envval, *) ox_tau
+      call get_environment_variable('PMC_OX_TAU_BL', envval, status=stat)
+      if (stat == 0) read(envval, *) ox_tau_bl
+      call get_environment_variable('PMC_OX_ZBL', envval, status=stat)
+      if (stat == 0) read(envval, *) ox_zbl
       call get_environment_variable('PMC_KZ_MAX', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_kz_max
       call get_environment_variable('PMC_KZ_TOP', envval, status=stat)
@@ -3354,6 +3372,49 @@ contains
    end subroutine atm_partmc_convection
 
 
+   !> Read the prescribed O3 and H2O2 of one month (PMC_OX_FILE) for the cells of this task.
+   subroutine ox_read(domain, month)
+      type (domain_type), intent(inout) :: domain
+      integer, intent(in) :: month
+#ifdef MPAS_PARTMC
+      type (mpas_pool_type), pointer :: mesh
+      integer, dimension(:), pointer :: indexToCellID
+      integer, pointer :: nVertLevels
+      integer :: ncid, varid, dimids(3), n_glob, iCell, v
+      real, allocatable :: glob(:,:)
+      character(len=4), parameter :: vname(2) = (/ 'o3  ', 'h2o2' /)
+
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
+      call mpas_pool_get_array(mesh, 'indexToCellID', indexToCellID)
+      call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
+      if (.not. allocated(ox_o3)) allocate(ox_o3(nVertLevels, size(indexToCellID)), &
+                                            ox_h2o2(nVertLevels, size(indexToCellID)))
+      call nc_check(nf90_open(trim(ox_file), NF90_NOWRITE, ncid), 'open ' // trim(ox_file))
+      do v = 1, 2
+         call nc_check(nf90_inq_varid(ncid, trim(vname(v)), varid), 'find ' // trim(vname(v)))
+         call nc_check(nf90_inquire_variable(ncid, varid, dimids=dimids), 'inquire ' // trim(vname(v)))
+         call nc_check(nf90_inquire_dimension(ncid, dimids(1), len=n_glob), 'cells of ' // trim(vname(v)))
+         allocate(glob(n_glob, nVertLevels))
+         call nc_check(nf90_get_var(ncid, varid, glob, start=(/1, 1, month/), count=(/n_glob, nVertLevels, 1/)), &
+                       'read ' // trim(vname(v)))
+         do iCell = 1, size(indexToCellID)
+            if (v == 1) then
+               ox_o3(:,iCell) = real(glob(indexToCellID(iCell), :), RKIND)
+            else
+               ox_h2o2(:,iCell) = real(glob(indexToCellID(iCell), :), RKIND)
+            end if
+         end do
+         deallocate(glob)
+      end do
+      call nc_check(nf90_close(ncid), 'close ' // trim(ox_file))
+      ox_month = month
+      call mpas_log_write('PartMC: O3 and H2O2 relaxed toward month $i of ' // trim(ox_file) &
+                          // ', time scale $r s ($r s in the lowest $r m)', intArgs=(/month/), &
+                          realArgs=(/ox_tau, merge(ox_tau_bl, ox_tau, ox_tau_bl > 0.0_RKIND), ox_zbl/))
+#endif
+   end subroutine ox_read
+
+
    !> Read one variable of the emissions file (a value for every cell of the mesh, in global
    !> cell order) for the owned cells. found is false if the file has no such variable.
    subroutine emis_read(domain, name, vals, found)
@@ -5070,6 +5131,17 @@ contains
       i_hno3 = gas_data_spec_by_name(gas_data, 'HNO3')
       i_o3 = gas_data_spec_by_name(gas_data, 'O3')
 
+      ! prescribed oxidants: the month of the current model date
+      if (len_trim(ox_file) > 0) then
+         doy = real(env_state%start_day, dp) + (env_state%start_time + env_state%elapsed_time) / 86400.0d0
+         j = 1
+         do while (j < 12)
+            if (doy < real(days_before(j+1) + 1, dp) + merge(1.0d0, 0.0d0, j+1 > 2 .and. mod(yr, 4) == 0)) exit
+            j = j + 1
+         end do
+         if (j /= ox_month) call ox_read(domain, j)
+      end if
+
       n_cells = 0
       sums = 0.0_RKIND
       burden = 0.0_RKIND
@@ -5090,6 +5162,22 @@ contains
             env_state%altitude = 0.5d0*(zgrid(k,iCell) + zgrid(k+1,iCell))
             ! moles of moist air per mole of dry air
             moist_fac = 1.0_RKIND + rvord*qv
+
+            if (len_trim(ox_file) > 0) then
+               t_local = ox_tau
+               if (ox_tau_bl > 0.0_RKIND .and. env_state%altitude - zgrid(1,iCell) < ox_zbl) t_local = ox_tau_bl
+               t_local = min(1.0_RKIND, del_t / t_local)
+               ! mol of air in the cell, for the record of what the relaxation adds
+               c_air = env_state%pressure / (8.314_RKIND * env_state%temp) * vol * 1.0e-9_RKIND
+               j = gas_idx(i_o3)
+               d_ppb = t_local * (ox_o3(k,iCell) * moist_fac - scalars(j,k,iCell))
+               scalars(j,k,iCell) = scalars(j,k,iCell) + d_ppb
+               ox_added(1) = ox_added(1) + d_ppb / moist_fac * c_air
+               j = gas_idx(i_h2o2)
+               d_ppb = t_local * (ox_h2o2(k,iCell) * moist_fac - scalars(j,k,iCell))
+               scalars(j,k,iCell) = scalars(j,k,iCell) + d_ppb
+               ox_added(2) = ox_added(2) + d_ppb / moist_fac * c_air
+            end if
 
             if (env_state%altitude < pmc_chem_top) then
                rlat = latCell(iCell)
@@ -5310,6 +5398,11 @@ contains
             call mpas_dmpar_sum_real_array(domain % dminfo, 9, thin_var_ind_g, vi)
             r = 0.0_RKIND
             where (vi > 0.0_RKIND) r = sqrt(v / vi)
+            if (len_trim(ox_file) > 0) then
+               call mpas_dmpar_sum_real_array(domain % dminfo, 2, ox_added, v(1:2))
+               call mpas_log_write('PartMC chemistry step $i: O3 and H2O2 added by the relaxation since the ' &
+                                   // 'start of this run = $r, $r mol', intArgs=(/itimestep/), realArgs=v(1:2))
+            end if
             call mpas_log_write('PartMC chemistry step $i: thinning noise relative to independent coins ' &
                                 // '(pairing $i) BC $r POM $r SO4 $r NO3 $r NH4 $r SOA $r sea salt $r dust $r MSA $r', &
                                 intArgs=(/itimestep, pmc_thin_pair/), realArgs=r)

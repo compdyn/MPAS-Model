@@ -2609,11 +2609,49 @@ contains
    !> with equal probability, which keeps the expected number and mass. Too few: each particle
    !> of the heaviest class present becomes two of the next class down (half the weight), which
    !> is exact; the new one is placed at a random point of the cell.
+   !> Sort key(1:m) ascending and permute idx(1:m) with it (heap sort, O(m log m)).
+   subroutine heap_sort_key(m, key, idx)
+      integer, intent(in) :: m
+      real (kind=RKIND), intent(inout) :: key(:)
+      integer, intent(inout) :: idx(:)
+      integer :: i, last
+      real (kind=RKIND) :: kt
+      integer :: it
+      do i = m / 2, 1, -1
+         call sift_down(i, m)
+      end do
+      do last = m, 2, -1
+         kt = key(1); key(1) = key(last); key(last) = kt
+         it = idx(1); idx(1) = idx(last); idx(last) = it
+         call sift_down(1, last - 1)
+      end do
+   contains
+      subroutine sift_down(start, n)
+         integer, intent(in) :: start, n
+         integer :: root, child
+         real (kind=RKIND) :: kr
+         integer :: ir
+         root = start
+         kr = key(root); ir = idx(root)
+         do
+            child = 2 * root
+            if (child > n) exit
+            if (child < n) then
+               if (key(child+1) > key(child)) child = child + 1
+            end if
+            if (key(child) <= kr) exit
+            key(root) = key(child); idx(root) = idx(child)
+            root = child
+         end do
+         key(root) = kr; idx(root) = ir
+      end subroutine sift_down
+   end subroutine heap_sort_key
+
    subroutine lagr_rebalance(k, iCell, nCells, nEdgesOnCell, cellsOnCell)
       integer, intent(in) :: k, iCell, nCells
       integer, dimension(:), intent(in) :: nEdgesOnCell
       integer, dimension(:,:), intent(in) :: cellsOnCell
-      integer :: n, j, g, g_sel, m, a, b, jt, jk, jd, np, b_best
+      integer :: n, j, g, g_sel, m, a, b, jk, jd, np, b_best
       real (kind=RKIND) :: xp(NPOS), s_w, kt, w_sel, d, d_best, mk(N_GRP), md(N_GRP), tot(N_GRP)
       integer, allocatable :: sel(:), pair(:,:)
       real (kind=RKIND), allocatable :: key(:), y(:,:)
@@ -2646,19 +2684,7 @@ contains
                       + (log10(max(key(m), 1.0e-30_RKIND)) + 30.0_RKIND) / 41.0_RKIND
             end if
          end do
-         do a = 2, m                          ! insertion sort, m is at most a few dozen
-            jt = sel(a)
-            kt = key(a)
-            b = a - 1
-            do while (b >= 1)
-               if (key(b) <= kt) exit
-               sel(b+1) = sel(b)
-               key(b+1) = key(b)
-               b = b - 1
-            end do
-            sel(b+1) = jt
-            key(b+1) = kt
-         end do
+         call heap_sort_key(m, key, sel)      ! m reaches thousands at 1000+ particles per cell
          ! thin only the lightest fraction of the class (sorted by dry mass, pairings 0 and 2)
          if (pmc_thin_frac < 1.0_RKIND .and. pmc_thin_pair /= 1) &
               m = min(m, max(2, nint(pmc_thin_frac * real(m, RKIND))))

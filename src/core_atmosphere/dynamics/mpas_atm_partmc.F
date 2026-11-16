@@ -362,6 +362,15 @@ module mpas_atm_partmc
    !> The same for independent coins on the same particles (each particle kept or removed on
    !> its own), for comparison.
    real (kind=RKIND) :: part_s_thin_var_ind = 0.0_RKIND
+   !> The same two variances for the mass (kg^2) of each species group (BC, POM, SO4, NO3, NH4,
+   !> SOA, sea salt, dust, MSA), to compare pairing strategies for all species.
+   real (kind=RKIND) :: thin_var_g(9) = 0.0_RKIND, thin_var_ind_g(9) = 0.0_RKIND
+   !> How thinning pairs the particles of a class (PMC_THIN_PAIR): 0 neighbours in dry mass
+   !> (default); 1 neighbours in dry mass within each source kind; 2 greedy nearest neighbour in
+   !> composition (group masses relative to the class total in the cell), searched among the
+   !> next PAIR_WIN particles in dry-mass order.
+   integer :: pmc_thin_pair = 0
+   integer, parameter :: PAIR_WIN = 64
    !> Repeat sample cells' chemistry after another cell to check MOSAIC carries nothing over.
    logical :: pmc_chem_selftest = .false.
    !> Cells (global cell ID and level) whose state is saved in PartMC's own file format before
@@ -538,6 +547,8 @@ contains
       end if
       call get_environment_variable('PMC_COAG', envval, status=stat)
       if (stat == 0) pmc_coag = (trim(envval) /= '0')
+      call get_environment_variable('PMC_THIN_PAIR', envval, status=stat)
+      if (stat == 0) read(envval, *) pmc_thin_pair
       call get_environment_variable('PMC_KZ_MAX', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_kz_max
       call get_environment_variable('PMC_KZ_TOP', envval, status=stat)
@@ -2551,15 +2562,15 @@ contains
       integer, intent(in) :: k, iCell, nCells
       integer, dimension(:), intent(in) :: nEdgesOnCell
       integer, dimension(:,:), intent(in) :: cellsOnCell
-      integer :: n, j, g, g_sel, m, a, b, jt, jk, jd
-      real (kind=RKIND) :: xp(NPOS), s_w, kt, w_sel
-      integer, allocatable :: sel(:)
-      real (kind=RKIND), allocatable :: key(:)
-      logical, allocatable :: drop(:)
+      integer :: n, j, g, g_sel, m, a, b, jt, jk, jd, np, b_best
+      real (kind=RKIND) :: xp(NPOS), s_w, kt, w_sel, d, d_best, mk(N_GRP), md(N_GRP), tot(N_GRP)
+      integer, allocatable :: sel(:), pair(:,:)
+      real (kind=RKIND), allocatable :: key(:), y(:,:)
+      logical, allocatable :: drop(:), used(:)
       type(aero_particle_t) :: twin
 
       n = pos(k,iCell) % n
-      if (n > 2*pmc_n_part) allocate(sel(n), key(n), drop(n))
+      if (n > 2*pmc_n_part) allocate(sel(n), key(n), drop(n), pair(2,n), used(n), y(N_GRP,n))
       do while (n > 2*pmc_n_part)
          g_sel = LAGR_GROUPS + 1
          do j = 1, n
@@ -2578,6 +2589,11 @@ contains
             m = m + 1
             sel(m) = j
             key(m) = particle_dry_mass(aero_states(k,iCell)%apa%particle(j))
+            if (pmc_thin_pair == 1) then
+               ! source kind first, then dry mass: key in [kind, kind+1) for masses 1e-30..1e10 kg
+               key(m) = real(mod(aero_states(k,iCell)%apa%particle(j)%component(1)%source_id, SRC_STRIDE), RKIND) &
+                      + (log10(max(key(m), 1.0e-30_RKIND)) + 30.0_RKIND) / 41.0_RKIND
+            end if
          end do
          do a = 2, m                          ! insertion sort, m is at most a few dozen
             jt = sel(a)
@@ -2594,18 +2610,69 @@ contains
          end do
          w_sel = lagr_w * 2.0_RKIND**(g_sel - LAGR_G0)
          drop(1:n) = .false.
-         do a = 1, m, 2
-            if (a < m) then
-               if (pmc_random() < 0.5d0) then
-                  jk = sel(a); jd = sel(a+1)
+         ! the pairs: (sel(a), sel(a+1)) in sorted order, or greedy nearest in composition
+         np = 0
+         if (pmc_thin_pair == 2) then
+            tot = 0.0_RKIND
+            do a = 1, m
+               call group_masses(aero_states(k,iCell)%apa%particle(sel(a)), y(:,a))
+               tot = tot + y(:,a)
+            end do
+            do g = 1, N_GRP
+               if (tot(g) > 0.0_RKIND) then
+                  y(g,1:m) = y(g,1:m) / tot(g)
                else
-                  jk = sel(a+1); jd = sel(a)
+                  y(g,1:m) = 0.0_RKIND
+               end if
+            end do
+            used(1:m) = .false.
+            do a = 1, m
+               if (used(a)) cycle
+               used(a) = .true.
+               b_best = 0
+               d_best = huge(1.0_RKIND)
+               do b = a + 1, min(m, a + PAIR_WIN)
+                  if (used(b)) cycle
+                  d = sum((y(:,a) - y(:,b))**2)
+                  if (d < d_best) then
+                     d_best = d
+                     b_best = b
+                  end if
+               end do
+               np = np + 1
+               pair(1,np) = sel(a)
+               pair(2,np) = 0
+               if (b_best > 0) then
+                  used(b_best) = .true.
+                  pair(2,np) = sel(b_best)
+               end if
+            end do
+         else
+            do a = 1, m, 2
+               np = np + 1
+               pair(1,np) = sel(a)
+               pair(2,np) = 0
+               if (a < m) pair(2,np) = sel(a+1)
+            end do
+         end if
+         do a = 1, np
+            if (pair(2,a) > 0) then
+               if (pmc_random() < 0.5d0) then
+                  jk = pair(1,a); jd = pair(2,a)
+               else
+                  jk = pair(2,a); jd = pair(1,a)
                end if
             else if (pmc_random() < 0.5d0) then
-               jk = sel(a); jd = 0
+               jk = pair(1,a); jd = 0
             else
-               jk = 0; jd = sel(a)
+               jk = 0; jd = pair(1,a)
             end if
+            mk = 0.0_RKIND
+            md = 0.0_RKIND
+            if (jk > 0) call group_masses(aero_states(k,iCell)%apa%particle(jk), mk)
+            if (jd > 0) call group_masses(aero_states(k,iCell)%apa%particle(jd), md)
+            thin_var_g = thin_var_g + ((mk - md) * w_sel)**2
+            thin_var_ind_g = thin_var_ind_g + (mk * w_sel)**2 + (md * w_sel)**2
             ! sulfate (mol) gained by the doubled particle and lost with the removed one
             s_w = 0.0_RKIND
             if (jk > 0) part_s_thin_var_ind = part_s_thin_var_ind &
@@ -5237,6 +5304,16 @@ contains
                              // '= $r mol, / total at start = $r; with independent coins it would be $r', &
                              intArgs=(/itimestep/), &
                              realArgs=(/sqrt(ch4_max), sqrt(ch4_max)/chem_s0, sqrt(ch4_min)/chem_s0/))
+         block
+            real (kind=RKIND) :: v(9), vi(9), r(9)
+            call mpas_dmpar_sum_real_array(domain % dminfo, 9, thin_var_g, v)
+            call mpas_dmpar_sum_real_array(domain % dminfo, 9, thin_var_ind_g, vi)
+            r = 0.0_RKIND
+            where (vi > 0.0_RKIND) r = sqrt(v / vi)
+            call mpas_log_write('PartMC chemistry step $i: thinning noise relative to independent coins ' &
+                                // '(pairing $i) BC $r POM $r SO4 $r NO3 $r NH4 $r SOA $r sea salt $r dust $r MSA $r', &
+                                intArgs=(/itimestep, pmc_thin_pair/), realArgs=r)
+         end block
          call mpas_dmpar_sum_real_array(domain % dminfo, N_GRP, burden, g_burden)
          rem = reshape(rem_mass, (/ 3*N_GRP /))
          call mpas_dmpar_sum_real_array(domain % dminfo, 3*N_GRP, rem, g_rem)

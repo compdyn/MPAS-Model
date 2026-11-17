@@ -320,7 +320,7 @@ module mpas_atm_partmc
    !> production of precipitation, and the part of the production counted as reaching the
    !> surface (kg); last, the number of particles expected to be removed given the particles
    !> that were in the layers (the sum of probability times number).
-   logical :: pmc_wet = .false., pmc_wet_diag_only = .false., lagr_shuffle = .false.
+   logical :: pmc_wet = .false., pmc_wet_diag_only = .false., lagr_shuffle = .false., pmc_wet_cldfrac = .false.
    !> Removal in the convective updraft: switch, and sums by this task so far: number removed
    !> (reference, particles, expected from the particles present), convective precipitation at
    !> the surface, water condensed in the updraft, and the part of it counted as precipitation
@@ -654,6 +654,8 @@ contains
       call get_environment_variable('PMC_WET', envval, status=stat)
       if (stat == 0) pmc_wet = (trim(envval) /= '0')
       if (stat == 0) pmc_wet_diag_only = (trim(envval) == '2')
+      call get_environment_variable('PMC_WET_CLDFRAC', envval, status=stat)
+      if (stat == 0) pmc_wet_cldfrac = (trim(envval) /= '0')
       call get_environment_variable('PMC_CONV_CHECK', envval, status=stat)
       if (stat == 0) pmc_conv_check = (trim(envval) /= '0')
       call get_environment_variable('PMC_WET_CONV', envval, status=stat)
@@ -4993,8 +4995,10 @@ contains
    !> number scalars lose r f, so they agree with the particles only when all particles count
    !> as activated. Gases lose e r f, with e the fraction of the gas in cloud water from the
    !> PMC_GAS_WET file. The cell is taken as cloudy throughout wherever it has condensate,
-   !> as the microphysics does. Convective precipitation and scavenging below cloud are not
-   !> included.
+   !> as the microphysics does, unless PMC_WET_CLDFRAC=1: then only the cloudy part of the cell
+   !> (the cloud fraction of the radiation scheme, limited to 0.1-1 as in the in-cloud
+   !> chemistry) loses the fraction r f, and the cell's tracers lose c r f. Convective
+   !> precipitation and scavenging below cloud are not included.
    subroutine atm_partmc_wet_removal(domain, itimestep)
 
       type (domain_type), intent(inout) :: domain
@@ -5005,6 +5009,7 @@ contains
       type (field3DReal), pointer :: scalars_field
       real (kind=RKIND), dimension(:,:,:), pointer :: scalars
       real (kind=RKIND), dimension(:,:), pointer :: rho_zz, rainprod, theta_m, exner, wwAvg
+      real (kind=RKIND), dimension(:,:), pointer :: cldfrac_w
       real (kind=RKIND), dimension(:), pointer :: rdzw, areaCell, rainncv
       real (kind=RKIND), pointer :: config_dt
       integer, dimension(:,:), pointer :: cellsOnCell
@@ -5058,6 +5063,11 @@ contains
       nullify(rainncv)
       call mpas_pool_get_array(diag_physics, 'rainprod', rainprod)
       call mpas_pool_get_array(diag_physics, 'rainncv', rainncv)
+      nullify(cldfrac_w)
+      if (pmc_wet_cldfrac) call mpas_pool_get_array(diag_physics, 'cldfrac', cldfrac_w)
+      if (pmc_wet_cldfrac .and. .not. associated(cldfrac_w)) then
+         call mpas_log_write('PartMC: PMC_WET_CLDFRAC needs the cloud fraction cldfrac', messageType=MPAS_LOG_CRIT)
+      end if
       if (.not. associated(rainprod) .or. .not. associated(rainncv)) then
          call mpas_log_write('PartMC: wet removal needs a microphysics scheme that gives rainprod', &
                              messageType=MPAS_LOG_CRIT)
@@ -5103,6 +5113,7 @@ contains
             if (prod <= 0.0_RKIND) cycle
             cond = max(0.0_RKIND, scalars(index_qc,k,iCell)) + max(0.0_RKIND, scalars(index_qi,k,iCell))
             p = r * prod / (cond + prod)
+            if (associated(cldfrac_w)) p = p * min(1.0_RKIND, max(0.1_RKIND, cldfrac_w(k,iCell)))
             ! dry air mass per area; number per area is mk times the mixing ratio
             mk = rho_zz(k,iCell) / rdzw(k)
 

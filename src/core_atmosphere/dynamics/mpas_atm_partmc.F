@@ -5265,7 +5265,7 @@ contains
    subroutine atm_partmc_chemistry(domain, itimestep)
 
 #ifdef MPAS_PARTMC_MOSAIC
-      use module_data_mosaic_main, only : rlon, rlat, zalt_m
+      use module_data_mosaic_main, only : rlon, rlat, zalt_m, tbeg_sec
 #endif
 
       type (domain_type), intent(inout) :: domain
@@ -5294,7 +5294,7 @@ contains
       real (kind=dp), allocatable :: gas_a(:), gas_pre(:)
       type(aero_state_t) :: state_a, state_b, state_pre
       type(env_state_t) :: env_b
-      real (kind=RKIND) :: test_sums(3), g_test(3)
+      real (kind=RKIND) :: test_sums(3), g_test(3), zen_max, g_zen
       integer :: kk, jc, n_test, g_n_test, i_box
       integer, dimension(:), pointer :: indexToCellID
       character(len=64) :: box_prefix
@@ -5347,6 +5347,9 @@ contains
       env_state%elapsed_time = real(itimestep - 1, kind=dp) * del_t
 
       call gas_setup(domain)
+      ! MOSAIC's clock: mosaic_init (in gas_setup) sets it from an env_state that has no date,
+      ! so set it here from the run's start time, every call (it also changes on a restart)
+      tbeg_sec = env_state%start_day*24*3600 + nint(env_state%start_time)
       n_gas = gas_data_n_spec(gas_data)
       call gas_state_set_size(gas_state, n_gas)
       i_so2 = gas_data_spec_by_name(gas_data, 'SO2')
@@ -5374,6 +5377,7 @@ contains
       burden = 0.0_RKIND
       test_sums = 0.0_RKIND
       n_test = 0
+      zen_max = 0.0_RKIND
       allocate(gas_a(n_gas), gas_pre(n_gas))
       call cpu_time(t0)
       do iCell = 1, nCellsSolve
@@ -5441,6 +5445,15 @@ contains
                so2_pre = scalars(gas_idx(i_so2),k,iCell)
                so4_pre = cell_sulfate(aero_states(k,iCell), vol)
                call mosaic_timestep(env_state, aero_data, aero_states(k,iCell), gas_data, gas_state, .false., uuid)
+               if (k == 1) then
+                  ! MOSAIC's solar zenith angle against a direct calculation, every cell at the surface
+                  doy = real(env_state%start_day, kind=dp) + (env_state%start_time + env_state%elapsed_time &
+                        + 0.5d0*del_t) / 86400.0d0
+                  decl = -23.44d0 * pii/180.0d0 * cos(2.0d0*pii*(doy + 9.0d0)/365.0d0)
+                  hour_angle = 2.0d0*pii*(doy - floor(doy)) - pii + lonCell(iCell)
+                  cos_ref = sin(latCell(iCell))*sin(decl) + cos(latCell(iCell))*cos(decl)*cos(hour_angle)
+                  zen_max = max(zen_max, real(abs(cos(env_state%solar_zenith_angle) - cos_ref), RKIND))
+               end if
                s_bud(SB_COND, band_of(iCell)) = s_bud(SB_COND, band_of(iCell)) &
                     + cell_sulfate(aero_states(k,iCell), vol) - so4_pre
                if (i_box > 0) then
@@ -5620,7 +5633,13 @@ contains
                              // 'rel diff gas = $r, particle volume = $r; largest cos(zenith) diff from direct ' &
                              // 'calculation = $r', intArgs=(/itimestep, g_n_test/), realArgs=g_test)
       end if
+      call mpas_dmpar_max_real(domain % dminfo, zen_max, g_zen)
+      if (g_zen > 0.1_RKIND) then
+         call mpas_log_write('PartMC: MOSAIC solar zenith angle off by $r in cos from a direct calculation', &
+                             realArgs=(/g_zen/), messageType=MPAS_LOG_CRIT)
+      end if
       if (mod(itimestep, 12) == 0 .or. itimestep == 1) then
+         call mpas_log_write('PartMC: largest cos(zenith) diff of MOSAIC from a direct calculation $r', realArgs=(/g_zen/))
          t_local = t1 - t0
          ! net sulfur (mol) put in at the surface so far
          if (allocated(gas_emitted)) then

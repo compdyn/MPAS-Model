@@ -485,6 +485,11 @@ module mpas_atm_partmc
    !> Brownian coagulation in every cell each step, and events so far.
    logical :: pmc_coag = .false.
    integer :: n_coag_total = 0
+   !> Coagulation kernel bounds per level and the temperature (K) and pressure (Pa) range they
+   !> hold for (lo, hi); a level is recomputed only when its cells leave that range.
+   real (kind=dp), allocatable :: coag_kmin(:,:,:), coag_kmax(:,:,:)
+   real (kind=RKIND), allocatable :: coag_trange(:,:), coag_prange(:,:)
+   integer :: coag_n_recompute = 0
    !> Particle output: interval in steps (0 = off), fraction of cells written, directory.
    integer :: pmc_out_interval = 0
    !> Time-mean aerosol fields: write interval and sampling interval (steps), directory, the
@@ -5799,7 +5804,7 @@ contains
       type(aero_sorted_t) :: empty_sorted
       type(bin_grid_t) :: coag_grid
       integer, parameter :: n_bin = 36
-      real (kind=dp), allocatable :: k_min_lev(:,:,:), k_max_lev(:,:,:), k_min(:,:), k_max(:,:)
+      real (kind=dp), allocatable :: k_min(:,:), k_max(:,:)
       real (kind=RKIND) :: t_lo, t_hi, p_lo, p_hi, temp, pres
       integer :: i_env
       real (kind=dp) :: del_t
@@ -5832,10 +5837,18 @@ contains
 
       ! One size grid for all cells, and bounds on the kernel for each level that hold for the
       ! range of temperature and pressure on that level. PartMC otherwise rebuilds both for
-      ! every cell, which costs far more than the coagulation itself.
+      ! every cell, which costs far more than the coagulation itself. The bounds are kept from
+      ! step to step for a range widened by 5 K and 5%, and a level is recomputed only when its
+      ! cells leave it (estimating them took 6 s per rank and step at 120 km on 4 nodes).
       call bin_grid_make(coag_grid, BIN_GRID_TYPE_LOG, n_bin, 1.0d-10, 1.0d-4)
-      allocate(k_min_lev(n_bin,n_bin,nVertLevels), k_max_lev(n_bin,n_bin,nVertLevels), &
-               k_min(n_bin,n_bin), k_max(n_bin,n_bin))
+      if (.not. allocated(coag_kmin)) then
+         allocate(coag_kmin(n_bin,n_bin,nVertLevels), coag_kmax(n_bin,n_bin,nVertLevels), &
+                  coag_trange(2,nVertLevels), coag_prange(2,nVertLevels))
+         coag_trange(1,:) = huge(1.0_RKIND)
+         coag_trange(2,:) = -huge(1.0_RKIND)
+         coag_prange = coag_trange
+      end if
+      allocate(k_min(n_bin,n_bin), k_max(n_bin,n_bin))
       do k = 1, nVertLevels
          t_lo = huge(1.0_RKIND)
          t_hi = 0.0_RKIND
@@ -5849,18 +5862,23 @@ contains
             p_lo = min(p_lo, pres)
             p_hi = max(p_hi, pres)
          end do
-         k_min_lev(:,:,k) = huge(1.0d0)
-         k_max_lev(:,:,k) = 0.0d0
          if (nCellsSolve == 0) cycle
+         if (t_lo >= coag_trange(1,k) .and. t_hi <= coag_trange(2,k) .and. &
+             p_lo >= coag_prange(1,k) .and. p_hi <= coag_prange(2,k)) cycle
+         coag_n_recompute = coag_n_recompute + 1
+         coag_trange(:,k) = (/ t_lo - 5.0_RKIND, t_hi + 5.0_RKIND /)
+         coag_prange(:,k) = (/ p_lo * 0.95_RKIND, p_hi * 1.05_RKIND /)
+         coag_kmin(:,:,k) = huge(1.0d0)
+         coag_kmax(:,:,k) = 0.0d0
          do i_env = 1, 4
-            env_state%temp = merge(t_lo, t_hi, i_env <= 2)
-            env_state%pressure = merge(p_lo, p_hi, mod(i_env, 2) == 1)
+            env_state%temp = coag_trange(merge(1, 2, i_env <= 2), k)
+            env_state%pressure = coag_prange(merge(1, 2, mod(i_env, 2) == 1), k)
             call est_k_minmax_binned_unweighted(coag_grid, COAG_KERNEL_TYPE_BROWN, aero_data, env_state, k_min, k_max)
-            k_min_lev(:,:,k) = min(k_min_lev(:,:,k), k_min)
-            k_max_lev(:,:,k) = max(k_max_lev(:,:,k), k_max)
+            coag_kmin(:,:,k) = min(coag_kmin(:,:,k), k_min)
+            coag_kmax(:,:,k) = max(coag_kmax(:,:,k), k_max)
          end do
-         k_min_lev(:,:,k) = k_min_lev(:,:,k) / 1.05d0
-         k_max_lev(:,:,k) = k_max_lev(:,:,k) * 1.05d0
+         coag_kmin(:,:,k) = coag_kmin(:,:,k) / 1.05d0
+         coag_kmax(:,:,k) = coag_kmax(:,:,k) * 1.05d0
       end do
       allocate(ids(4*pmc_n_part + 16), xs(NPOS, 4*pmc_n_part + 16))
       call cpu_time(tb)
@@ -5902,8 +5920,8 @@ contains
             end if
 
             call aero_state_sort(aero_states(k,iCell), aero_data, bin_grid=coag_grid)
-            aero_states(k,iCell)%aero_sorted%coag_kernel_min = k_min_lev(:,:,k)
-            aero_states(k,iCell)%aero_sorted%coag_kernel_max = k_max_lev(:,:,k)
+            aero_states(k,iCell)%aero_sorted%coag_kernel_min = coag_kmin(:,:,k)
+            aero_states(k,iCell)%aero_sorted%coag_kernel_max = coag_kmax(:,:,k)
             aero_states(k,iCell)%aero_sorted%coag_kernel_bounds_valid = .true.
             call cpu_time(tb)
             tc(2) = tc(2) + tb - ta
@@ -5964,8 +5982,9 @@ contains
       call mpas_dmpar_max_real_array(domain % dminfo, 5, tc, g_tc_max)
       if (itimestep <= 15 .or. mod(itimestep, 12) == 0) then
          call mpas_log_write('PartMC coagulation step $i CPU s, sum over ranks then max: bounds $r, remap+sort $r, ' &
-                             // 'mc_coag $r, positions $r, rebalance $r; max $r $r $r $r $r', &
-                             intArgs=(/itimestep/), realArgs=(/g_tc, g_tc_max/))
+                             // 'mc_coag $r, positions $r, rebalance $r; max $r $r $r $r $r; ' &
+                             // 'level bounds recomputed on this rank so far $i', &
+                             intArgs=(/itimestep, coag_n_recompute/), realArgs=(/g_tc, g_tc_max/))
       end if
       if (mod(itimestep, 12) == 0) then
          call mpas_dmpar_sum_int(domain % dminfo, n_coag_total, g_n_coag)

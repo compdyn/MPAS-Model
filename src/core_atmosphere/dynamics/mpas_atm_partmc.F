@@ -5803,6 +5803,8 @@ contains
       real (kind=RKIND) :: t_lo, t_hi, p_lo, p_hi, temp, pres
       integer :: i_env
       real (kind=dp) :: del_t
+      ! CPU time (s) of the parts: kernel bounds, class remap and sort, mc_coag, positions, rebalance
+      real (kind=RKIND) :: tc(5), g_tc(5), g_tc_max(5), ta, tb
 
       if (.not. pmc_coag .or. pmc_n_part <= 0) return
 
@@ -5825,6 +5827,8 @@ contains
       del_t = config_dt
       env_state%rel_humid = 0.0d0
       n_new = 0
+      tc = 0.0_RKIND
+      call cpu_time(ta)
 
       ! One size grid for all cells, and bounds on the kernel for each level that hold for the
       ! range of temperature and pressure on that level. PartMC otherwise rebuilds both for
@@ -5859,6 +5863,8 @@ contains
          k_max_lev(:,:,k) = k_max_lev(:,:,k) * 1.05d0
       end do
       allocate(ids(4*pmc_n_part + 16), xs(NPOS, 4*pmc_n_part + 16))
+      call cpu_time(tb)
+      tc(1) = tb - ta
 
       do iCell = 1, nCellsSolve
          do k = 1, nVertLevels
@@ -5866,6 +5872,7 @@ contains
             if (n0 < 2) cycle
             env_state%temp = theta_m(k,iCell) / (1.0_RKIND + rvord*scalars(index_qv,k,iCell)) * exner(k,iCell)
             env_state%pressure = pressure_p(k,iCell) + pressure_base(k,iCell)
+            call cpu_time(ta)
 
             if (pmc_mode == MODE_LAGR) then
                if (n0 > size(ids)) then
@@ -5898,7 +5905,11 @@ contains
             aero_states(k,iCell)%aero_sorted%coag_kernel_min = k_min_lev(:,:,k)
             aero_states(k,iCell)%aero_sorted%coag_kernel_max = k_max_lev(:,:,k)
             aero_states(k,iCell)%aero_sorted%coag_kernel_bounds_valid = .true.
+            call cpu_time(tb)
+            tc(2) = tc(2) + tb - ta
             call mc_coag(COAG_KERNEL_TYPE_BROWN, env_state, aero_data, aero_states(k,iCell), del_t, n_samp, n_coag)
+            call cpu_time(ta)
+            tc(3) = tc(3) + ta - tb
             n_coag_total = n_coag_total + n_coag
 
             ! drop the sorting structures and removal records PartMC built, to save memory and so
@@ -5934,7 +5945,11 @@ contains
                   end if
                   call pos_append(pos(k,iCell), xp)
                end do
+               call cpu_time(tb)
+               tc(4) = tc(4) + tb - ta
                if (lagr_control) call lagr_rebalance(k, iCell, nCells, nEdgesOnCell, cellsOnCell)
+               call cpu_time(ta)
+               tc(5) = tc(5) + ta - tb
             else
                cnt(:,k,iCell) = 0
                do j = 1, n1
@@ -5945,6 +5960,13 @@ contains
          end do
       end do
 
+      call mpas_dmpar_sum_real_array(domain % dminfo, 5, tc, g_tc)
+      call mpas_dmpar_max_real_array(domain % dminfo, 5, tc, g_tc_max)
+      if (itimestep <= 15 .or. mod(itimestep, 12) == 0) then
+         call mpas_log_write('PartMC coagulation step $i CPU s, sum over ranks then max: bounds $r, remap+sort $r, ' &
+                             // 'mc_coag $r, positions $r, rebalance $r; max $r $r $r $r $r', &
+                             intArgs=(/itimestep/), realArgs=(/g_tc, g_tc_max/))
+      end if
       if (mod(itimestep, 12) == 0) then
          call mpas_dmpar_sum_int(domain % dminfo, n_coag_total, g_n_coag)
          call mpas_dmpar_sum_int(domain % dminfo, n_new, g_n_new)

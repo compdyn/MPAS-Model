@@ -6140,9 +6140,9 @@ contains
 
       ! One size grid for all cells, and bounds on the kernel for each level that hold for the
       ! range of temperature and pressure on that level. PartMC otherwise rebuilds both for
-      ! every cell, which costs far more than the coagulation itself. The bounds are kept from
-      ! step to step for a range widened by 5 K and 5%, and a level is recomputed only when its
-      ! cells leave it (estimating them took 6 s per rank and step at 120 km on 4 nodes).
+      ! every cell, which costs far more than the coagulation itself. The range is rounded
+      ! outward to a fixed grid and a level is recomputed only when its rounded range changes
+      ! (estimating them took 6 s per rank and step at 120 km on 4 nodes).
       call bin_grid_make(coag_grid, BIN_GRID_TYPE_LOG, n_bin, 1.0d-10, 1.0d-4)
       if (.not. allocated(coag_kmin)) then
          allocate(coag_kmin(n_bin,n_bin,nVertLevels), coag_kmax(n_bin,n_bin,nVertLevels), &
@@ -6166,11 +6166,17 @@ contains
             p_hi = max(p_hi, pres)
          end do
          if (nCellsSolve == 0) cycle
-         if (t_lo >= coag_trange(1,k) .and. t_hi <= coag_trange(2,k) .and. &
-             p_lo >= coag_prange(1,k) .and. p_hi <= coag_prange(2,k)) cycle
+         ! the range rounded outward to a fixed grid (10 K, factors of 1.1 in pressure), so that
+         ! the bounds depend only on the present state and a restart reproduces them
+         t_lo = 10.0_RKIND * floor((t_lo - 2.0_RKIND) / 10.0_RKIND)
+         t_hi = 10.0_RKIND * ceiling((t_hi + 2.0_RKIND) / 10.0_RKIND)
+         p_lo = 1.1_RKIND**floor(log(0.98_RKIND * p_lo) / log(1.1_RKIND))
+         p_hi = 1.1_RKIND**ceiling(log(1.02_RKIND * p_hi) / log(1.1_RKIND))
+         if (t_lo == coag_trange(1,k) .and. t_hi == coag_trange(2,k) .and. &
+             p_lo == coag_prange(1,k) .and. p_hi == coag_prange(2,k)) cycle
          coag_n_recompute = coag_n_recompute + 1
-         coag_trange(:,k) = (/ t_lo - 5.0_RKIND, t_hi + 5.0_RKIND /)
-         coag_prange(:,k) = (/ p_lo * 0.95_RKIND, p_hi * 1.05_RKIND /)
+         coag_trange(:,k) = (/ t_lo, t_hi /)
+         coag_prange(:,k) = (/ p_lo, p_hi /)
          coag_kmin(:,:,k) = huge(1.0d0)
          coag_kmax(:,:,k) = 0.0d0
          do i_env = 1, 4

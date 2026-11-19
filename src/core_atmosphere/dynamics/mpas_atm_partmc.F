@@ -54,7 +54,7 @@
 !                     its own size (number geometric mean diameter 30 nm for fossil sources, 80 nm
 !                     for biofuel and fires, sigma 1.8, Dentener et al. 2006) and the BC/OC ratio
 !                     of its cell; fire gases by month; DMS from a seawater climatology (emitted
-!                     as SO2); isoprene and monoterpenes from emission factors with temperature
+!                     as SO2, or as DMS for MOSAIC's marine chemistry with PMC_DMS_CHEM=1); isoprene and monoterpenes from emission factors with temperature
 !                     and light factors. Dust: flux PMC_DUST_SCALE * 1e-9 * source * u10^2
 !                     (u10 - PMC_DUST_UT) kg m^-2 s^-1 (default threshold 6.5 m/s), sizes from
 !                     Kok (2011). PMC_BIO_SCALE and PMC_DMS_SCALE scale those fluxes.
@@ -452,6 +452,9 @@ module mpas_atm_partmc
    real (kind=RKIND) :: kind_mass(N_KIND) = 0.0_RKIND, gas_nat(3) = 0.0_RKIND
    real (kind=RKIND), allocatable :: gas_bb(:,:,:), dms_w(:,:), isop_ef(:), mterp_ef(:)
    real (kind=RKIND) :: bio_scale = 1.0_RKIND, dms_scale = 1.0_RKIND
+   !> PMC_DMS_CHEM: emit DMS as DMS (MOSAIC's marine mechanism then makes SO2 and MSA) instead
+   !> of as SO2.
+   logical :: pmc_dms_chem = .false.
    !> Budget by species group (BC, POM, SO4, NO3, NH4, SOA, sea salt, dust, MSA): particle mass
    !> (kg) removed by this task since the start of the run by dry deposition, grid-scale and
    !> convective wet removal; the group of each aerosol species (0 = none, e.g. water).
@@ -693,6 +696,8 @@ contains
       if (stat == 0) read(envval, *) bio_scale
       call get_environment_variable('PMC_DMS_SCALE', envval, status=stat)
       if (stat == 0) read(envval, *) dms_scale
+      call get_environment_variable('PMC_DMS_CHEM', envval, status=stat)
+      if (stat == 0) pmc_dms_chem = (trim(envval) == '1')
       call get_environment_variable('PMC_SEASALT_SCALE', envval, status=stat)
       if (stat == 0) read(envval, *) seasalt_scale
       call get_environment_variable('PMC_Q_BACKGROUND', envval, status=stat)
@@ -4368,7 +4373,7 @@ contains
       real (kind=RKIND), dimension(:), pointer :: u10, v10, t2m, swdnb, sst, xice
       real (kind=RKIND), allocatable :: extra(:)
       real (kind=RKIND) :: wind, tc, sc_dms, k_w, f_dms, g_t, g_p, par, nat(3)
-      integer :: mo_now, i_mo, ib, j_so2, j_isop, j_api, j_lim
+      integer :: mo_now, i_mo, ib, j_so2, j_isop, j_api, j_lim, j_dms
       real (kind=dp) :: t_now
 
       if (.not. pmc_chem .or. pmc_n_part <= 0) return
@@ -4469,6 +4474,12 @@ contains
          call mpas_pool_get_array(sfc_input, 'sst', sst)
          call mpas_pool_get_array(sfc_input, 'xice', xice)
          j_so2 = gas_data_spec_by_name(gas_data, 'SO2')
+         j_dms = j_so2
+         if (pmc_dms_chem) then
+            j_dms = gas_data_spec_by_name(gas_data, 'DMS')
+            if (j_dms < 1) call mpas_log_write('PartMC: PMC_DMS_CHEM=1 but no DMS in the gas data', &
+                                               messageType=MPAS_LOG_CRIT)
+         end if
          j_isop = gas_data_spec_by_name(gas_data, 'ISOP')
          j_api = gas_data_spec_by_name(gas_data, 'API')
          j_lim = gas_data_spec_by_name(gas_data, 'LIM')
@@ -4483,13 +4494,13 @@ contains
             nat = 0.0_RKIND
             if (landmask(iCell) == 0) then
                ! DMS from the sea (Nightingale et al. 2000 transfer velocity, Saltzman et al.
-               ! 1993 Schmidt number), emitted as SO2
+               ! 1993 Schmidt number), emitted as SO2 or (PMC_DMS_CHEM) as DMS
                wind = sqrt(u10(iCell)**2 + v10(iCell)**2)
                tc = min(35.0_RKIND, max(-2.0_RKIND, sst(iCell) - 273.15_RKIND))
                sc_dms = 2674.0_RKIND - 147.12_RKIND*tc + 3.726_RKIND*tc**2 - 0.038_RKIND*tc**3
                k_w = (0.222_RKIND * wind**2 + 0.333_RKIND * wind) / 3.6e5_RKIND * (sc_dms / 600.0_RKIND)**(-0.5_RKIND)
                f_dms = dms_scale * k_w * dms_w(iCell,i_mo) * 1.0e-6_RKIND * (1.0_RKIND - min(1.0_RKIND, max(0.0_RKIND, xice(iCell))))
-               extra(j_so2) = extra(j_so2) + f_dms
+               extra(j_dms) = extra(j_dms) + f_dms
                nat(1) = f_dms
             else
                ! isoprene (light and temperature, Guenther et al. 1993, normalised at 303 K) and
@@ -4901,14 +4912,19 @@ contains
    end subroutine note_removal
 
 
-   !> Sulfate (mol) in one real particle represented by a computational particle.
+   !> Sulfur (mol) of sulfate and MSA in one real particle represented by a computational particle.
    function particle_sulfate(particle)
       type(aero_particle_t), intent(in) :: particle
       real (kind=RKIND) :: particle_sulfate
-      integer, save :: i_so4 = -1
-      if (i_so4 < 0) i_so4 = aero_data_spec_by_name(aero_data, 'SO4')
+      integer, save :: i_so4 = -1, i_msa = -1
+      if (i_so4 < 0) then
+         i_so4 = aero_data_spec_by_name(aero_data, 'SO4')
+         i_msa = aero_data_spec_by_name(aero_data, 'MSA')
+      end if
       particle_sulfate = 0.0_RKIND
       if (i_so4 > 0) particle_sulfate = particle%vol(i_so4) * aero_data%density(i_so4) / aero_data%molec_weight(i_so4)
+      if (i_msa > 0) particle_sulfate = particle_sulfate &
+                                        + particle%vol(i_msa) * aero_data%density(i_msa) / aero_data%molec_weight(i_msa)
    end function particle_sulfate
 
 
@@ -4930,19 +4946,29 @@ contains
    end function sulfur_band
 
 
-   !> Whether gas species j (index in gas_data) carries sulfur that the budget counts (SO2, H2SO4).
+   !> Whether gas species j (index in gas_data) carries sulfur that the budget counts: SO2,
+   !> H2SO4 and the DMS species of MOSAIC's marine mechanism (one S atom each).
    logical function is_sulfur_gas(j)
       integer, intent(in) :: j
-      integer, save :: j_so2 = -1, j_h2so4 = -1
-      if (j_so2 < 0) then
-         j_so2 = gas_data_spec_by_name(gas_data, 'SO2')
-         j_h2so4 = gas_data_spec_by_name(gas_data, 'H2SO4')
+      character(len=12), parameter :: s_names(13) = (/ 'SO2         ', 'H2SO4       ', 'DMS         ', &
+         'MSA         ', 'DMSO        ', 'DMSO2       ', 'CH3SO2H     ', 'CH3SCH2OO   ', 'CH3SO2      ', &
+         'CH3SO3      ', 'CH3SO2OO    ', 'CH3SO2CH2OO ', 'SULFHOX     ' /)
+      logical, allocatable, save :: is_s(:)
+      integer :: i, js
+      if (.not. allocated(is_s)) then
+         allocate(is_s(gas_data_n_spec(gas_data)))
+         is_s = .false.
+         do i = 1, size(s_names)
+            js = gas_data_spec_by_name(gas_data, trim(s_names(i)))
+            if (js > 0) is_s(js) = .true.
+         end do
       end if
-      is_sulfur_gas = (j > 0 .and. (j == j_so2 .or. j == j_h2so4))
+      is_sulfur_gas = .false.
+      if (j > 0 .and. j <= size(is_s)) is_sulfur_gas = is_s(j)
    end function is_sulfur_gas
 
 
-   !> SO2 plus H2SO4 of an array over the gas species.
+   !> Sulfur of an array over the gas species (the species of is_sulfur_gas).
    real (kind=RKIND) function sulfur_gas_sum(a)
       real (kind=RKIND), intent(in) :: a(:)
       integer :: j
@@ -5336,7 +5362,7 @@ contains
       character (len=StrKIND), pointer :: config_start_time
       integer, pointer :: nCellsSolve, nVertLevels, index_qv
       integer :: iCell, k, j, n_before, n_cells, g_n_cells, n_gas, yr, mo, dy, hr, mi, sc, i_so2, i_h2so4, i_so4
-      real (kind=RKIND) :: so2_pre, so4_pre, s_burd(2,4)
+      real (kind=RKIND) :: so2_pre, so4_pre, s_burd(2,4), s_gas
       integer, parameter :: days_before(12) = (/ 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 /)
       type(spec_file_t) :: file
       type(env_state_t) :: env_state
@@ -5656,15 +5682,12 @@ contains
 
             if (mod(itimestep, 12) == 0 .or. itimestep == 1) then
                ! sulfur (mol): gas, then particles
-               sums(1) = sums(1) + (scalars(gas_idx(i_so2),k,iCell) + scalars(gas_idx(i_h2so4),k,iCell)) * 1.0d-9 &
-                                   * rho_zz(k,iCell) * zz(k,iCell) * vol / M_AIR
-               s_burd(1, band_of(iCell)) = s_burd(1, band_of(iCell)) &
-                    + (scalars(gas_idx(i_so2),k,iCell) + scalars(gas_idx(i_h2so4),k,iCell)) * 1.0d-9 &
-                      * rho_zz(k,iCell) * zz(k,iCell) * vol / M_AIR
+               s_gas = sulfur_gas_sum(scalars(gas_idx,k,iCell)) * 1.0d-9 * rho_zz(k,iCell) * zz(k,iCell) * vol / M_AIR
+               sums(1) = sums(1) + s_gas
+               s_burd(1, band_of(iCell)) = s_burd(1, band_of(iCell)) + s_gas
                s_burd(2, band_of(iCell)) = s_burd(2, band_of(iCell)) + cell_sulfate(aero_states(k,iCell), vol)
                do j = 1, aero_state_n_part(aero_states(k,iCell))
-                  sums(2) = sums(2) + aero_states(k,iCell)%apa%particle(j)%vol(i_so4) &
-                                      * aero_data%density(i_so4) / aero_data%molec_weight(i_so4) &
+                  sums(2) = sums(2) + particle_sulfate(aero_states(k,iCell)%apa%particle(j)) &
                                       * aero_weight_array_num_conc(aero_states(k,iCell)%awa, &
                                            aero_states(k,iCell)%apa%particle(j), aero_data) * vol
                   sums(3) = sums(3) + aero_states(k,iCell)%apa%particle(j)%vol(aero_data%i_water) &
@@ -5699,8 +5722,7 @@ contains
          t_local = t1 - t0
          ! net sulfur (mol) put in at the surface so far
          if (allocated(gas_emitted)) then
-            sums(4) = gas_emitted(i_so2) + gas_emitted(i_h2so4) - gas_deposited(i_so2) - gas_deposited(i_h2so4) &
-                      - gas_wetdep(i_so2) - gas_wetdep(i_h2so4)
+            sums(4) = sulfur_gas_sum(gas_emitted) - sulfur_gas_sum(gas_deposited) - sulfur_gas_sum(gas_wetdep)
          end if
          sums(4) = sums(4) - part_s_removed
          call mpas_dmpar_sum_real_array(domain % dminfo, 4, sums, g_sums)

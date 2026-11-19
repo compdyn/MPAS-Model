@@ -519,7 +519,8 @@ module mpas_atm_partmc
    logical :: pmc_checksum = .false.
    !> PMC_COAG_DUMP: up to this step, every task writes one line per cell and level of the
    !> coagulation inputs and outputs (hashes) to coag_dump_rNNNN.txt
-   integer :: pmc_coag_dump = 0, coag_dump_unit = -1
+   integer :: pmc_coag_dump = 0, coag_dump_unit = 0
+   logical :: coag_dump_open = .false.
    integer :: n_coag_total = 0
    !> Coagulation kernel bounds per level and the temperature (K) and pressure (Pa) range they
    !> hold for (lo, hi); a level is recomputed only when its cells leave that range.
@@ -6176,9 +6177,10 @@ contains
       dump = (itimestep <= pmc_coag_dump)
       if (dump) then
          call mpas_pool_get_array(mesh, 'indexToCellID', indexToCellID)
-         if (coag_dump_unit < 0) then
+         if (.not. coag_dump_open) then
             write(dump_name, '(a,i4.4,a)') 'coag_dump_r', domain % dminfo % my_proc_id, '.txt'
             open(newunit=coag_dump_unit, file=trim(dump_name), status='replace', action='write')
+            coag_dump_open = .true.
          end if
          call random_seed(size=n_rseed)
          allocate(rseed(n_rseed))
@@ -6373,9 +6375,12 @@ contains
       integer, pointer :: nCellsSolve, nVertLevels
       real (kind=RKIND), dimension(:,:,:), pointer :: scalars
       real (kind=RKIND), dimension(:,:), pointer :: theta_m
-      integer (kind=I8KIND) :: h(4), w
-      integer :: iCell, k, j, i
-      real (kind=RKIND) :: loc(5), glob(5)
+      type (mpas_pool_type), pointer :: diag
+      real (kind=RKIND), dimension(:,:), pointer :: exner, pressure_p
+      integer (kind=I8KIND) :: h(4), w, h_rng, h_env, h_k
+      integer, allocatable :: rseed(:)
+      integer :: iCell, k, j, i, n_rseed
+      real (kind=RKIND) :: loc(8), glob(8)
 
       if (.not. pmc_checksum) return
       call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
@@ -6384,8 +6389,25 @@ contains
       call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
       call mpas_pool_get_array(state, 'scalars', scalars, 2)
       call mpas_pool_get_array(state, 'theta_m', theta_m, 2)
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'diag', diag)
+      call mpas_pool_get_array(diag, 'exner', exner)
+      call mpas_pool_get_array(diag, 'pressure_p', pressure_p)
       h = 0
+      h_env = 0
+      h_k = 0
       loc = 0.0_RKIND
+      call random_seed(size=n_rseed)
+      allocate(rseed(n_rseed))
+      call random_seed(get=rseed)
+      h_rng = 0
+      do i = 1, n_rseed
+         h_rng = iand(h_rng + iand(int(rseed(i), I8KIND), M30) * i, M30)
+      end do
+      if (allocated(coag_kmax)) then
+         do k = 1, size(coag_kmax, 3)
+            h_k = iand(h_k + sum(pmc_fold(coag_kmax(:,:,k)) + pmc_fold(coag_kmin(:,:,k))) * k, M30)
+         end do
+      end if
       do iCell = 1, nCellsSolve
          do k = 1, nVertLevels
             w = int(mod(iCell, 997) * 64 + k, I8KIND)
@@ -6411,13 +6433,18 @@ contains
                h(3) = iand(h(3) + iand(pmc_fold(scalars(i,k,iCell)) * (w + i), M30), M30)
             end do
             h(4) = iand(h(4) + iand(pmc_fold(theta_m(k,iCell)) * w, M30), M30)
+            h_env = iand(h_env + iand((pmc_fold(exner(k,iCell)) + 3 * pmc_fold(pressure_p(k,iCell))) * w, M30), M30)
          end do
       end do
       loc(1:4) = real(h, RKIND)
-      call mpas_dmpar_sum_real_array(domain % dminfo, 5, loc, glob)
+      loc(6) = real(h_rng, RKIND)
+      loc(7) = real(h_env, RKIND)
+      loc(8) = real(h_k, RKIND)
+      call mpas_dmpar_sum_real_array(domain % dminfo, 8, loc, glob)
       call mpas_log_write('PartMC checksum step $i after '//trim(label)//': particles $r, particle $r, ' &
-                          // 'position $r, scalars $r, theta_m $r', intArgs=(/itimestep/), &
-                          realArgs=(/glob(5), glob(1), glob(2), glob(3), glob(4)/))
+                          // 'position $r, scalars $r, theta_m $r, random state $r, exner and p $r, coag bounds $r', &
+                          intArgs=(/itimestep/), realArgs=(/glob(5), glob(1), glob(2), glob(3), glob(4), &
+                          glob(6), glob(7), glob(8)/))
 
 #endif
 

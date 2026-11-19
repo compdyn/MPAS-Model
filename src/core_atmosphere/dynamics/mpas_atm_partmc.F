@@ -3553,6 +3553,44 @@ contains
    end subroutine ox_read
 
 
+   !> When the model date has moved past both months held for the monthly emission fields
+   !> (fires, DMS), hold the current month and the next one and read them again. Runs longer
+   !> than about a month needed this; before, they kept the second month.
+   subroutine emis_months_update(domain, mo_now)
+      type (domain_type), intent(inout) :: domain
+      integer, intent(in) :: mo_now
+      real (kind=RKIND), allocatable :: cell_vals(:)
+      integer :: ib, j, n
+      logical :: found
+
+      if (emis_mo(1) == 0 .or. mo_now == emis_mo(1) .or. mo_now == emis_mo(2)) return
+      emis_mo = (/ mo_now, modulo(mo_now, 12) + 1 /)
+      n = 0
+      if (allocated(bb_bc)) n = size(bb_bc, 1)
+      if (allocated(dms_w)) n = size(dms_w, 1)
+      if (n == 0) return
+      allocate(cell_vals(n))
+      do ib = 1, 2
+         if (allocated(bb_bc)) then
+            call emis_read_month(domain, 'bc_bb', ib, cell_vals, found)
+            bb_bc(:,ib) = max(0.0_RKIND, cell_vals) * emis_scale
+            call emis_read_month(domain, 'oc_bb', ib, cell_vals, found)
+            bb_oc(:,ib) = max(0.0_RKIND, cell_vals) * emis_scale
+         end if
+         if (allocated(gas_bb)) then
+            gas_bb(:,:,ib) = 0.0_RKIND
+            do j = 1, size(gas_bb, 1)
+               call emis_read_month(domain, 'gas_bb_' // trim(gas_data%name(j)), ib, cell_vals, found)
+               if (found) gas_bb(j,:,ib) = max(0.0_RKIND, cell_vals) * emis_scale
+            end do
+            call emis_read_month(domain, 'dms', ib, cell_vals, found)
+            dms_w(:,ib) = max(0.0_RKIND, cell_vals)
+         end if
+      end do
+      call mpas_log_write('PartMC: monthly fire and DMS fields now months $i and $i', intArgs=emis_mo)
+   end subroutine emis_months_update
+
+
    !> Read the monthly field prefix_MM of the emissions file for slot ib (month emis_mo(ib)). An
    !> older file with only some months (the first runs had 02 and 03): the nearest month it has
    !> is used instead, and the substitution is logged.
@@ -3746,6 +3784,7 @@ contains
       call mpas_pool_get_array(sfc_input, 'snowh', snowh)
       ! the months held for fires and DMS: that of the first emission step and the next
       if (emis_mo(1) == 0) emis_mo = (/ mo_now, modulo(mo_now, 12) + 1 /)
+      call emis_months_update(domain, mo_now)
       i_mo = merge(1, 2, mo_now == emis_mo(1))
       cur_dg = carb_dg
 
@@ -4420,6 +4459,7 @@ contains
       extra = 0.0_RKIND
       if (allocated(gas_bb)) then
          call model_date(domain, mo_now, t_now)
+         call emis_months_update(domain, mo_now)
          i_mo = merge(1, 2, mo_now == emis_mo(1))
          call mpas_pool_get_subpool(domain % blocklist % structs, 'diag_physics', dphys)
          call mpas_pool_get_array(dphys, 'u10', u10)

@@ -517,6 +517,9 @@ module mpas_atm_partmc
    !> Brownian coagulation in every cell each step, and events so far.
    logical :: pmc_coag = .false.
    logical :: pmc_checksum = .false.
+   !> PMC_COAG_DUMP: at this step, every task writes one line per cell and level of the
+   !> coagulation inputs and outputs (hashes) to coag_dump_rNNNN.txt
+   integer :: pmc_coag_dump = 0, coag_dump_unit = -1
    integer :: n_coag_total = 0
    !> Coagulation kernel bounds per level and the temperature (K) and pressure (Pa) range they
    !> hold for (lo, hi); a level is recomputed only when its cells leave that range.
@@ -626,6 +629,8 @@ contains
          q_background = q_background * num_scale
          q_blob = q_blob * num_scale
       end if
+      call get_environment_variable('PMC_COAG_DUMP', envval, status=stat)
+      if (stat == 0) read(envval, *) pmc_coag_dump
       call get_environment_variable('PMC_CHECKSUM', envval, status=stat)
       if (stat == 0) pmc_checksum = (trim(envval) == '1')
       call get_environment_variable('PMC_COAG', envval, status=stat)
@@ -6089,6 +6094,12 @@ contains
       real (kind=dp) :: del_t
       ! CPU time (s) of the parts: kernel bounds, class remap and sort, mc_coag, positions, rebalance
       real (kind=RKIND) :: tc(5), g_tc(5), g_tc_max(5), ta, tb, s_before, s_after, cs2(2), g_cs2(2)
+      integer, pointer :: indexToCellID(:)
+      integer, allocatable :: rseed(:)
+      integer (kind=I8KIND) :: h_pre, h_rng, h_k, h_env
+      integer :: n_rseed, i_dump
+      logical :: dump
+      character(len=32) :: dump_name
 
       if (.not. pmc_coag .or. pmc_n_part <= 0) return
 
@@ -6162,6 +6173,16 @@ contains
       allocate(ids(4*pmc_n_part + 16), xs(NPOS, 4*pmc_n_part + 16))
       call cpu_time(tb)
       tc(1) = tb - ta
+      dump = (itimestep == pmc_coag_dump)
+      if (dump) then
+         call mpas_pool_get_array(mesh, 'indexToCellID', indexToCellID)
+         if (coag_dump_unit < 0) then
+            write(dump_name, '(a,i4.4,a)') 'coag_dump_r', domain % dminfo % my_proc_id, '.txt'
+            open(newunit=coag_dump_unit, file=trim(dump_name), status='replace', action='write')
+         end if
+         call random_seed(size=n_rseed)
+         allocate(rseed(n_rseed))
+      end if
 
       do iCell = 1, nCellsSolve
          do k = 1, nVertLevels
@@ -6209,7 +6230,23 @@ contains
             aero_states(k,iCell)%aero_sorted%coag_kernel_bounds_valid = .true.
             call cpu_time(tb)
             tc(2) = tc(2) + tb - ta
+            if (dump) then
+               h_pre = pmc_cell_hash(aero_states(k,iCell))
+               call random_seed(get=rseed)
+               h_rng = 0
+               do i_dump = 1, n_rseed
+                  h_rng = iand(h_rng + int(rseed(i_dump), I8KIND) * i_dump, 1073741823_I8KIND)
+               end do
+               h_k = 0
+               do i_dump = 1, n_bin
+                  h_k = iand(h_k + sum(pmc_fold(coag_kmax(:,i_dump,k)) + pmc_fold(coag_kmin(:,i_dump,k))) * i_dump, &
+                             1073741823_I8KIND)
+               end do
+               h_env = iand(pmc_fold(env_state%temp) + 3 * pmc_fold(env_state%pressure), 1073741823_I8KIND)
+            end if
             call mc_coag(COAG_KERNEL_TYPE_BROWN, env_state, aero_data, aero_states(k,iCell), del_t, n_samp, n_coag)
+            if (dump) write(coag_dump_unit, '(i4,i8,i4,i6,4i12,2i8,i12)') itimestep, indexToCellID(iCell), k, n0, &
+               h_pre, h_rng, h_k, h_env, n_samp, n_coag, pmc_cell_hash(aero_states(k,iCell))
             call cpu_time(ta)
             tc(3) = tc(3) + ta - tb
             n_coag_total = n_coag_total + n_coag
@@ -6269,6 +6306,10 @@ contains
          end do
       end do
 
+      if (dump) then
+         flush(coag_dump_unit)
+         if (itimestep == pmc_coag_dump) close(coag_dump_unit)
+      end if
       call mpas_dmpar_sum_real_array(domain % dminfo, 5, tc, g_tc)
       call mpas_dmpar_max_real_array(domain % dminfo, 5, tc, g_tc_max)
       if (itimestep <= 15 .or. mod(itimestep, 12) == 0) then
@@ -6292,6 +6333,29 @@ contains
 
    end subroutine atm_partmc_coagulation
 
+
+   !> The 64 bits of x folded into 30.
+   elemental integer (kind=I8KIND) function pmc_fold(x)
+      real (kind=RKIND), intent(in) :: x
+      integer (kind=I8KIND) :: b
+      b = transfer(x, b)
+      pmc_fold = iand(ieor(ieor(b, ishft(b, -30)), ishft(b, -60)), 1073741823_I8KIND)
+   end function pmc_fold
+
+   !> 30-bit hash of the particles of one cell in their order (volumes, ids, weight classes).
+   integer (kind=I8KIND) function pmc_cell_hash(as)
+      type(aero_state_t), intent(in) :: as
+      integer (kind=I8KIND), parameter :: M30 = 1073741823_I8KIND
+      integer :: j, i
+      pmc_cell_hash = 0
+      do j = 1, aero_state_n_part(as)
+         do i = 1, size(as%apa%particle(j)%vol)
+            pmc_cell_hash = iand(pmc_cell_hash + iand(pmc_fold(as%apa%particle(j)%vol(i)) * (j + 5*i), M30), M30)
+         end do
+         pmc_cell_hash = iand(pmc_cell_hash + iand((as%apa%particle(j)%id + 7 * as%apa%particle(j)%weight_class) &
+                         * (j + 1), M30), M30)
+      end do
+   end function pmc_cell_hash
 
    !> Exact, order-independent sums over all tasks of 30-bit hashes of the particle state
    !> (species volumes, ids, weight classes, in particle order), the particle positions, all
@@ -6330,7 +6394,7 @@ contains
                do j = 1, aero_state_n_part(aero_states(k,iCell))
                   associate (p => aero_states(k,iCell)%apa%particle(j))
                      do i = 1, size(p%vol)
-                        h(1) = iand(h(1) + iand(fold(p%vol(i)) * (w + j + 5*i), M30), M30)
+                        h(1) = iand(h(1) + iand(pmc_fold(p%vol(i)) * (w + j + 5*i), M30), M30)
                      end do
                      h(1) = iand(h(1) + iand((p%id + 7 * p%weight_class) * (j + 1), M30), M30)
                   end associate
@@ -6339,14 +6403,14 @@ contains
             if (allocated(pos)) then
                do j = 1, pos(k,iCell)%n
                   do i = 1, NPOS
-                     h(2) = iand(h(2) + iand(fold(pos(k,iCell)%x(i,j)) * (w + j + 3*i), M30), M30)
+                     h(2) = iand(h(2) + iand(pmc_fold(pos(k,iCell)%x(i,j)) * (w + j + 3*i), M30), M30)
                   end do
                end do
             end if
             do i = 1, size(scalars, 1)
-               h(3) = iand(h(3) + iand(fold(scalars(i,k,iCell)) * (w + i), M30), M30)
+               h(3) = iand(h(3) + iand(pmc_fold(scalars(i,k,iCell)) * (w + i), M30), M30)
             end do
-            h(4) = iand(h(4) + iand(fold(theta_m(k,iCell)) * w, M30), M30)
+            h(4) = iand(h(4) + iand(pmc_fold(theta_m(k,iCell)) * w, M30), M30)
          end do
       end do
       loc(1:4) = real(h, RKIND)
@@ -6355,15 +6419,6 @@ contains
                           // 'position $r, scalars $r, theta_m $r', intArgs=(/itimestep/), &
                           realArgs=(/glob(5), glob(1), glob(2), glob(3), glob(4)/))
 
-   contains
-
-      !> The 64 bits of x folded into 30.
-      integer (kind=I8KIND) function fold(x)
-         real (kind=RKIND), intent(in) :: x
-         integer (kind=I8KIND) :: b
-         b = transfer(x, b)
-         fold = iand(ieor(ieor(b, ishft(b, -30)), ishft(b, -60)), M30)
-      end function fold
 #endif
 
    end subroutine atm_partmc_checksum

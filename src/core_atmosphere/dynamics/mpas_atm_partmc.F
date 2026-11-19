@@ -517,8 +517,8 @@ module mpas_atm_partmc
    !> Brownian coagulation in every cell each step, and events so far.
    logical :: pmc_coag = .false.
    logical :: pmc_checksum = .false.
-   !> PMC_COAG_DUMP: at this step, every task writes one line per cell and level of the
-   !> coagulation inputs and outputs (hashes) to coag_dump_rNNNN.txt
+   !> PMC_COAG_DUMP: up to this step, every task writes one line per cell and level of the
+   !> coagulation inputs and outputs (hashes) to coag_dump_rNNNN.txt, one line per cell and level
    integer :: pmc_coag_dump = 0, coag_dump_unit = -1
    integer :: n_coag_total = 0
    !> Coagulation kernel bounds per level and the temperature (K) and pressure (Pa) range they
@@ -6173,7 +6173,7 @@ contains
       allocate(ids(4*pmc_n_part + 16), xs(NPOS, 4*pmc_n_part + 16))
       call cpu_time(tb)
       tc(1) = tb - ta
-      dump = (itimestep == pmc_coag_dump)
+      dump = (itimestep <= pmc_coag_dump)
       if (dump) then
          call mpas_pool_get_array(mesh, 'indexToCellID', indexToCellID)
          if (coag_dump_unit < 0) then

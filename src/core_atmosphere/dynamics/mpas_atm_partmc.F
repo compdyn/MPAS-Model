@@ -114,6 +114,7 @@
 !   PMC_AERO_DATA     PartMC aerosol species file (default aero_data.dat)
 !   PMC_RESTART_INTERVAL  write the complete particle state every this many steps (0 = never)
 !                     to PMC_RESTART_DIR (default pmc_restart), one binary file per MPI task
+!   PMC_SEED          on a restart: start a new random stream from this seed instead of the saved one
 !   PMC_RESTART_READ  step number of the particle state to read at start-up, for a model
 !                     restart from the same time with the same number of tasks and partition
 !   PMC_DIAG_INTERVAL write time-mean aerosol fields of every cell (number, CCN, species
@@ -1591,7 +1592,8 @@ contains
       type (mpas_pool_type), pointer :: mesh
       integer, dimension(:), pointer :: indexToCellID
       integer, pointer :: nCellsSolve, nVertLevels
-      integer :: u, iCell, k, n, nb, p, n_seed, has_gas, hdr(7), ios, n_in
+      integer :: u, iCell, k, n, nb, p, n_seed, has_gas, hdr(7), ios, n_in, stat_seed, seed_new
+      character(len=64) :: seed_env
       integer, allocatable :: seed(:), ids(:)
       character, allocatable :: buf(:)
       integer (kind=I8KIND) :: n_tot, n_chk
@@ -1670,6 +1672,15 @@ contains
       end if
       ! last, so that nothing above has drawn random numbers after the state was set
       call random_seed(put=seed)
+      ! PMC_SEED: a new random stream instead of the saved one, for runs that differ only in
+      ! their random numbers (sampling-noise tests)
+      call get_environment_variable('PMC_SEED', seed_env, status=stat_seed)
+      if (stat_seed == 0) then
+         read(seed_env, *) seed_new
+         call pmc_srand(seed_new, domain % dminfo % my_proc_id)
+         if (domain % dminfo % my_proc_id == 0) call mpas_log_write('PartMC: random stream reseeded with $i', &
+                                                                     intArgs=(/seed_new/))
+      end if
       if (domain % dminfo % my_proc_id == 0) then
          call mpas_log_write('PartMC: particle state read from ' // trim(pmc_restart_dir) // ', step $i', &
                              intArgs=(/pmc_restart_read/))

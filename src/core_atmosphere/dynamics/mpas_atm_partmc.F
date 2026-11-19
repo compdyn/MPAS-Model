@@ -61,6 +61,14 @@
 !                     Every emitted particle carries source_id = source + 16 * region + 256 *
 !                     (global cell ID of the cell it was emitted in) and its emission time (s
 !                     since 2000-01-01); regions as in region_of.
+!   PMC_NPF           new particle formation (lagrangian mode, needs MOSAIC): 1 in the boundary
+!                     layer (below hpbl; always the lowest layer), 2 at all heights. Rate J1 =
+!                     PMC_NPF_A [H2SO4] (activation type, default A 1e-6 s^-1) carried to dry
+!                     diameter PMC_NPF_D (default 10 nm) with the survival of Kerminen and Kulmala
+!                     (2002) from the cell's condensation sink and a growth rate PMC_NPF_GR0 (nm/h,
+!                     default 1, for the organics) + 0.5 [H2SO4]/1e7 cm^-3; sulfate particles of
+!                     source kind 13 made from the gas H2SO4
+!   PMC_DMS_CHEM      1 = DMS emitted as DMS for MOSAIC's marine chemistry (default: as SO2)
 !   PMC_SEASALT       1 = sea salt particles emitted over open water from the 10-m wind speed
 !                     with the flux of Gong (2003), dry diameters 0.07-10 um; PMC_SEASALT_SCALE
 !                     multiplies it
@@ -455,6 +463,13 @@ module mpas_atm_partmc
    !> PMC_DMS_CHEM: emit DMS as DMS (MOSAIC's marine mechanism then makes SO2 and MSA) instead
    !> of as SO2.
    logical :: pmc_dms_chem = .false.
+   !> New particle formation (PMC_NPF, see the header): mode, A (s^-1), diameter (m), growth rate
+   !> without H2SO4 (nm/h); real particles nucleated and their sulfur (mol) by this task since
+   !> the start of the run; source kind of the new particles.
+   integer :: pmc_npf = 0
+   real (kind=RKIND) :: npf_a = 1.0e-6_RKIND, npf_d = 1.0e-8_RKIND, npf_gr0 = 1.0_RKIND
+   real (kind=RKIND) :: npf_n = 0.0_RKIND, npf_s = 0.0_RKIND
+   integer, parameter :: K_NPF = 13
    !> Budget by species group (BC, POM, SO4, NO3, NH4, SOA, sea salt, dust, MSA): particle mass
    !> (kg) removed by this task since the start of the run by dry deposition, grid-scale and
    !> convective wet removal; the group of each aerosol species (0 = none, e.g. water).
@@ -698,6 +713,14 @@ contains
       if (stat == 0) read(envval, *) dms_scale
       call get_environment_variable('PMC_DMS_CHEM', envval, status=stat)
       if (stat == 0) pmc_dms_chem = (trim(envval) == '1')
+      call get_environment_variable('PMC_NPF', envval, status=stat)
+      if (stat == 0) read(envval, *) pmc_npf
+      call get_environment_variable('PMC_NPF_A', envval, status=stat)
+      if (stat == 0) read(envval, *) npf_a
+      call get_environment_variable('PMC_NPF_D', envval, status=stat)
+      if (stat == 0) read(envval, *) npf_d
+      call get_environment_variable('PMC_NPF_GR0', envval, status=stat)
+      if (stat == 0) read(envval, *) npf_gr0
       call get_environment_variable('PMC_SEASALT_SCALE', envval, status=stat)
       if (stat == 0) read(envval, *) seasalt_scale
       call get_environment_variable('PMC_Q_BACKGROUND', envval, status=stat)
@@ -4912,6 +4935,94 @@ contains
    end subroutine note_removal
 
 
+   !> New particle formation in cell (k,iCell) after its MOSAIC step (PMC_NPF, see the header).
+   !> h2so4: the gas H2SO4 (ppb), lowered by what goes into the new particles; vol: cell volume
+   !> (m3); s_mol: sulfur moved into new particles (mol). The weight level is chosen as for
+   !> emissions, but never so heavy that one particle needs more than half the gas H2SO4.
+   subroutine npf_cell(k, iCell, vol, temp, pres, dt, t_now, h2so4, nCells, nEdgesOnCell, cellsOnCell, &
+                       src_code, s_mol)
+      integer, intent(in) :: k, iCell, nCells, src_code
+      real (kind=RKIND), intent(in) :: vol
+      real (kind=dp), intent(in) :: temp, pres, dt, t_now
+      real (kind=dp), intent(inout) :: h2so4
+      integer, dimension(:), intent(in) :: nEdgesOnCell
+      integer, dimension(:,:), intent(in) :: cellsOnCell
+      real (kind=RKIND), intent(out) :: s_mol
+      real (kind=dp), parameter :: k_b = 1.380649d-23, n_av = 6.02214076d23
+      real (kind=dp) :: n_air, c_a, j1, cs_p, d_v, c_bar, lam, kn, d_w, gr, eta, j_d, n_cell, n_have, &
+                        w_new, f_new, v_new, mol_one, mol_avail, x2
+      real (kind=RKIND) :: x(NPOS)
+      real (kind=dp), allocatable :: vols(:)
+      type(aero_particle_t) :: particle
+      integer :: jp, g_new, n_new, i_new
+      integer, save :: i_so4 = -1
+
+      s_mol = 0.0_RKIND
+      if (i_so4 < 0) i_so4 = aero_data_spec_by_name(aero_data, 'SO4')
+      n_air = pres / (k_b * temp)
+      c_a = h2so4 * 1.0d-9 * n_air * 1.0d-6
+      if (c_a < 1.0d3) return
+      j1 = npf_a * c_a
+      ! condensation sink CS' (m^-2): sum of N d beta(Kn) over the particles, wet diameter,
+      ! Fuchs-Sutugin with accommodation 1, H2SO4 diffusivity and mean speed
+      d_v = 1.1d-5 * (temp / 298.0d0)**1.75d0 * (101325.0d0 / pres)
+      c_bar = sqrt(8.0d0 * k_b * temp * n_av / (pii * 98.08d-3))
+      lam = 3.0d0 * d_v / c_bar
+      cs_p = 0.0d0
+      do jp = 1, aero_state_n_part(aero_states(k,iCell))
+         d_w = 2.0d0 * aero_particle_radius(aero_states(k,iCell)%apa%particle(jp), aero_data)
+         kn = 2.0d0 * lam / d_w
+         cs_p = cs_p + aero_weight_array_num_conc(aero_states(k,iCell)%awa, aero_states(k,iCell)%apa%particle(jp), &
+                                                  aero_data) * d_w * (1.0d0 + kn) / (1.0d0 + 1.71d0*kn + 1.33d0*kn*kn)
+      end do
+      ! Kerminen and Kulmala (2002): J_d = J_1 exp(eta (1/d - 1/d_1)), d in nm, d_1 = 1 nm,
+      ! eta = gamma CS'/GR with gamma = 0.23 nm^2 m^2 h^-1
+      gr = npf_gr0 + 0.5d0 * c_a / 1.0d7
+      eta = 0.23d0 * cs_p / gr
+      j_d = j1 * exp(eta * (1.0d0 / (npf_d * 1.0d9) - 1.0d0))
+      n_cell = j_d * 1.0d6 * dt * vol
+      v_new = pii / 6.0d0 * real(npf_d, dp)**3
+      mol_one = v_new * aero_data%density(i_so4) / aero_data%molec_weight(i_so4)
+      mol_avail = h2so4 * 1.0d-9 * n_air / n_av * vol
+      n_cell = min(n_cell, 0.5d0 * mol_avail / mol_one)
+      if (n_cell * mol_one < 1.0d-30) return
+      n_have = 0.0d0
+      do jp = 1, pos(k,iCell) % n
+         n_have = n_have + lagr_w * 2.0d0**(aero_states(k,iCell)%apa%particle(jp)%weight_class - LAGR_G0)
+      end do
+      n_have = max(n_have, n_cell)
+      g_new = LAGR_G0 + nint(log(n_have / (real(pmc_n_part, dp) * lagr_w)) / log(2.0d0))
+      x2 = log(0.5d0 * mol_avail / mol_one / lagr_w) / log(2.0d0)
+      g_new = min(g_new, LAGR_G0 + floor(x2))
+      g_new = max(1, min(LAGR_GROUPS, g_new))
+      w_new = lagr_w * 2.0d0**(g_new - LAGR_G0)
+      if (w_new * mol_one > 0.5d0 * mol_avail) return
+      f_new = n_cell / w_new
+      n_new = int(f_new)
+      if (pmc_random() < f_new - real(n_new, dp)) n_new = n_new + 1
+      if (n_new == 0) return
+      allocate(vols(aero_data_n_spec(aero_data)))
+      vols = 0.0d0
+      vols(i_so4) = v_new
+      do i_new = 1, n_new
+         call aero_particle_zero(particle, aero_data)
+         call aero_particle_set_component(particle, src_code, t_now)
+         particle%n_primary_parts = 1
+         call aero_particle_set_vols(particle, vols)
+         call aero_particle_new_id(particle)
+         call aero_particle_set_weight(particle, 1, g_new)
+         call aero_state_add_particle(aero_states(k,iCell), particle, aero_data)
+         call random_in_cell(iCell, k, nCells, nEdgesOnCell, cellsOnCell, x(1:4))
+         x(5:7) = x(1:3)
+         call pos_append(pos(k,iCell), x)
+      end do
+      s_mol = real(n_new, dp) * w_new * mol_one
+      h2so4 = max(0.0d0, h2so4 - s_mol / (n_air / n_av * vol) * 1.0d9)
+      npf_n = npf_n + real(n_new, dp) * w_new
+      npf_s = npf_s + s_mol
+   end subroutine npf_cell
+
+
    !> Sulfur (mol) of sulfate and MSA in one real particle represented by a computational particle.
    function particle_sulfate(particle)
       type(aero_particle_t), intent(in) :: particle
@@ -5362,7 +5473,13 @@ contains
       character (len=StrKIND), pointer :: config_start_time
       integer, pointer :: nCellsSolve, nVertLevels, index_qv
       integer :: iCell, k, j, n_before, n_cells, g_n_cells, n_gas, yr, mo, dy, hr, mi, sc, i_so2, i_h2so4, i_so4
-      real (kind=RKIND) :: so2_pre, so4_pre, s_burd(2,4), s_gas
+      real (kind=RKIND) :: so2_pre, so4_pre, s_burd(2,4), s_gas, s_npf, z_mid, npf_g(2), g_npf(2)
+      real (kind=RKIND), dimension(:), pointer :: hpbl
+      integer, dimension(:), pointer :: nEdgesOnCell
+      integer, dimension(:,:), pointer :: cellsOnCell
+      integer, pointer :: nCells
+      integer :: mo_npf
+      real (kind=dp) :: t_npf
       integer, parameter :: days_before(12) = (/ 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 /)
       type(spec_file_t) :: file
       type(env_state_t) :: env_state
@@ -5414,6 +5531,17 @@ contains
       call mpas_pool_get_array(diag, 'pressure_p', pressure_p)
       call mpas_pool_get_array(diag, 'pressure_base', pressure_base)
       nullify(cldfrac)
+      nullify(hpbl)
+      if (pmc_npf > 0) then
+         if (pmc_mode /= MODE_LAGR) call mpas_log_write('PartMC: PMC_NPF needs the lagrangian mode', &
+                                                        messageType=MPAS_LOG_CRIT)
+         call mpas_pool_get_dimension(mesh, 'nCells', nCells)
+         call mpas_pool_get_array(mesh, 'nEdgesOnCell', nEdgesOnCell)
+         call mpas_pool_get_array(mesh, 'cellsOnCell', cellsOnCell)
+         call mpas_pool_get_subpool(domain % blocklist % structs, 'diag_physics', diag_physics)
+         call mpas_pool_get_array(diag_physics, 'hpbl', hpbl)
+         call model_date(domain, mo_npf, t_npf)
+      end if
       if (pmc_aq) then
          call mpas_pool_get_dimension(state, 'index_qc', index_qc)
          call mpas_pool_get_subpool(domain % blocklist % structs, 'diag_physics', diag_physics)
@@ -5546,6 +5674,17 @@ contains
                if (aero_state_n_part(aero_states(k,iCell)) /= n_before) then
                   call mpas_log_write('PartMC: MOSAIC changed the number of particles in a cell', &
                                       messageType=MPAS_LOG_CRIT)
+               end if
+               if (pmc_npf > 0 .and. i_h2so4 > 0) then
+                  z_mid = 0.5_RKIND * (zgrid(k,iCell) + zgrid(k+1,iCell)) - zgrid(1,iCell)
+                  if (pmc_npf == 2 .or. k == 1 .or. (associated(hpbl) .and. z_mid < hpbl(iCell))) then
+                     call npf_cell(k, iCell, vol, env_state%temp, env_state%pressure, del_t, t_npf, &
+                                   gas_state%mix_rat(i_h2so4), nCells, nEdgesOnCell, cellsOnCell, &
+                                   K_NPF + SRC_STRIDE * region_of(latCell(iCell) * 180.0_RKIND / pii, &
+                                   lonCell(iCell) * 180.0_RKIND / pii) + SRC_STRIDE * SRC_STRIDE * indexToCellID(iCell), &
+                                   s_npf)
+                     s_bud(SB_COND, band_of(iCell)) = s_bud(SB_COND, band_of(iCell)) + s_npf
+                  end if
                end if
                scalars(gas_idx,k,iCell) = gas_state%mix_rat * moist_fac
                s_bud(SB_GOX, band_of(iCell)) = s_bud(SB_GOX, band_of(iCell)) &
@@ -5719,6 +5858,11 @@ contains
       end if
       if (mod(itimestep, 12) == 0 .or. itimestep == 1) then
          call mpas_log_write('PartMC: largest cos(zenith) diff of MOSAIC from a direct calculation $r', realArgs=(/g_zen/))
+         if (pmc_npf > 0) then
+            npf_g = (/ npf_n, npf_s /)
+            call mpas_dmpar_sum_real_array(domain % dminfo, 2, npf_g, g_npf)
+            call mpas_log_write('PartMC: nucleated since the start of this run $r particles, $r mol S', realArgs=g_npf)
+         end if
          t_local = t1 - t0
          ! net sulfur (mol) put in at the surface so far
          if (allocated(gas_emitted)) then

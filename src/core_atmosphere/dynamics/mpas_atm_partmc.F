@@ -482,6 +482,13 @@ module mpas_atm_partmc
    real (kind=RKIND) :: seasalt_scale = 1.0_RKIND, ss_unit = 0.0_RKIND
    integer, parameter :: N_SS = 80
    real (kind=RKIND) :: ss_edge(N_SS+1), ss_cum(N_SS)
+   !> Sea salt: cumulative share of the volume by bin, and the mean volume (m3) of an emitted particle.
+   real (kind=RKIND) :: ss_mcum(N_SS), ss_vmean = 0.0_RKIND
+   !> PMC_EMIT_MFRAC: share of the emitted carbonaceous and sea salt particles drawn from the
+   !> mass distribution instead of the number distribution (0, default: none; 0.5 is the
+   !> two-group form of notes/07). Each such particle gets the weight w m_mean/m, rounded at
+   !> random to a neighbouring power of two, so number and mass are unbiased.
+   real (kind=RKIND) :: emit_mfrac = 0.0_RKIND
    !> Sums by this task so far: carbonaceous number (reference, particles) and mass (inventory,
    !> particles, kg); sea salt number (expected, particles) and mass (particles, kg).
    real (kind=RKIND) :: emis_sums(7) = 0.0_RKIND
@@ -711,6 +718,8 @@ contains
       if (stat == 0) read(envval, *) bio_scale
       call get_environment_variable('PMC_DMS_SCALE', envval, status=stat)
       if (stat == 0) read(envval, *) dms_scale
+      call get_environment_variable('PMC_EMIT_MFRAC', envval, status=stat)
+      if (stat == 0) read(envval, *) emit_mfrac
       call get_environment_variable('PMC_DMS_CHEM', envval, status=stat)
       if (stat == 0) pmc_dms_chem = (trim(envval) == '1')
       call get_environment_variable('PMC_NPF', envval, status=stat)
@@ -3887,6 +3896,14 @@ contains
             end do
             ss_unit = ss_cum(N_SS)
             ss_cum = ss_cum / ss_unit
+            ! volume by bin (number uniform in log d within a bin)
+            do ib = 1, N_SS
+               ss_mcum(ib) = (ss_cum(ib) - merge(0.0_RKIND, ss_cum(max(1, ib-1)), ib == 1)) &
+                             * (ss_edge(ib+1)**3 - ss_edge(ib)**3) / (3.0_RKIND * log(ss_edge(ib+1) / ss_edge(ib)))
+               if (ib > 1) ss_mcum(ib) = ss_mcum(ib) + ss_mcum(ib-1)
+            end do
+            ss_vmean = pii / 6.0_RKIND * ss_mcum(N_SS)
+            ss_mcum = ss_mcum / ss_mcum(N_SS)
             call mpas_log_write('PartMC: sea salt number flux at 10 m/s = $r m^-2 s^-1, times $r', &
                                 realArgs=(/ss_unit * 10.0_RKIND**3.41_RKIND, seasalt_scale/))
          end if
@@ -4086,9 +4103,9 @@ contains
       subroutine emit_kind(i_kind, kk, n_area)
          integer, intent(in) :: i_kind, kk
          real (kind=RKIND), intent(in) :: n_area
-         real (kind=RKIND) :: m_kk, n_have, w_new, f_new, u
-         integer :: g_new, n_new, i_new, jp, ibin
-         real (kind=dp) :: d_new, v_new, m_new
+         real (kind=RKIND) :: m_kk, n_have, w_new, f_new, u, f_g
+         integer :: g_new, n_new, i_new, jp, ibin, i_grp, g_p
+         real (kind=dp) :: d_new, v_new, m_new, m_kind, w_p, x2
 
          if (n_area <= 0.0_RKIND) return
          m_kk = rho_zz(kk,iCell) / rdzw(kk)
@@ -4106,44 +4123,80 @@ contains
          g_new = max(1, min(LAGR_GROUPS, g_new))
          w_new = lagr_w * 2.0_RKIND**(g_new - LAGR_G0)
          f_new = n_area * areaCell(iCell) / w_new
-         n_new = int(f_new)
-         if (pmc_random() < f_new - real(n_new, kind=RKIND)) n_new = n_new + 1
-         do i_new = 1, n_new
-            call aero_particle_zero(particle, aero_data)
-            vols = 0.0d0
-            if (i_kind == 3 .or. (i_kind >= 5 .and. i_kind <= K_BB)) then
-               d_new = cur_dg * exp(log(carb_sigma) * rand_normal(0.0d0, 1.0d0))
-               v_new = pii / 6.0d0 * d_new**3
-               ! volumes from the mass fraction of BC
-               vols(i_bc) = v_new * (f_bc / aero_data%density(i_bc)) * rho_mix
-               vols(i_oc) = v_new - vols(i_bc)
-               m_new = v_new * rho_mix
-               emis_sums(2) = emis_sums(2) + w_new
-               emis_sums(4) = emis_sums(4) + w_new * m_new
+         ! mean mass of an emitted particle of this kind (kg)
+         if (i_kind == 4) then
+            m_kind = ss_vmean / (0.3934d0 / aero_data%density(i_na) + 0.6066d0 / aero_data%density(i_cl))
+         else
+            m_kind = rho_mix * pii / 6.0d0 * cur_dg**3 * exp(4.5d0 * log(carb_sigma)**2)
+         end if
+         ! group 1 from the number distribution at weight w_new, group 2 (PMC_EMIT_MFRAC) from
+         ! the mass distribution at weight w_new m_kind / m
+         do i_grp = 1, 2
+            if (i_grp == 1) then
+               f_g = (1.0_RKIND - emit_mfrac) * f_new
             else
-               u = pmc_random()
-               do ibin = 1, N_SS - 1
-                  if (u <= ss_cum(ibin)) exit
-               end do
-               d_new = ss_edge(ibin) * (ss_edge(ibin+1) / ss_edge(ibin))**pmc_random()
-               v_new = pii / 6.0d0 * d_new**3
-               ! NaCl by mass: 39.34% Na, 60.66% Cl
-               m_new = v_new / (0.3934d0 / aero_data%density(i_na) + 0.6066d0 / aero_data%density(i_cl))
-               vols(i_na) = 0.3934d0 * m_new / aero_data%density(i_na)
-               vols(i_cl) = 0.6066d0 * m_new / aero_data%density(i_cl)
-               emis_sums(6) = emis_sums(6) + w_new
-               emis_sums(7) = emis_sums(7) + w_new * m_new
-               kind_mass(4) = kind_mass(4) + w_new * m_new
+               if (emit_mfrac <= 0.0_RKIND) exit
+               f_g = emit_mfrac * f_new
             end if
-            call aero_particle_set_component(particle, source_code(i_kind, iCell), t_now)
-            particle%n_primary_parts = 1
-            call aero_particle_set_vols(particle, vols)
-            call aero_particle_new_id(particle)
-            call aero_particle_set_weight(particle, 1, g_new)
-            call aero_state_add_particle(aero_states(kk,iCell), particle, aero_data)
-            call random_in_cell(iCell, kk, nCells, nEdgesOnCell, cellsOnCell, x(1:4))
-            x(5:7) = x(1:3)
-            call pos_append(pos(kk,iCell), x)
+            n_new = int(f_g)
+            if (pmc_random() < f_g - real(n_new, kind=RKIND)) n_new = n_new + 1
+            do i_new = 1, n_new
+               call aero_particle_zero(particle, aero_data)
+               vols = 0.0d0
+               if (i_kind == 3 .or. (i_kind >= 5 .and. i_kind <= K_BB)) then
+                  d_new = cur_dg * exp(log(carb_sigma) * rand_normal(0.0d0, 1.0d0))
+                  if (i_grp == 2) d_new = d_new * exp(3.0d0 * log(carb_sigma)**2)
+                  v_new = pii / 6.0d0 * d_new**3
+                  ! volumes from the mass fraction of BC
+                  vols(i_bc) = v_new * (f_bc / aero_data%density(i_bc)) * rho_mix
+                  vols(i_oc) = v_new - vols(i_bc)
+                  m_new = v_new * rho_mix
+               else
+                  u = pmc_random()
+                  if (i_grp == 1) then
+                     do ibin = 1, N_SS - 1
+                        if (u <= ss_cum(ibin)) exit
+                     end do
+                     d_new = ss_edge(ibin) * (ss_edge(ibin+1) / ss_edge(ibin))**pmc_random()
+                  else
+                     do ibin = 1, N_SS - 1
+                        if (u <= ss_mcum(ibin)) exit
+                     end do
+                     d_new = (ss_edge(ibin)**3 + pmc_random() * (ss_edge(ibin+1)**3 - ss_edge(ibin)**3))**(1.0d0/3.0d0)
+                  end if
+                  v_new = pii / 6.0d0 * d_new**3
+                  ! NaCl by mass: 39.34% Na, 60.66% Cl
+                  m_new = v_new / (0.3934d0 / aero_data%density(i_na) + 0.6066d0 / aero_data%density(i_cl))
+                  vols(i_na) = 0.3934d0 * m_new / aero_data%density(i_na)
+                  vols(i_cl) = 0.6066d0 * m_new / aero_data%density(i_cl)
+               end if
+               g_p = g_new
+               if (i_grp == 2) then
+                  w_p = w_new * m_kind / m_new
+                  x2 = log(w_p / lagr_w) / log(2.0d0)
+                  g_p = LAGR_G0 + floor(x2)
+                  if (pmc_random() < w_p / (lagr_w * 2.0d0**(g_p - LAGR_G0)) - 1.0d0) g_p = g_p + 1
+                  g_p = max(1, min(LAGR_GROUPS, g_p))
+               end if
+               w_p = lagr_w * 2.0d0**(g_p - LAGR_G0)
+               if (i_kind == 4) then
+                  emis_sums(6) = emis_sums(6) + w_p
+                  emis_sums(7) = emis_sums(7) + w_p * m_new
+                  kind_mass(4) = kind_mass(4) + w_p * m_new
+               else
+                  emis_sums(2) = emis_sums(2) + w_p
+                  emis_sums(4) = emis_sums(4) + w_p * m_new
+               end if
+               call aero_particle_set_component(particle, source_code(i_kind, iCell), t_now)
+               particle%n_primary_parts = 1
+               call aero_particle_set_vols(particle, vols)
+               call aero_particle_new_id(particle)
+               call aero_particle_set_weight(particle, 1, g_p)
+               call aero_state_add_particle(aero_states(kk,iCell), particle, aero_data)
+               call random_in_cell(iCell, kk, nCells, nEdgesOnCell, cellsOnCell, x(1:4))
+               x(5:7) = x(1:3)
+               call pos_append(pos(kk,iCell), x)
+            end do
          end do
          if (lagr_control .and. kk > 1) call lagr_rebalance(kk, iCell, nCells, nEdgesOnCell, cellsOnCell)
       end subroutine emit_kind

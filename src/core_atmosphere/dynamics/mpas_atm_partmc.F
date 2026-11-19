@@ -115,6 +115,8 @@
 !   PMC_RESTART_INTERVAL  write the complete particle state every this many steps (0 = never)
 !                     to PMC_RESTART_DIR (default pmc_restart), one binary file per MPI task
 !   PMC_SEED          on a restart: start a new random stream from this seed instead of the saved one
+!   PMC_CHECKSUM      1: log exact checksums of the particles, positions, scalars and theta_m
+!                     after every process of every step, to find where two runs part
 !   PMC_RESTART_READ  step number of the particle state to read at start-up, for a model
 !                     restart from the same time with the same number of tasks and partition
 !   PMC_DIAG_INTERVAL write time-mean aerosol fields of every cell (number, CCN, species
@@ -254,7 +256,7 @@ module mpas_atm_partmc
              atm_partmc_particles_to_scalar, atm_partmc_output, atm_partmc_vertical_mixing, &
              atm_partmc_convection, atm_partmc_surface, atm_partmc_gas_surface, atm_partmc_chemistry, &
              atm_partmc_wet_removal, atm_partmc_restart_write, atm_partmc_diag, &
-             atm_partmc_coagulation
+             atm_partmc_coagulation, atm_partmc_checksum
 
    integer, parameter :: MODE_FLUX = 1, MODE_LAGR = 2
    integer, parameter :: MAX_CLASS = 2
@@ -514,6 +516,7 @@ module mpas_atm_partmc
    integer :: n_mixed = 0
    !> Brownian coagulation in every cell each step, and events so far.
    logical :: pmc_coag = .false.
+   logical :: pmc_checksum = .false.
    integer :: n_coag_total = 0
    !> Coagulation kernel bounds per level and the temperature (K) and pressure (Pa) range they
    !> hold for (lo, hi); a level is recomputed only when its cells leave that range.
@@ -623,6 +626,8 @@ contains
          q_background = q_background * num_scale
          q_blob = q_blob * num_scale
       end if
+      call get_environment_variable('PMC_CHECKSUM', envval, status=stat)
+      if (stat == 0) pmc_checksum = (trim(envval) == '1')
       call get_environment_variable('PMC_COAG', envval, status=stat)
       if (stat == 0) pmc_coag = (trim(envval) /= '0')
       call get_environment_variable('PMC_THIN_PAIR', envval, status=stat)
@@ -6286,6 +6291,82 @@ contains
 #endif
 
    end subroutine atm_partmc_coagulation
+
+
+   !> Exact, order-independent sums over all tasks of 30-bit hashes of the particle state
+   !> (species volumes, ids, weight classes, in particle order), the particle positions, all
+   !> scalars and theta_m of the owned cells. Two runs that should be identical print the same
+   !> numbers; the first process after which they differ is where they part.
+   subroutine atm_partmc_checksum(domain, itimestep, label)
+
+      type (domain_type), intent(inout) :: domain
+      integer, intent(in) :: itimestep
+      character(len=*), intent(in) :: label
+
+#ifdef MPAS_PARTMC
+      integer (kind=I8KIND), parameter :: M30 = 1073741823_I8KIND
+      type (mpas_pool_type), pointer :: mesh, state
+      integer, pointer :: nCellsSolve, nVertLevels
+      real (kind=RKIND), dimension(:,:,:), pointer :: scalars
+      real (kind=RKIND), dimension(:,:), pointer :: theta_m
+      integer (kind=I8KIND) :: h(4), w
+      integer :: iCell, k, j, i
+      real (kind=RKIND) :: loc(5), glob(5)
+
+      if (.not. pmc_checksum) return
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'state', state)
+      call mpas_pool_get_dimension(mesh, 'nCellsSolve', nCellsSolve)
+      call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
+      call mpas_pool_get_array(state, 'scalars', scalars, 2)
+      call mpas_pool_get_array(state, 'theta_m', theta_m, 2)
+      h = 0
+      loc = 0.0_RKIND
+      do iCell = 1, nCellsSolve
+         do k = 1, nVertLevels
+            w = int(mod(iCell, 997) * 64 + k, I8KIND)
+            if (allocated(aero_states)) then
+               loc(5) = loc(5) + real(aero_state_n_part(aero_states(k,iCell)), RKIND)
+               do j = 1, aero_state_n_part(aero_states(k,iCell))
+                  associate (p => aero_states(k,iCell)%apa%particle(j))
+                     do i = 1, size(p%vol)
+                        h(1) = iand(h(1) + iand(fold(p%vol(i)) * (w + j + 5*i), M30), M30)
+                     end do
+                     h(1) = iand(h(1) + iand((p%id + 7 * p%weight_class) * (j + 1), M30), M30)
+                  end associate
+               end do
+            end if
+            if (allocated(pos)) then
+               do j = 1, pos(k,iCell)%n
+                  do i = 1, NPOS
+                     h(2) = iand(h(2) + iand(fold(pos(k,iCell)%x(i,j)) * (w + j + 3*i), M30), M30)
+                  end do
+               end do
+            end if
+            do i = 1, size(scalars, 1)
+               h(3) = iand(h(3) + iand(fold(scalars(i,k,iCell)) * (w + i), M30), M30)
+            end do
+            h(4) = iand(h(4) + iand(fold(theta_m(k,iCell)) * w, M30), M30)
+         end do
+      end do
+      loc(1:4) = real(h, RKIND)
+      call mpas_dmpar_sum_real_array(domain % dminfo, 5, loc, glob)
+      call mpas_log_write('PartMC checksum step $i after '//trim(label)//': particles $r, particle $r, ' &
+                          // 'position $r, scalars $r, theta_m $r', intArgs=(/itimestep/), &
+                          realArgs=(/glob(5), glob(1), glob(2), glob(3), glob(4)/))
+
+   contains
+
+      !> The 64 bits of x folded into 30.
+      integer (kind=I8KIND) function fold(x)
+         real (kind=RKIND), intent(in) :: x
+         integer (kind=I8KIND) :: b
+         b = transfer(x, b)
+         fold = iand(ieor(ieor(b, ishft(b, -30)), ishft(b, -60)), M30)
+      end function fold
+#endif
+
+   end subroutine atm_partmc_checksum
 
 
    !> Solve a tridiagonal system (Thomas algorithm).

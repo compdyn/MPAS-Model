@@ -1012,7 +1012,7 @@ module atm_core
                                  atm_partmc_output, atm_partmc_vertical_mixing, atm_partmc_coagulation, &
                                  atm_partmc_convection, atm_partmc_surface, atm_partmc_chemistry, &
                                  atm_partmc_gas_surface, atm_partmc_wet_removal, atm_partmc_restart_write, &
-                                 atm_partmc_diag
+                                 atm_partmc_diag, atm_partmc_checksum
       use mpas_atm_halos, only: exchange_halo_group
 
       implicit none
@@ -1052,17 +1052,28 @@ module atm_core
 
       call atm_partmc_particles_to_scalar(domain)
 
+      call atm_partmc_checksum(domain, itimestep, 'physics')
       call atm_timestep(domain, dt, currTime, itimestep, exchange_halo_group)
+      call atm_partmc_checksum(domain, itimestep, 'dynamics')
 
       call atm_partmc_check(domain, itimestep)
+      call atm_partmc_checksum(domain, itimestep, 'check')
       call atm_partmc_particles_transport(domain, itimestep)
+      call atm_partmc_checksum(domain, itimestep, 'particles_transport')
       call atm_partmc_vertical_mixing(domain, itimestep)
+      call atm_partmc_checksum(domain, itimestep, 'vertical_mixing')
       call atm_partmc_convection(domain, itimestep)
+      call atm_partmc_checksum(domain, itimestep, 'convection')
       call atm_partmc_wet_removal(domain, itimestep)
+      call atm_partmc_checksum(domain, itimestep, 'wet_removal')
       call atm_partmc_surface(domain, itimestep)
+      call atm_partmc_checksum(domain, itimestep, 'surface')
       call atm_partmc_gas_surface(domain, itimestep)
+      call atm_partmc_checksum(domain, itimestep, 'gas_surface')
       call atm_partmc_chemistry(domain, itimestep)
+      call atm_partmc_checksum(domain, itimestep, 'chemistry')
       call atm_partmc_coagulation(domain, itimestep)
+      call atm_partmc_checksum(domain, itimestep, 'coagulation')
       call atm_partmc_diag(domain, itimestep)
       call atm_partmc_output(domain, itimestep, dt)
       call atm_partmc_restart_write(domain, itimestep)

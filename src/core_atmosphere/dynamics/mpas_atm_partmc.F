@@ -521,6 +521,10 @@ module mpas_atm_partmc
    !> coagulation inputs and outputs (hashes) to coag_dump_rNNNN.txt
    integer :: pmc_coag_dump = 0, coag_dump_unit = 0
    logical :: coag_dump_open = .false.
+   !> PMC_COAG_TWICE=1: run mc_coag on a copy of each cell first with the same random state and
+   !> report cells where the two calls differ (memory-dependent results)
+   logical :: pmc_coag_twice = .false.
+   integer :: coag_twice_bad = 0
    integer :: n_coag_total = 0
    !> Coagulation kernel bounds per level and the temperature (K) and pressure (Pa) range they
    !> hold for (lo, hi); a level is recomputed only when its cells leave that range.
@@ -630,6 +634,8 @@ contains
          q_background = q_background * num_scale
          q_blob = q_blob * num_scale
       end if
+      call get_environment_variable('PMC_COAG_TWICE', envval, status=stat)
+      if (stat == 0) pmc_coag_twice = (trim(envval) == '1')
       call get_environment_variable('PMC_COAG_DUMP', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_coag_dump
       call get_environment_variable('PMC_CHECKSUM', envval, status=stat)
@@ -6098,7 +6104,9 @@ contains
       integer, pointer :: indexToCellID(:)
       integer, allocatable :: rseed(:)
       integer (kind=I8KIND) :: h_pre, h_rng, h_k, h_env
-      integer :: n_rseed, i_dump
+      integer :: n_rseed, i_dump, n_samp2, n_coag2, g_bad
+      type(aero_state_t) :: as_copy
+      integer (kind=I8KIND) :: h_copy
       logical :: dump
       character(len=32) :: dump_name
 
@@ -6246,7 +6254,29 @@ contains
                end do
                h_env = iand(pmc_fold(env_state%temp) + 3 * pmc_fold(env_state%pressure), 1073741823_I8KIND)
             end if
+            if (pmc_coag_twice) then
+               if (.not. allocated(rseed)) then
+                  call random_seed(size=n_rseed)
+                  allocate(rseed(n_rseed))
+               end if
+               as_copy = aero_states(k,iCell)
+               call random_seed(get=rseed)
+               call mc_coag(COAG_KERNEL_TYPE_BROWN, env_state, aero_data, as_copy, del_t, n_samp2, n_coag2)
+               h_copy = pmc_cell_hash(as_copy)
+               call random_seed(put=rseed)
+            end if
             call mc_coag(COAG_KERNEL_TYPE_BROWN, env_state, aero_data, aero_states(k,iCell), del_t, n_samp, n_coag)
+            if (pmc_coag_twice) then
+               if (n_samp2 /= n_samp .or. n_coag2 /= n_coag .or. h_copy /= pmc_cell_hash(aero_states(k,iCell))) then
+                  coag_twice_bad = coag_twice_bad + 1
+                  if (coag_twice_bad <= 3) then
+                     call mpas_log_write('PartMC coag twice MISMATCH step $i rank $i cell $i level $i n_part $i: ' &
+                        // 'samples $i $i, events $i $i', messageType=MPAS_LOG_ERR, &
+                        intArgs=(/itimestep, domain % dminfo % my_proc_id, iCell, k, n0, n_samp2, n_samp, &
+                                  n_coag2, n_coag/))
+                  end if
+               end if
+            end if
             if (dump) write(coag_dump_unit, '(i4,i8,i4,i6,4i12,2i8,i12)') itimestep, indexToCellID(iCell), k, n0, &
                h_pre, h_rng, h_k, h_env, n_samp, n_coag, pmc_cell_hash(aero_states(k,iCell))
             call cpu_time(ta)
@@ -6314,6 +6344,11 @@ contains
       end if
       call mpas_dmpar_sum_real_array(domain % dminfo, 5, tc, g_tc)
       call mpas_dmpar_max_real_array(domain % dminfo, 5, tc, g_tc_max)
+      if (pmc_coag_twice) then
+         call mpas_dmpar_sum_int(domain % dminfo, coag_twice_bad, g_bad)
+         call mpas_log_write('PartMC coag twice step $i: cell-levels where two identical calls differ so far $i', &
+                             intArgs=(/itimestep, g_bad/))
+      end if
       if (itimestep <= 15 .or. mod(itimestep, 12) == 0) then
          call mpas_log_write('PartMC coagulation step $i CPU s, sum over ranks then max: bounds $r, remap+sort $r, ' &
                              // 'mc_coag $r, positions $r, rebalance $r; max $r $r $r $r $r; ' &

@@ -518,7 +518,7 @@ module mpas_atm_partmc
    logical :: pmc_coag = .false.
    logical :: pmc_checksum = .false.
    !> PMC_COAG_DUMP: up to this step, every task writes one line per cell and level of the
-   !> coagulation inputs and outputs (hashes) to coag_dump_rNNNN.txt, one line per cell and level
+   !> coagulation inputs and outputs (hashes) to coag_dump_rNNNN.txt
    integer :: pmc_coag_dump = 0, coag_dump_unit = -1
    integer :: n_coag_total = 0
    !> Coagulation kernel bounds per level and the temperature (K) and pressure (Pa) range they

@@ -6105,7 +6105,9 @@ contains
       integer, allocatable :: rseed(:)
       integer (kind=I8KIND) :: h_pre, h_rng, h_k, h_env
       integer :: n_rseed, i_dump, n_samp2, n_coag2, g_bad
-      type(aero_state_t) :: as_copy
+      type(aero_state_t) :: as_copy, as_orig
+      integer :: u_bad, jb
+      character(len=48) :: bad_name
       integer (kind=I8KIND) :: h_copy
       logical :: dump
       character(len=32) :: dump_name
@@ -6260,6 +6262,7 @@ contains
                   allocate(rseed(n_rseed))
                end if
                as_copy = aero_states(k,iCell)
+               as_orig = aero_states(k,iCell)
                call random_seed(get=rseed)
                call mc_coag(COAG_KERNEL_TYPE_BROWN, env_state, aero_data, as_copy, del_t, n_samp2, n_coag2)
                h_copy = pmc_cell_hash(as_copy)
@@ -6269,6 +6272,24 @@ contains
             if (pmc_coag_twice) then
                if (n_samp2 /= n_samp .or. n_coag2 /= n_coag .or. h_copy /= pmc_cell_hash(aero_states(k,iCell))) then
                   coag_twice_bad = coag_twice_bad + 1
+                  if (coag_twice_bad <= 2) then
+                     ! the cell before both calls, for an offline replay (perlmutter/coag_replay.F90)
+                     write(bad_name, '(a,i4.4,a,i1,a)') 'coag_bad_r', domain % dminfo % my_proc_id, '_', &
+                        coag_twice_bad, '.bin'
+                     open(newunit=u_bad, file=trim(bad_name), access='stream', form='unformatted', &
+                          status='replace', action='write')
+                     write(u_bad) aero_data_n_spec(aero_data), aero_state_n_part(as_orig), m, n_bin, n_rseed
+                     write(u_bad) env_state%temp, env_state%pressure, del_t
+                     write(u_bad) rseed
+                     write(u_bad) (as_orig%awa%weight(1,jb)%magnitude, jb = 1, m)
+                     write(u_bad) coag_kmin(:,:,k), coag_kmax(:,:,k)
+                     do jb = 1, aero_state_n_part(as_orig)
+                        write(u_bad) as_orig%apa%particle(jb)%vol, as_orig%apa%particle(jb)%weight_group, &
+                           as_orig%apa%particle(jb)%weight_class, as_orig%apa%particle(jb)%id
+                     end do
+                     write(u_bad) n_samp2, n_coag2, n_samp, n_coag
+                     close(u_bad)
+                  end if
                   if (coag_twice_bad <= 3) then
                      call mpas_log_write('PartMC coag twice MISMATCH step $i rank $i cell $i level $i n_part $i: ' &
                         // 'samples $i $i, events $i $i', messageType=MPAS_LOG_ERR, &

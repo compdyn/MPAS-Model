@@ -469,6 +469,10 @@ module mpas_atm_partmc
    integer :: pmc_npf = 0
    real (kind=RKIND) :: npf_a = 1.0e-6_RKIND, npf_d = 1.0e-8_RKIND, npf_gr0 = 1.0_RKIND
    real (kind=RKIND) :: npf_n = 0.0_RKIND, npf_s = 0.0_RKIND
+   !> Coagulation (lagrangian mode): particle sulfur (mol) added by the coagulation since the
+   !> start of this run, which PartMC's weighted coagulation conserves only in expectation, and
+   !> the sum of squares of the changes in single cells and steps.
+   real (kind=RKIND) :: coag_s = 0.0_RKIND, coag_s_sq = 0.0_RKIND
    integer, parameter :: K_NPF = 13
    !> Budget by species group (BC, POM, SO4, NO3, NH4, SOA, sea salt, dust, MSA): particle mass
    !> (kg) removed by this task since the start of the run by dry deposition, grid-scale and
@@ -6068,7 +6072,7 @@ contains
       integer :: i_env
       real (kind=dp) :: del_t
       ! CPU time (s) of the parts: kernel bounds, class remap and sort, mc_coag, positions, rebalance
-      real (kind=RKIND) :: tc(5), g_tc(5), g_tc_max(5), ta, tb
+      real (kind=RKIND) :: tc(5), g_tc(5), g_tc_max(5), ta, tb, s_before, s_after, cs2(2), g_cs2(2)
 
       if (.not. pmc_coag .or. pmc_n_part <= 0) return
 
@@ -6152,6 +6156,11 @@ contains
             call cpu_time(ta)
 
             if (pmc_mode == MODE_LAGR) then
+               s_before = 0.0_RKIND
+               do j = 1, n0
+                  s_before = s_before + particle_sulfate(aero_states(k,iCell)%apa%particle(j)) &
+                             * lagr_w * 2.0_RKIND**(aero_states(k,iCell)%apa%particle(j)%weight_class - LAGR_G0)
+               end do
                if (n0 > size(ids)) then
                   deallocate(ids, xs)
                   allocate(ids(2*n0), xs(NPOS, 2*n0))
@@ -6222,6 +6231,13 @@ contains
                   end if
                   call pos_append(pos(k,iCell), xp)
                end do
+               s_after = 0.0_RKIND
+               do j = 1, n1
+                  s_after = s_after + particle_sulfate(aero_states(k,iCell)%apa%particle(j)) &
+                            * lagr_w * 2.0_RKIND**(aero_states(k,iCell)%apa%particle(j)%weight_class - LAGR_G0)
+               end do
+               coag_s = coag_s + (s_after - s_before)
+               coag_s_sq = coag_s_sq + (s_after - s_before)**2
                call cpu_time(tb)
                tc(4) = tc(4) + tb - ta
                if (lagr_control) call lagr_rebalance(k, iCell, nCells, nEdgesOnCell, cellsOnCell)
@@ -6250,6 +6266,11 @@ contains
          call mpas_dmpar_sum_int(domain % dminfo, n_new, g_n_new)
          call mpas_log_write('PartMC coagulation step $i: events so far = $i, particles placed at random this step = $i', &
                              intArgs=(/itimestep, g_n_coag, g_n_new/))
+         cs2 = (/ coag_s, coag_s_sq /)
+         call mpas_dmpar_sum_real_array(domain % dminfo, 2, cs2, g_cs2)
+         call mpas_log_write('PartMC coagulation step $i: particle sulfur added since the start of this run $r mol, ' &
+                             // 'standard deviation if unbiased $r mol', intArgs=(/itimestep/), &
+                             realArgs=(/g_cs2(1), sqrt(g_cs2(2))/))
       end if
 #endif
 

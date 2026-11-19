@@ -6105,7 +6105,9 @@ contains
       integer, allocatable :: rseed(:)
       integer (kind=I8KIND) :: h_pre, h_rng, h_k, h_env
       integer :: n_rseed, i_dump, n_samp2, n_coag2, g_bad
-      type(aero_state_t) :: as_copy, as_orig
+      type(aero_state_t) :: as_copy, as_orig, as_re
+      type(aero_particle_t) :: p_re
+      integer :: n_samp3, n_coag3, n_samp4, n_coag4
       integer :: u_bad, jb
       character(len=48) :: bad_name
       integer (kind=I8KIND) :: h_copy
@@ -6289,6 +6291,34 @@ contains
                      end do
                      write(u_bad) n_samp2, n_coag2, n_samp, n_coag
                      close(u_bad)
+                     ! the same cell rebuilt from the written fields only, as the offline replay does
+                     call aero_state_zero(as_re)
+                     call aero_weight_array_set_sizes(as_re%awa, 1, m)
+                     as_re%awa%weight%type = AERO_WEIGHT_TYPE_NONE
+                     as_re%awa%weight%exponent = 0.0d0
+                     do jb = 1, m
+                        as_re%awa%weight(1,jb)%magnitude = as_orig%awa%weight(1,jb)%magnitude
+                     end do
+                     do jb = 1, aero_state_n_part(as_orig)
+                        call aero_particle_zero(p_re, aero_data)
+                        call aero_particle_set_vols(p_re, as_orig%apa%particle(jb)%vol)
+                        call aero_particle_set_weight(p_re, as_orig%apa%particle(jb)%weight_group, &
+                             as_orig%apa%particle(jb)%weight_class)
+                        p_re%id = as_orig%apa%particle(jb)%id
+                        call aero_state_add_particle(as_re, p_re, aero_data)
+                     end do
+                     call aero_state_sort(as_re, aero_data, bin_grid=coag_grid)
+                     as_re%aero_sorted%coag_kernel_min = coag_kmin(:,:,k)
+                     as_re%aero_sorted%coag_kernel_max = coag_kmax(:,:,k)
+                     as_re%aero_sorted%coag_kernel_bounds_valid = .true.
+                     ! (3) the rebuilt cell, (4) the original cell as it was before both calls
+                     call random_seed(get=rseed)
+                     as_copy = as_orig
+                     call mc_coag(COAG_KERNEL_TYPE_BROWN, env_state, aero_data, as_copy, del_t, n_samp4, n_coag4)
+                     call random_seed(put=rseed)
+                     call mc_coag(COAG_KERNEL_TYPE_BROWN, env_state, aero_data, as_re, del_t, n_samp3, n_coag3)
+                     call mpas_log_write('PartMC coag twice rebuilt cell: samples/events rebuilt $i $i, original again $i $i', &
+                        messageType=MPAS_LOG_ERR, intArgs=(/n_samp3, n_coag3, n_samp4, n_coag4/))
                   end if
                   if (coag_twice_bad <= 3) then
                      call mpas_log_write('PartMC coag twice MISMATCH step $i rank $i cell $i level $i n_part $i: ' &

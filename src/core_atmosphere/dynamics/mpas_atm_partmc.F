@@ -332,6 +332,13 @@ module mpas_atm_partmc
    !> surface (kg); last, the number of particles expected to be removed given the particles
    !> that were in the layers (the sum of probability times number).
    logical :: pmc_wet = .false., pmc_wet_diag_only = .false., lagr_shuffle = .false., pmc_wet_cldfrac = .false.
+   !> PMC_WET_ICE=1: in-cloud removal only with the liquid part of the condensate, except for
+   !> ice-nucleating particles (see atm_partmc_wet_removal). PMC_WET_BELOW=1: below-cloud
+   !> scavenging by rain and snow (Wang, Zhang and Moran 2014). Sums by this task: particles
+   !> removed below cloud (number), sulfur removed below cloud (mol), number not removed in
+   !> cloud because the condensate was ice.
+   logical :: pmc_wet_ice = .false., pmc_wet_below = .false.
+   real (kind=RKIND) :: bc_sums(3) = 0.0_RKIND
    !> Removal in the convective updraft: switch, and sums by this task so far: number removed
    !> (reference, particles, expected from the particles present), convective precipitation at
    !> the surface, water condensed in the updraft, and the part of it counted as precipitation
@@ -463,6 +470,28 @@ module mpas_atm_partmc
    real (kind=RKIND) :: kind_mass(N_KIND) = 0.0_RKIND, gas_nat(3) = 0.0_RKIND
    real (kind=RKIND), allocatable :: gas_bb(:,:,:), dms_w(:,:), isop_ef(:), mterp_ef(:)
    real (kind=RKIND) :: bio_scale = 1.0_RKIND, dms_scale = 1.0_RKIND
+   !> Emissions by month and source group, daily fires and elevated point sources (emission
+   !> files of tools/make_emis3.py, global attribute anthro_monthly = 1). Groups: EDGAR v8.1
+   !> monthly sectors, with shipping and aviation (landing and take-off, climb and descent,
+   !> cruise) taken out of transport, and soil NO. g3_kind: particle source kind (0: gases only);
+   !> g3_prof: vertical profile (emis_profile). Slots 1 and 2 hold months an_mo and the next,
+   !> weight an_w of the second (month_interp). Daily fires: records from day bb_day0 (days
+   !> since 2000-01-01). Point sources (volcanoes): owned cell, height band (m above sea level),
+   !> SO2 (mol/s), days active [day0, day1).
+   logical :: an_monthly = .false., an_checked = .false., bb_daily = .false.
+   integer, parameter :: NG3 = 13
+   character(len=3), parameter :: g3_name(NG3) = (/ 'ene', 'inc', 'inp', 'fex', 'bld', 'tro', 'shp', 'agr', &
+                                                    'wst', 'avl', 'avc', 'avr', 'soi' /)
+   integer, parameter :: g3_kind(NG3) = (/ 6, 6, 6, 7, 8, 5, 9, 10, 10, 5, 5, 5, 0 /)
+   integer, parameter :: g3_prof(NG3) = (/ 2, 3, 4, 5, 6, 1, 1, 1, 1, 7, 8, 9, 1 /)
+   integer :: an_mo = 0, bb_day0 = 0, bb_ndays = 0, bb_day_held = -999999
+   real (kind=RKIND) :: an_w = 0.0_RKIND
+   real (kind=RKIND), allocatable :: an_bc(:,:,:), an_oc(:,:,:), an_gas(:,:,:,:)
+   real (kind=RKIND), allocatable :: bbd_bc(:), bbd_oc(:), bbd_gas(:,:)
+   integer :: n_pt = 0
+   integer, allocatable :: pt_cell(:)
+   real (kind=RKIND), allocatable :: pt_zbot(:), pt_ztop(:), pt_so2(:), pt_day0(:), pt_day1(:)
+   real (kind=RKIND) :: pt_s_emitted = 0.0_RKIND
    !> PMC_DMS_CHEM: emit DMS as DMS (MOSAIC's marine mechanism then makes SO2 and MSA) instead
    !> of as SO2.
    logical :: pmc_dms_chem = .false.
@@ -712,6 +741,10 @@ contains
       call get_environment_variable('PMC_WET', envval, status=stat)
       if (stat == 0) pmc_wet = (trim(envval) /= '0')
       if (stat == 0) pmc_wet_diag_only = (trim(envval) == '2')
+      call get_environment_variable('PMC_WET_ICE', envval, status=stat)
+      if (stat == 0) pmc_wet_ice = (trim(envval) /= '0')
+      call get_environment_variable('PMC_WET_BELOW', envval, status=stat)
+      if (stat == 0) pmc_wet_below = (trim(envval) /= '0')
       call get_environment_variable('PMC_WET_CLDFRAC', envval, status=stat)
       if (stat == 0) pmc_wet_cldfrac = (trim(envval) /= '0')
       call get_environment_variable('PMC_CONV_CHECK', envval, status=stat)
@@ -3787,7 +3820,7 @@ contains
       real (kind=RKIND) :: w_mo
       integer, dimension(:), pointer :: indexToCellID
       real (kind=RKIND), dimension(:), pointer :: latCell, lonCell_s, snowh
-      real (kind=RKIND) :: cur_dg, prof(200), fm, km(N_KIND), g_km(N_KIND), dd, cum
+      real (kind=RKIND) :: cur_dg, prof(200), fm, km(N_KIND), g_km(N_KIND), dd, cum, m_col(200)
       real (kind=RKIND), dimension(:,:), pointer :: zgrid_s
       real (kind=dp) :: t_now
       real (kind=RKIND), allocatable :: cell_vals(:)
@@ -3864,6 +3897,7 @@ contains
       call month_interp(domain, m_a, w_mo)
       if (emis_mo(1) == 0) emis_mo = (/ m_a, modulo(m_a, 12) + 1 /)
       call emis_months_update(domain, m_a)
+      if (pmc_sectors) call emis3_update(domain)
       cur_dg = carb_dg
 
       if (len_trim(emis_file) > 0 .and. .not. emis_part_read) then
@@ -4052,12 +4086,30 @@ contains
                prof(k) = rho_zz(k,iCell) / rdzw(k)
             end do
             prof = prof / sum(prof(1:pmc_emit_levels))
-            do i_sec = 1, N_SEC
-               call emit_carb(4 + i_sec, sec_bc(iCell,i_sec), sec_oc(iCell,i_sec))
-            end do
+            if (an_monthly) then
+               ! by month and group, each with its vertical profile
+               do k = 1, nVertLevels
+                  m_col(k) = rho_zz(k,iCell) / rdzw(k)
+               end do
+               do i_sec = 1, NG3
+                  if (g3_kind(i_sec) == 0) cycle
+                  call emis_profile(g3_prof(i_sec), nVertLevels, zgrid_s(:,iCell), m_col, latCell(iCell), &
+                                    0.0_RKIND, 0.0_RKIND, prof)
+                  call emit_carb(g3_kind(i_sec), (1.0_RKIND - an_w) * an_bc(iCell,i_sec,1) + an_w * an_bc(iCell,i_sec,2), &
+                                 (1.0_RKIND - an_w) * an_oc(iCell,i_sec,1) + an_w * an_oc(iCell,i_sec,2))
+               end do
+            else
+               do i_sec = 1, N_SEC
+                  call emit_carb(4 + i_sec, sec_bc(iCell,i_sec), sec_oc(iCell,i_sec))
+               end do
+            end if
             call bb_profile(iCell)
-            call emit_carb(K_BB, (1.0_RKIND - w_mo) * bb_bc(iCell,1) + w_mo * bb_bc(iCell,2), &
-                                 (1.0_RKIND - w_mo) * bb_oc(iCell,1) + w_mo * bb_oc(iCell,2))
+            if (bb_daily) then
+               call emit_carb(K_BB, bbd_bc(iCell), bbd_oc(iCell))
+            else
+               call emit_carb(K_BB, (1.0_RKIND - w_mo) * bb_bc(iCell,1) + w_mo * bb_bc(iCell,2), &
+                                    (1.0_RKIND - w_mo) * bb_oc(iCell,1) + w_mo * bb_oc(iCell,2))
+            end if
             ! dust from bare, snow-free land
             if (dust_src(iCell) > 0.0_RKIND .and. associated(landmask)) then
                if (landmask(iCell) == 1) then
@@ -4494,6 +4546,13 @@ contains
       integer :: mo_now, i_mo, ib, j_so2, j_isop, j_api, j_lim, j_dms, m_a
       real (kind=RKIND) :: w_mo
       real (kind=dp) :: t_now
+      ! layered emissions: profile shares, air mass per area by layer, group amounts, fire gases
+      real (kind=RKIND) :: prf(200), m_col(200), day_now
+      real (kind=RKIND), allocatable :: amt_g(:), fire_g(:)
+      integer, pointer :: nVertLevels
+      real (kind=RKIND), dimension(:,:), pointer :: zgrid
+      real (kind=RKIND), dimension(:), pointer :: latCell
+      integer :: ig, ip
 
       if (.not. pmc_chem .or. pmc_n_part <= 0) return
       if (len_trim(gas_emit_file) == 0 .and. len_trim(gas_drydep_file) == 0 .and. len_trim(emis_file) == 0 &
@@ -4513,6 +4572,11 @@ contains
       call mpas_pool_get_array(mesh, 'areaCell', areaCell)
       call mpas_pool_get_array(state, 'scalars', scalars, 2)
       call mpas_pool_get_array(state, 'rho_zz', rho_zz, 2)
+      call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
+      call mpas_pool_get_array(mesh, 'zgrid', zgrid)
+      call mpas_pool_get_array(mesh, 'latCell', latCell)
+      allocate(amt_g(n_gas), fire_g(n_gas))
+      fire_g = 0.0_RKIND
       ! landmask, not xland: the physics sets xland to land where there is sea ice
       nullify(landmask)
       call mpas_pool_get_array(sfc_input, 'landmask', landmask)
@@ -4584,6 +4648,9 @@ contains
       if (allocated(gas_bb)) then
          call month_interp(domain, m_a, w_mo)
          call emis_months_update(domain, m_a)
+         call emis3_update(domain)
+         call model_date(domain, mo_now, t_now)
+         day_now = real(t_now / 86400.0d0, kind=RKIND)
          call mpas_pool_get_subpool(domain % blocklist % structs, 'diag_physics', dphys)
          call mpas_pool_get_array(dphys, 'u10', u10)
          call mpas_pool_get_array(dphys, 'v10', v10)
@@ -4607,8 +4674,13 @@ contains
          ! mol of dry air per area in the lowest layer
          air1 = rho_zz(1,iCell) / rdzw(1) / M_AIR
          if (allocated(gas_bb)) then
-            ! fires of this month
-            extra = (1.0_RKIND - w_mo) * gas_bb(:,iCell,1) + w_mo * gas_bb(:,iCell,2)
+            ! fires: this day's, or interpolated between months; emitted with the fire profile below
+            if (bb_daily) then
+               fire_g = bbd_gas(:,iCell)
+            else
+               fire_g = (1.0_RKIND - w_mo) * gas_bb(:,iCell,1) + w_mo * gas_bb(:,iCell,2)
+            end if
+            extra = 0.0_RKIND
             nat = 0.0_RKIND
             if (landmask(iCell) == 0) then
                ! DMS from the sea (Nightingale et al. 2000 transfer velocity, Saltzman et al.
@@ -4661,23 +4733,60 @@ contains
             end if
          end if
          if (allocated(emis_gas)) then
-            ! the inventory's flux of this cell, mol per area this step
-            air_emit = 0.0_RKIND
-            do k = 1, pmc_emit_levels
-               air_emit = air_emit + rho_zz(k,iCell) / rdzw(k) / M_AIR
+            ! the inventory's flux of this cell, mol per area this step: surface sources (and the
+            ! annual inventory unless there are emissions by month and group) in the lowest layers
+            do k = 1, nVertLevels
+               m_col(k) = rho_zz(k,iCell) / rdzw(k)
             end do
-            amount = (emis_gas(:,iCell) + extra) * config_dt
-            do k = 1, pmc_emit_levels
-               scalars(gas_idx,k,iCell) = scalars(gas_idx,k,iCell) + amount / air_emit * 1.0e9_RKIND
+            if (an_monthly) then
+               amount = extra * config_dt
+            else
+               amount = (emis_gas(:,iCell) + extra) * config_dt
+            end if
+            call emis_profile(1, nVertLevels, zgrid(:,iCell), m_col, latCell(iCell), 0.0_RKIND, 0.0_RKIND, prf)
+            if (an_monthly) then
+               ! groups with the surface profile go in with the rest of the surface sources
+               do ig = 1, NG3
+                  if (g3_prof(ig) /= 1) cycle
+                  amount = amount + ((1.0_RKIND - an_w) * an_gas(:,iCell,ig,1) + an_w * an_gas(:,iCell,ig,2)) * config_dt
+               end do
+            end if
+            call add_gas(amount, prf)
+            if (an_monthly) then
+               do ig = 1, NG3
+                  if (g3_prof(ig) == 1) cycle
+                  amt_g = ((1.0_RKIND - an_w) * an_gas(:,iCell,ig,1) + an_w * an_gas(:,iCell,ig,2)) * config_dt
+                  if (maxval(amt_g) <= 0.0_RKIND) cycle
+                  call emis_profile(g3_prof(ig), nVertLevels, zgrid(:,iCell), m_col, latCell(iCell), 0.0_RKIND, &
+                                    0.0_RKIND, prf)
+                  call add_gas(amt_g, prf)
+               end do
+            end if
+            if (maxval(fire_g) > 0.0_RKIND) then
+               call emis_profile(10, nVertLevels, zgrid(:,iCell), m_col, latCell(iCell), 0.0_RKIND, 0.0_RKIND, prf)
+               call add_gas(fire_g * config_dt, prf)
+            end if
+            ! point sources (volcanoes) in this cell, active today, SO2 over their height band
+            do ip = 1, n_pt
+               if (pt_cell(ip) /= iCell) cycle
+               if (day_now < pt_day0(ip) .or. day_now >= pt_day1(ip)) cycle
+               amt_g = 0.0_RKIND
+               if (j_so2 > 0) amt_g(j_so2) = pt_so2(ip) * config_dt / areaCell(iCell)
+               pt_s_emitted = pt_s_emitted + pt_so2(ip) * config_dt
+               call emis_profile(11, nVertLevels, zgrid(:,iCell), m_col, latCell(iCell), pt_zbot(ip), pt_ztop(ip), prf)
+               call add_gas(amt_g, prf)
             end do
-            gas_emitted = gas_emitted + amount * areaCell(iCell)
-            s_bud(SB_EMIT, band_of(iCell)) = s_bud(SB_EMIT, band_of(iCell)) + sulfur_gas_sum(amount) * areaCell(iCell)
          end if
       end do
 
       call mpas_pool_get_field(state, 'scalars', scalars_field, 2)
       call mpas_dmpar_exch_halo_field(scalars_field)
 
+      if (n_pt > 0 .and. mod(itimestep, 12) == 0) then
+         call mpas_dmpar_sum_real(domain % dminfo, pt_s_emitted, air_emit)
+         call mpas_log_write('PartMC gas surface step $i: SO2 from point sources since the start of this run $r mol', &
+                             intArgs=(/itimestep/), realArgs=(/air_emit/))
+      end if
       if (allocated(gas_bb) .and. mod(itimestep, 12) == 0) then
          call mpas_dmpar_sum_real_array(domain % dminfo, 3, gas_nat, nat)
          call mpas_log_write('PartMC gas surface step $i: emitted since the start of this run (mol): DMS (as SO2) $r, ' &
@@ -4704,6 +4813,22 @@ contains
                                            / max(g_content(j), 1.0e-30_RKIND)/))
          end do
       end if
+
+   contains
+
+      !> Add amt (mol per m^2 this step, by gas species) to the current cell with the layer
+      !> shares prf, and count it as emitted.
+      subroutine add_gas(amt, prf_in)
+         real (kind=RKIND), intent(in) :: amt(:), prf_in(:)
+         integer :: kz
+         do kz = 1, nVertLevels
+            if (prf_in(kz) <= 0.0_RKIND) cycle
+            scalars(gas_idx,kz,iCell) = scalars(gas_idx,kz,iCell) &
+                 + amt * prf_in(kz) / (rho_zz(kz,iCell) / rdzw(kz) / M_AIR) * 1.0e9_RKIND
+         end do
+         gas_emitted = gas_emitted + amt * areaCell(iCell)
+         s_bud(SB_EMIT, band_of(iCell)) = s_bud(SB_EMIT, band_of(iCell)) + sulfur_gas_sum(amt) * areaCell(iCell)
+      end subroutine add_gas
 #endif
 
    end subroutine atm_partmc_gas_surface
@@ -4962,6 +5087,283 @@ contains
 
 
    !> Current model month and time in seconds since 2000-01-01 00:00 UTC.
+   !> Read record irec of a two-dimensional variable (record, cell) of the emissions file for the
+   !> owned cells. found is false if the file has no such variable or record.
+   subroutine emis_read_rec(domain, name, irec, vals, found)
+      type (domain_type), intent(inout) :: domain
+      character(len=*), intent(in) :: name
+      integer, intent(in) :: irec
+      real (kind=RKIND), intent(out) :: vals(:)
+      logical, intent(out) :: found
+#ifdef MPAS_PARTMC
+      type (mpas_pool_type), pointer :: mesh
+      integer, dimension(:), pointer :: indexToCellID
+      integer :: ncid, varid, dimids(2), n_glob, n_rec, iCell
+      real (kind=RKIND), allocatable :: glob(:)
+
+      found = .false.
+      vals = 0.0_RKIND
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
+      call mpas_pool_get_array(mesh, 'indexToCellID', indexToCellID)
+      call nc_check(nf90_open(trim(emis_file), NF90_NOWRITE, ncid), 'open ' // trim(emis_file))
+      if (nf90_inq_varid(ncid, name, varid) == NF90_NOERR) then
+         call nc_check(nf90_inquire_variable(ncid, varid, dimids=dimids), 'inquire ' // name)
+         call nc_check(nf90_inquire_dimension(ncid, dimids(1), len=n_glob), 'cells of ' // name)
+         call nc_check(nf90_inquire_dimension(ncid, dimids(2), len=n_rec), 'records of ' // name)
+         if (irec >= 1 .and. irec <= n_rec) then
+            allocate(glob(n_glob))
+            call nc_check(nf90_get_var(ncid, varid, glob, start=(/1, irec/), count=(/n_glob, 1/)), 'read ' // name)
+            do iCell = 1, size(vals)
+               vals(iCell) = glob(indexToCellID(iCell))
+            end do
+            found = .true.
+         end if
+      end if
+      call nc_check(nf90_close(ncid), 'close ' // trim(emis_file))
+#else
+      found = .false.
+      vals = 0.0_RKIND
+#endif
+   end subroutine emis_read_rec
+
+
+   !> Set up and update the emissions by month and group, the daily fires and the point sources
+   !> (see an_monthly). Called by the particle and gas emission routines; reads only when the
+   !> months or the day change.
+   subroutine emis3_update(domain)
+      type (domain_type), intent(inout) :: domain
+#ifdef MPAS_PARTMC
+      type (mpas_pool_type), pointer :: mesh
+      integer, pointer :: nCellsSolve
+      real (kind=RKIND), dimension(:), pointer :: latCell, lonCell
+      integer :: ncid, att, dimid, varid, ig, ib, j, ip, m_a, iCell, n_gas3, day, irec, ic_best
+      real (kind=RKIND), allocatable :: cell_vals(:), plat(:), plon(:), tmp(:)
+      real (kind=RKIND) :: d_best, d, gd
+      real (kind=dp) :: t_now
+      integer :: mo_now
+      logical :: found
+
+      if (len_trim(emis_file) == 0) return
+      call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
+      call mpas_pool_get_dimension(mesh, 'nCellsSolve', nCellsSolve)
+      n_gas3 = 0
+#ifdef MPAS_PARTMC_MOSAIC
+      n_gas3 = gas_data_n_spec(gas_data)
+#endif
+      if (.not. an_checked) then
+         an_checked = .true.
+         call nc_check(nf90_open(trim(emis_file), NF90_NOWRITE, ncid), 'open ' // trim(emis_file))
+         if (nf90_get_att(ncid, NF90_GLOBAL, 'anthro_monthly', att) == NF90_NOERR) an_monthly = (att == 1)
+         if (nf90_inq_dimid(ncid, 'nDays', dimid) == NF90_NOERR) then
+            call nc_check(nf90_inquire_dimension(ncid, dimid, len=bb_ndays), 'nDays')
+            call nc_check(nf90_get_att(ncid, NF90_GLOBAL, 'bb_day0', bb_day0), 'bb_day0')
+            bb_daily = .true.
+         end if
+         if (nf90_inq_dimid(ncid, 'nPoint', dimid) == NF90_NOERR) then
+            call nc_check(nf90_inquire_dimension(ncid, dimid, len=n_pt), 'nPoint')
+            allocate(pt_cell(n_pt), pt_zbot(n_pt), pt_ztop(n_pt), pt_so2(n_pt), pt_day0(n_pt), pt_day1(n_pt), &
+                     plat(n_pt), plon(n_pt))
+            call nc_check(nf90_inq_varid(ncid, 'pt_lat', varid), 'pt_lat')
+            call nc_check(nf90_get_var(ncid, varid, plat), 'pt_lat')
+            call nc_check(nf90_inq_varid(ncid, 'pt_lon', varid), 'pt_lon')
+            call nc_check(nf90_get_var(ncid, varid, plon), 'pt_lon')
+            call nc_check(nf90_inq_varid(ncid, 'pt_zbot', varid), 'pt_zbot')
+            call nc_check(nf90_get_var(ncid, varid, pt_zbot), 'pt_zbot')
+            call nc_check(nf90_inq_varid(ncid, 'pt_ztop', varid), 'pt_ztop')
+            call nc_check(nf90_get_var(ncid, varid, pt_ztop), 'pt_ztop')
+            call nc_check(nf90_inq_varid(ncid, 'pt_so2', varid), 'pt_so2')
+            call nc_check(nf90_get_var(ncid, varid, pt_so2), 'pt_so2')
+            call nc_check(nf90_inq_varid(ncid, 'pt_day0', varid), 'pt_day0')
+            call nc_check(nf90_get_var(ncid, varid, pt_day0), 'pt_day0')
+            call nc_check(nf90_inq_varid(ncid, 'pt_day1', varid), 'pt_day1')
+            call nc_check(nf90_get_var(ncid, varid, pt_day1), 'pt_day1')
+         end if
+         call nc_check(nf90_close(ncid), 'close ' // trim(emis_file))
+         ! each point source goes to the nearest cell centre; the task owning it claims it
+         if (n_pt > 0) then
+            call mpas_pool_get_array(mesh, 'latCell', latCell)
+            call mpas_pool_get_array(mesh, 'lonCell', lonCell)
+            do ip = 1, n_pt
+               d_best = huge(1.0_RKIND)
+               ic_best = 0
+               do iCell = 1, nCellsSolve
+                  d = 1.0_RKIND - (sin(plat(ip)*pii/180.0_RKIND) * sin(latCell(iCell)) + cos(plat(ip)*pii/180.0_RKIND) &
+                      * cos(latCell(iCell)) * cos(plon(ip)*pii/180.0_RKIND - lonCell(iCell)))
+                  if (d < d_best) then
+                     d_best = d
+                     ic_best = iCell
+                  end if
+               end do
+               call mpas_dmpar_min_real(domain % dminfo, d_best, gd)
+               pt_cell(ip) = 0
+               if (ic_best > 0 .and. d_best <= gd) pt_cell(ip) = ic_best
+            end do
+            pt_so2 = pt_so2 * emis_scale
+         end if
+         if (an_monthly) then
+            allocate(an_bc(nCellsSolve, NG3, 2), an_oc(nCellsSolve, NG3, 2), an_gas(max(n_gas3, 1), nCellsSolve, NG3, 2))
+            an_mo = 0
+         end if
+         if (bb_daily) allocate(bbd_bc(nCellsSolve), bbd_oc(nCellsSolve), bbd_gas(max(n_gas3, 1), nCellsSolve))
+         call mpas_log_write('PartMC emissions from ' // trim(emis_file) // ': by month and group $l, daily fires $l ' &
+                             // '($i days from day $i), point sources $i', logicArgs=(/an_monthly, bb_daily/), &
+                             intArgs=(/bb_ndays, bb_day0, n_pt/))
+      end if
+
+      allocate(cell_vals(nCellsSolve))
+      if (an_monthly) then
+         call month_interp(domain, m_a, an_w)
+         if (m_a /= an_mo) then
+            an_mo = m_a
+            an_bc = 0.0_RKIND
+            an_oc = 0.0_RKIND
+            an_gas = 0.0_RKIND
+            do ib = 1, 2
+               do ig = 1, NG3
+                  call emis_read_rec(domain, 'bc_m_' // g3_name(ig), modulo(m_a - 1 + ib - 1, 12) + 1, cell_vals, found)
+                  if (found) an_bc(:,ig,ib) = max(0.0_RKIND, cell_vals) * emis_scale
+                  call emis_read_rec(domain, 'oc_m_' // g3_name(ig), modulo(m_a - 1 + ib - 1, 12) + 1, cell_vals, found)
+                  if (found) an_oc(:,ig,ib) = max(0.0_RKIND, cell_vals) * emis_scale
+#ifdef MPAS_PARTMC_MOSAIC
+                  do j = 1, n_gas3
+                     call emis_read_rec(domain, 'gas_' // trim(gas_data%name(j)) // '_m_' // g3_name(ig), &
+                                        modulo(m_a - 1 + ib - 1, 12) + 1, cell_vals, found)
+                     if (found) an_gas(j,:,ig,ib) = max(0.0_RKIND, cell_vals) * emis_scale
+                  end do
+#endif
+               end do
+            end do
+            call mpas_log_write('PartMC: emissions by group now months $i and next, interpolated between mid-months', &
+                                intArgs=(/m_a/))
+         end if
+      end if
+      if (bb_daily) then
+         call model_date(domain, mo_now, t_now)
+         day = floor(t_now / 86400.0d0)
+         if (day /= bb_day_held) then
+            bb_day_held = day
+            irec = day - bb_day0 + 1
+            bbd_bc = 0.0_RKIND
+            bbd_oc = 0.0_RKIND
+            bbd_gas = 0.0_RKIND
+            if (irec < 1 .or. irec > bb_ndays) then
+               call mpas_log_write('PartMC: no daily fire emissions for day $i (file has days $i to $i); none emitted', &
+                                   intArgs=(/day, bb_day0, bb_day0 + bb_ndays - 1/), messageType=MPAS_LOG_WARN)
+            else
+               call emis_read_rec(domain, 'bc_bb_d', irec, cell_vals, found)
+               bbd_bc = max(0.0_RKIND, cell_vals) * emis_scale
+               call emis_read_rec(domain, 'oc_bb_d', irec, cell_vals, found)
+               bbd_oc = max(0.0_RKIND, cell_vals) * emis_scale
+#ifdef MPAS_PARTMC_MOSAIC
+               do j = 1, n_gas3
+                  call emis_read_rec(domain, 'gas_bb_' // trim(gas_data%name(j)) // '_d', irec, cell_vals, found)
+                  if (found) bbd_gas(j,:) = max(0.0_RKIND, cell_vals) * emis_scale
+               end do
+#endif
+            end if
+         end if
+      end if
+      deallocate(cell_vals)
+#endif
+   end subroutine emis3_update
+
+
+   !> Shares prof(1:nlev) of the layers in an emission of vertical profile ip, for a column with
+   !> layer interfaces zg(1:nlev+1) (m above sea level), dry air mass per area mass(1:nlev) and
+   !> latitude lat (rad). Within each height bin of a profile the emission is spread evenly in
+   !> height. Profiles:
+   !>   1     the lowest PMC_EMIT_LEVELS layers, in proportion to their air mass (surface sources)
+   !>   2-6   Bieser et al. (2011) plume-rise profiles by SNAP sector as given by Mailler et al.
+   !>         (2013, Table 1), bins 0-20-92-184-324-522-781-1106 m above the ground, normalised to
+   !>         sum to one: 2 SNAP1 energy, 3 SNAP3 industrial combustion, 4 SNAP4 production
+   !>         processes, 5 SNAP5 fuel extraction, 6 SNAP2 residential and commercial combustion
+   !>   7     aviation landing and take-off: 0-1 km above the ground (below 3000 ft)
+   !>   8     aviation climb and descent: 1-9 km above the ground
+   !>   9     aviation cruise: 9-12 km above sea level
+   !>   10    fires: Dentener et al. (2006) by latitude (as bb_profile)
+   !>   11    the band zlo-zhi (m above sea level), for point sources
+   !> Parts of a bin below the ground or above the model top go to the lowest or highest layer.
+   subroutine emis_profile(ip, nlev, zg, mass, lat, zlo, zhi, prof)
+      integer, intent(in) :: ip, nlev
+      real (kind=RKIND), intent(in) :: zg(:), mass(:), lat, zlo, zhi
+      real (kind=RKIND), intent(out) :: prof(:)
+      real (kind=RKIND), parameter :: zbs(8) = (/ 0.0_RKIND, 20.0_RKIND, 92.0_RKIND, 184.0_RKIND, 324.0_RKIND, &
+                                                  522.0_RKIND, 781.0_RKIND, 1106.0_RKIND /)
+      real (kind=RKIND), parameter :: snap(7,5) = reshape((/ &
+           0.0_RKIND, 0.0_RKIND, 0.25_RKIND, 51.0_RKIND, 45.3_RKIND, 3.29_RKIND, 0.2_RKIND, &   ! SNAP1
+           0.0_RKIND, 21.3_RKIND, 75.4_RKIND, 3.3_RKIND, 0.0_RKIND, 0.0_RKIND, 0.0_RKIND, &    ! SNAP3
+           20.0_RKIND, 70.0_RKIND, 7.0_RKIND, 1.0_RKIND, 0.0_RKIND, 0.0_RKIND, 0.0_RKIND, &    ! SNAP4
+           20.0_RKIND, 70.0_RKIND, 6.0_RKIND, 3.0_RKIND, 0.0_RKIND, 0.0_RKIND, 0.0_RKIND, &    ! SNAP5
+           11.0_RKIND, 89.0_RKIND, 0.0_RKIND, 0.0_RKIND, 0.0_RKIND, 0.0_RKIND, 0.0_RKIND /), & ! SNAP2
+           (/ 7, 5 /))
+      real (kind=RKIND), parameter :: zbf(7) = (/ 0.0_RKIND, 100.0_RKIND, 500.0_RKIND, 1000.0_RKIND, &
+                                                  2000.0_RKIND, 3000.0_RKIND, 6000.0_RKIND /)
+      real (kind=RKIND) :: zb(9), sh(8), base, lo, hi, alat, tot
+      integer :: nb, ib, kz, n_lev_s
+
+      prof(1:nlev) = 0.0_RKIND
+      if (ip == 1) then
+         n_lev_s = max(1, min(nlev, pmc_emit_levels))
+         prof(1:n_lev_s) = mass(1:n_lev_s) / sum(mass(1:n_lev_s))
+         return
+      end if
+      base = zg(1)
+      select case (ip)
+      case (2:6)
+         nb = 7
+         zb(1:8) = zbs
+         sh(1:7) = snap(:, ip - 1) / sum(snap(:, ip - 1))
+      case (7)
+         nb = 1
+         zb(1:2) = (/ 0.0_RKIND, 1000.0_RKIND /)
+         sh(1) = 1.0_RKIND
+      case (8)
+         nb = 1
+         zb(1:2) = (/ 1000.0_RKIND, 9000.0_RKIND /)
+         sh(1) = 1.0_RKIND
+      case (9)
+         nb = 1
+         zb(1:2) = (/ 9000.0_RKIND, 12000.0_RKIND /)
+         sh(1) = 1.0_RKIND
+         base = 0.0_RKIND
+      case (10)
+         nb = 6
+         zb(1:7) = zbf
+         alat = abs(lat) * 180.0_RKIND / pii
+         if (alat < 30.0_RKIND) then
+            sh(1:6) = (/ 0.2_RKIND, 0.4_RKIND, 0.4_RKIND, 0.0_RKIND, 0.0_RKIND, 0.0_RKIND /)
+         else if (alat < 50.0_RKIND) then
+            sh(1:6) = (/ 0.2_RKIND, 0.2_RKIND, 0.2_RKIND, 0.4_RKIND, 0.0_RKIND, 0.0_RKIND /)
+         else
+            sh(1:6) = (/ 0.1_RKIND, 0.1_RKIND, 0.2_RKIND, 0.2_RKIND, 0.4_RKIND, 0.0_RKIND /)
+         end if
+      case default
+         nb = 1
+         zb(1:2) = (/ zlo, max(zhi, zlo + 1.0_RKIND) /)
+         sh(1) = 1.0_RKIND
+         base = 0.0_RKIND
+      end select
+      do ib = 1, nb
+         if (sh(ib) <= 0.0_RKIND) cycle
+         tot = 0.0_RKIND
+         do kz = 1, nlev
+            lo = zg(kz)
+            hi = zg(kz+1)
+            if (kz == 1) lo = -huge(1.0_RKIND)
+            if (kz == nlev) hi = huge(1.0_RKIND)
+            prof(kz) = prof(kz) + sh(ib) * max(0.0_RKIND, min(hi, base + zb(ib+1)) - max(lo, base + zb(ib))) &
+                                  / (zb(ib+1) - zb(ib))
+         end do
+      end do
+      tot = sum(prof(1:nlev))
+      if (tot > 0.0_RKIND) then
+         prof(1:nlev) = prof(1:nlev) / tot
+      else
+         prof(1) = 1.0_RKIND
+      end if
+   end subroutine emis_profile
+
+
    !> The months whose mid-points bracket the model date, m_a and the month after it, and the
    !> weight w of the second: a monthly field at this time is (1 - w) F(m_a) + w F(m_a + 1).
    subroutine month_interp(domain, m_a, w)
@@ -5049,6 +5451,72 @@ contains
 
    !> Book the removal of a computational particle standing for w real particles by process
    !> proc (1 dry deposition, 2 grid-scale wet, 3 convective wet) in latitude band ib.
+   !> Dry-mass fractions of dust (OIN) and BC of a particle.
+   subroutine dust_bc_fractions(particle, i_oin, i_bc, fr_du, fr_bc)
+      type(aero_particle_t), intent(in) :: particle
+      integer, intent(in) :: i_oin, i_bc
+      real (kind=RKIND), intent(out) :: fr_du, fr_bc
+      real (kind=RKIND) :: m_dry
+      m_dry = particle_dry_mass(particle)
+      fr_du = 0.0_RKIND
+      fr_bc = 0.0_RKIND
+      if (m_dry <= 0.0_RKIND) return
+      if (i_oin > 0) fr_du = particle%vol(i_oin) * aero_data%density(i_oin) / m_dry
+      if (i_bc > 0) fr_bc = particle%vol(i_bc) * aero_data%density(i_bc) / m_dry
+   end subroutine dust_bc_fractions
+
+
+   !> Below-cloud scavenging coefficient (s^-1) of Wang, Zhang and Moran (2014, GMD 7, 799;
+   !> fits to the 90th percentile of the theoretical ensemble), L = A(d) R^B(d), for wet
+   !> diameter d (um, limited to 0.001-100) and precipitation rate R (mm/h of water; limited to
+   !> 0.01-100 for rain and 0.001-10 for snow).
+   real (kind=RKIND) function bcs_lambda(d_um, r_mmh, snow)
+      real (kind=RKIND), intent(in) :: d_um, r_mmh
+      logical, intent(in) :: snow
+      real (kind=RKIND), parameter :: rb(0:6) = (/ -14.707_RKIND, 51.043_RKIND, -97.306_RKIND, 97.946_RKIND, &
+                                                   -53.923_RKIND, 15.311_RKIND, -1.7510_RKIND /)
+      real (kind=RKIND), parameter :: re(0:6) = (/ -0.6492_RKIND, 9.3483_RKIND, -21.929_RKIND, 25.317_RKIND, &
+                                                   -15.395_RKIND, 4.7242_RKIND, -0.5766_RKIND /)
+      real (kind=RKIND), parameter :: sa(0:6) = (/ -4.4260_RKIND, 1.3940_RKIND, -1.2020_RKIND, -3.2942_RKIND, &
+                                                   -1.9521_RKIND, -0.4904_RKIND, -0.0457_RKIND /)
+      real (kind=RKIND), parameter :: sc(0:6) = (/ 0.5664_RKIND, 0.0085_RKIND, -0.1948_RKIND, -0.6532_RKIND, &
+                                                   -0.5462_RKIND, -0.1778_RKIND, -0.0201_RKIND /)
+      real (kind=RKIND), parameter :: sb(0:6) = (/ -4.3531_RKIND, -0.7828_RKIND, 12.768_RKIND, -19.864_RKIND, &
+                                                   13.618_RKIND, -4.4350_RKIND, 0.5551_RKIND /)
+      real (kind=RKIND), parameter :: se(0:6) = (/ 0.5689_RKIND, -0.0923_RKIND, 0.0402_RKIND, 1.4523_RKIND, &
+                                                   -2.0780_RKIND, 1.0500_RKIND, -0.1821_RKIND /)
+      real (kind=RKIND) :: x, la, b, r
+      integer :: i
+      x = log10(min(100.0_RKIND, max(1.0e-3_RKIND, d_um)))
+      la = 0.0_RKIND
+      b = 0.0_RKIND
+      if (.not. snow) then
+         r = min(100.0_RKIND, max(0.01_RKIND, r_mmh))
+         if (x <= log10(2.0_RKIND)) then
+            la = -6.2609_RKIND + 0.6820_RKIND*x + 0.8676_RKIND*x**2 + 0.1282_RKIND*x**3
+            b = 0.7230_RKIND + 0.0303_RKIND*x
+         else
+            do i = 0, 6
+               la = la + rb(i) * x**i
+               b = b + re(i) * x**i
+            end do
+         end if
+      else
+         r = min(10.0_RKIND, max(0.001_RKIND, r_mmh))
+         do i = 0, 6
+            if (x <= log10(1.44_RKIND)) then
+               la = la + sa(i) * x**i
+               b = b + sc(i) * x**i
+            else
+               la = la + sb(i) * x**i
+               b = b + se(i) * x**i
+            end if
+         end do
+      end if
+      bcs_lambda = 10.0_RKIND**la * r**b
+   end function bcs_lambda
+
+
    subroutine note_removal(particle, w, proc, ib)
       type(aero_particle_t), intent(in) :: particle
       real (kind=RKIND), intent(in) :: w
@@ -5307,7 +5775,26 @@ contains
    !> as the microphysics does, unless PMC_WET_CLDFRAC=1: then only the cloudy part of the cell
    !> (the cloud fraction of the radiation scheme, limited to 0.1-1 as in the in-cloud
    !> chemistry) loses the fraction r f, and the cell's tracers lose c r f. Convective
-   !> precipitation and scavenging below cloud are not included.
+   !> precipitation is treated in atm_partmc_convection.
+   !>
+   !> Ice (PMC_WET_ICE=1). Aerosol in cloud is carried by the droplets, and ice grown from the
+   !> vapour (the Wegener-Bergeron-Findeisen process) takes none of it, so in mixed-phase and
+   !> ice clouds nucleation scavenging is far less efficient than in liquid clouds (Cozic et al.
+   !> 2007; CAM5 has no in-cloud scavenging by ice, Wang et al. 2013). The removal probability of
+   !> an activated particle is therefore multiplied by the liquid fraction qc / (qc + qi) of the
+   !> layer's condensate (from temperature, 1 above 268 K and 0 below, if there is no
+   !> condensate left). Ice-nucleating particles are removed with the full probability, as in
+   !> GEOS-Chem (Wang et al. 2011): particles that are mostly dust at any temperature, and
+   !> particles that are mostly BC below 258 K. Gases dissolved in cloud water are scaled the
+   !> same way, except HNO3, which ice takes up efficiently.
+   !>
+   !> Below cloud (PMC_WET_BELOW=1). In layers without condensate under precipitation, each
+   !> particle is removed with probability (1 - exp(-L dt)) s, with the scavenging coefficient
+   !> L(d, R) = A(d) R^B(d) of Wang, Zhang and Moran (2014, 90th-percentile fit) for rain
+   !> (T >= 268 K, as in GEOS-Chem) or snow, d the wet diameter (um) and R the precipitation
+   !> rate (mm/h of water) falling through the layer: the column's production above it less
+   !> the evaporation (rainprod - evapprod). s = min(1, surface precipitation / R) is the part
+   !> of that precipitation that reaches the ground, as for the in-cloud removal.
    subroutine atm_partmc_wet_removal(domain, itimestep)
 
       type (domain_type), intent(inout) :: domain
@@ -5318,7 +5805,11 @@ contains
       type (field3DReal), pointer :: scalars_field
       real (kind=RKIND), dimension(:,:,:), pointer :: scalars
       real (kind=RKIND), dimension(:,:), pointer :: rho_zz, rainprod, theta_m, exner, wwAvg
-      real (kind=RKIND), dimension(:,:), pointer :: cldfrac_w
+      real (kind=RKIND), dimension(:,:), pointer :: cldfrac_w, evapprod
+      real (kind=RKIND) :: f_liq, p_j, temp_k, flux, s_reach, lam, d_um, r_mmh, fr_du, fr_bc, m_dry
+      real (kind=RKIND), allocatable :: p_gas(:)
+      integer :: j_hno3, i_oin_w, i_bc_w
+      logical :: snow
       real (kind=RKIND), dimension(:), pointer :: rdzw, areaCell, rainncv
       real (kind=RKIND), pointer :: config_dt
       integer, dimension(:,:), pointer :: cellsOnCell
@@ -5370,6 +5861,13 @@ contains
       call mpas_pool_get_array(mesh, 'dvEdge', dvEdge)
       nullify(rainprod)
       nullify(rainncv)
+      nullify(evapprod)
+      if (pmc_wet_below) call mpas_pool_get_array(diag_physics, 'evapprod', evapprod)
+      if (pmc_wet_below .and. .not. associated(evapprod)) then
+         call mpas_log_write('PartMC: PMC_WET_BELOW needs evapprod from the microphysics', messageType=MPAS_LOG_CRIT)
+      end if
+      i_oin_w = aero_data_spec_by_name(aero_data, 'OIN')
+      i_bc_w = aero_data_spec_by_name(aero_data, 'BC')
       call mpas_pool_get_array(diag_physics, 'rainprod', rainprod)
       call mpas_pool_get_array(diag_physics, 'rainncv', rainncv)
       nullify(cldfrac_w)
@@ -5390,8 +5888,12 @@ contains
       call gas_wet_setup(domain)
       if (allocated(gas_wet_frac)) then
          n_gas = size(gas_wet_frac)
-         allocate(amount(n_gas))
+         allocate(amount(n_gas), p_gas(n_gas))
       end if
+      j_hno3 = 0
+#ifdef MPAS_PARTMC_MOSAIC
+      if (n_gas > 0) j_hno3 = gas_data_spec_by_name(gas_data, 'HNO3')
+#endif
 
       if (lagr_shuffle .and. pmc_n_part > 0 .and. pmc_mode == MODE_LAGR) then
          do iCell = 1, nCellsSolve
@@ -5422,6 +5924,15 @@ contains
             if (prod <= 0.0_RKIND) cycle
             cond = max(0.0_RKIND, scalars(index_qc,k,iCell)) + max(0.0_RKIND, scalars(index_qi,k,iCell))
             p = r * prod / (cond + prod)
+            temp_k = theta_m(k,iCell) / (1.0_RKIND + rvord*max(0.0_RKIND, scalars(index_qv,k,iCell))) * exner(k,iCell)
+            f_liq = 1.0_RKIND
+            if (pmc_wet_ice) then
+               if (cond > 0.0_RKIND) then
+                  f_liq = max(0.0_RKIND, scalars(index_qc,k,iCell)) / cond
+               else
+                  f_liq = merge(1.0_RKIND, 0.0_RKIND, temp_k >= 268.0_RKIND)
+               end if
+            end if
             if (associated(cldfrac_w)) p = p * min(1.0_RKIND, max(0.1_RKIND, cldfrac_w(k,iCell)))
             ! dry air mass per area; number per area is mk times the mixing ratio
             mk = rho_zz(k,iCell) / rdzw(k)
@@ -5495,11 +6006,13 @@ contains
                cycle
             end if
             do i_s = 1, 4
-               scalars(idx(i_s),k,iCell) = scalars(idx(i_s),k,iCell) * (1.0_RKIND - p)
+               scalars(idx(i_s),k,iCell) = scalars(idx(i_s),k,iCell) * (1.0_RKIND - p * f_liq)
             end do
 #ifdef MPAS_PARTMC_MOSAIC
             if (n_gas > 0) then
-               amount = gas_wet_frac * p * scalars(gas_idx,k,iCell)
+               p_gas = p * f_liq
+               if (j_hno3 > 0) p_gas(j_hno3) = p
+               amount = gas_wet_frac * p_gas * scalars(gas_idx,k,iCell)
                scalars(gas_idx,k,iCell) = scalars(gas_idx,k,iCell) - amount
                gas_wetdep = gas_wetdep + amount * 1.0e-9_RKIND * mk / M_AIR * areaCell(iCell)
                s_bud(SB_GWET, band_of(iCell)) = s_bud(SB_GWET, band_of(iCell)) &
@@ -5514,8 +6027,17 @@ contains
             end if
             do j = pos(k,iCell) % n, 1, -1
                g = aero_states(k,iCell)%apa%particle(j)%weight_class
-               wet_sums(6) = wet_sums(6) + p * lagr_w * 2.0_RKIND**(g - LAGR_G0)
-               if (pmc_random() >= p) cycle
+               p_j = p
+               if (f_liq < 1.0_RKIND) then
+                  ! ice-nucleating particles keep the full probability (see above)
+                  call dust_bc_fractions(aero_states(k,iCell)%apa%particle(j), i_oin_w, i_bc_w, fr_du, fr_bc)
+                  if (.not. (fr_du >= 0.5_RKIND .or. (fr_bc >= 0.5_RKIND .and. temp_k < 258.0_RKIND))) then
+                     p_j = p * f_liq
+                     bc_sums(3) = bc_sums(3) + (p - p_j) * lagr_w * 2.0_RKIND**(g - LAGR_G0)
+                  end if
+               end if
+               wet_sums(6) = wet_sums(6) + p_j * lagr_w * 2.0_RKIND**(g - LAGR_G0)
+               if (pmc_random() >= p_j) cycle
                if (pmc_wet_scrit < 1.0e8_RKIND) then
                   if (aero_particle_crit_rel_humid(aero_states(k,iCell)%apa%particle(j), aero_data, env_state) &
                       - 1.0d0 > pmc_wet_scrit) cycle
@@ -5530,6 +6052,41 @@ contains
             end do
             if (removed .and. lagr_control) call lagr_rebalance(k, iCell, nCells, nEdgesOnCell, cellsOnCell)
          end do
+
+         ! below-cloud scavenging, from the top down with the precipitation flux at each layer
+         if (pmc_wet_below .and. pmc_n_part > 0 .and. pmc_mode == MODE_LAGR .and. .not. pmc_wet_diag_only) then
+            flux = 0.0_RKIND
+            do k = nVertLevels, 1, -1
+               mk = rho_zz(k,iCell) / rdzw(k)
+               cond = max(0.0_RKIND, scalars(index_qc,k,iCell)) + max(0.0_RKIND, scalars(index_qi,k,iCell))
+               ! flux into the layer from above (kg m^-2 s^-1), then the layer's own change
+               if (flux > 0.0_RKIND .and. cond <= 1.0e-9_RKIND) then
+                  r_mmh = flux * 3600.0_RKIND
+                  s_reach = min(1.0_RKIND, rainncv(iCell) / (flux * config_dt))
+                  temp_k = theta_m(k,iCell) / (1.0_RKIND + rvord*max(0.0_RKIND, scalars(index_qv,k,iCell))) &
+                           * exner(k,iCell)
+                  snow = (temp_k < 268.0_RKIND)
+                  removed = .false.
+                  do j = pos(k,iCell) % n, 1, -1
+                     d_um = 1.0e6_RKIND * aero_particle_diameter(aero_states(k,iCell)%apa%particle(j), aero_data)
+                     lam = bcs_lambda(d_um, r_mmh, snow)
+                     p_j = (1.0_RKIND - exp(-lam * config_dt)) * s_reach
+                     if (pmc_random() >= p_j) cycle
+                     g = aero_states(k,iCell)%apa%particle(j)%weight_class
+                     w = lagr_w * 2.0_RKIND**(g - LAGR_G0)
+                     bc_sums(1) = bc_sums(1) + w
+                     bc_sums(2) = bc_sums(2) + particle_sulfate(aero_states(k,iCell)%apa%particle(j)) * w
+                     wet_sums(2) = wet_sums(2) + w
+                     call note_removal(aero_states(k,iCell)%apa%particle(j), w, 2, band_of(iCell))
+                     call aero_state_remove_particle_no_info(aero_states(k,iCell), j)
+                     call pos_remove(pos(k,iCell), j)
+                     removed = .true.
+                  end do
+                  if (removed .and. lagr_control) call lagr_rebalance(k, iCell, nCells, nEdgesOnCell, cellsOnCell)
+               end if
+               flux = max(0.0_RKIND, flux + (max(0.0_RKIND, rainprod(k,iCell)) - max(0.0_RKIND, evapprod(k,iCell))) * mk)
+            end do
+         end if
       end do
 
       call mpas_pool_get_field(state, 'scalars', scalars_field, 2)
@@ -5543,6 +6100,14 @@ contains
                              // 'production counted as reaching the surface = $r; particles expected ' &
                              // 'from the layers'' content (all activated) = $r', &
                              intArgs=(/itimestep/), realArgs=g_sums)
+         if (pmc_wet_ice .or. pmc_wet_below) then
+            call mpas_dmpar_sum_real_array(domain % dminfo, 3, bc_sums, g_sums(1:3))
+            call mpas_log_write('PartMC wet removal step $i: below cloud so far: particles (number) $r, sulfur $r mol; ' &
+                                // 'in-cloud removal (number, expected) not done because the condensate was ice $r', &
+                                intArgs=(/itimestep/), realArgs=g_sums(1:3))
+            sums = wet_sums
+            call mpas_dmpar_sum_real_array(domain % dminfo, 6, sums, g_sums)
+         end if
          wsum = wet_where
          call mpas_dmpar_sum_real_array(domain % dminfo, 8, wsum, g_wsum)
          if (g_sums(1) > 0.0_RKIND) then

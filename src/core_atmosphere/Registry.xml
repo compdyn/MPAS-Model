@@ -4517,6 +4517,15 @@
         </var_struct>
 #endif
 
+        <var_struct name="nudge" time_levs="1">
+                <!-- wind nudging (dynamics/mpas_atm_nudging.F): the file read at time T holds the
+                     analyses valid at T (a) and one nudging interval later (b) -->
+                <var name="nudge_u_a" type="real" dimensions="nVertLevels nEdges Time" units="m s^{-1}"
+                     description="Analysis normal velocity valid at the time of the file"/>
+                <var name="nudge_u_b" type="real" dimensions="nVertLevels nEdges Time" units="m s^{-1}"
+                     description="Analysis normal velocity valid one nudging interval after the time of the file"/>
+        </var_struct>
+
         <var_struct name="tend_iau" time_levs="1" packages="iau">
 			
                 <!-- analysis increments; read from iau input -->

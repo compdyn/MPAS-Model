@@ -36,6 +36,7 @@ module atm_time_integration
    use mpas_atm_boundaries, only : nSpecZone, nRelaxZone, nBdyZone, mpas_atm_get_bdy_state, mpas_atm_get_bdy_tend  ! regional_MPAS addition
    
    use mpas_atm_iau  
+   use mpas_atm_nudging, only : atm_nudge_add_tend
    use mpas_atm_dissipation_models
 
    ! Provides definition of halo_exchange_routine
@@ -2165,6 +2166,9 @@ module atm_time_integration
       !
       ! IAU - Incremental Analysis Update
       !
+      ! wind nudging toward analyses (MPAS_NUDGE=1; mpas_atm_nudging.F)
+      call atm_nudge_add_tend(domain, block, itimestep, tend_ru_physics)
+
       if (trim(config_IAU_option) /= 'off') then
          call pre_add_tend_anal_incr(block % configs, block % structs)
          call atm_add_tend_anal_incr(block % configs, block % structs, itimestep, dt, &

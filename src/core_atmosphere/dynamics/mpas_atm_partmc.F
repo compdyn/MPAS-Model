@@ -411,7 +411,7 @@ module mpas_atm_partmc
    character(len=256) :: ox_file = ''
    real (kind=RKIND) :: ox_tau = 172800.0_RKIND, ox_tau_bl = -1.0_RKIND, ox_zbl = 1500.0_RKIND
    integer :: ox_month = 0
-   real (kind=RKIND), allocatable :: ox_o3(:,:), ox_h2o2(:,:)
+   real (kind=RKIND), allocatable :: ox_o3(:,:,:), ox_h2o2(:,:,:)
    logical :: ox_has_h2o2 = .false.
    !> In-cloud sulfate in convective updrafts (PMC_AQ_CONV=1): the fraction of each layer's air
    !> that enters the updraft in a step and reaches liquid cloud (condensation at a level warmer
@@ -3581,9 +3581,9 @@ contains
 
 
    !> Read the prescribed O3 and H2O2 of one month (PMC_OX_FILE) for the cells of this task.
-   subroutine ox_read(domain, month)
+   subroutine ox_read(domain, month, slot)
       type (domain_type), intent(inout) :: domain
-      integer, intent(in) :: month
+      integer, intent(in) :: month, slot
 #ifdef MPAS_PARTMC
       type (mpas_pool_type), pointer :: mesh
       integer, dimension(:), pointer :: indexToCellID
@@ -3595,8 +3595,8 @@ contains
       call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
       call mpas_pool_get_array(mesh, 'indexToCellID', indexToCellID)
       call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
-      if (.not. allocated(ox_o3)) allocate(ox_o3(nVertLevels, size(indexToCellID)), &
-                                            ox_h2o2(nVertLevels, size(indexToCellID)))
+      if (.not. allocated(ox_o3)) allocate(ox_o3(nVertLevels, size(indexToCellID), 2), &
+                                            ox_h2o2(nVertLevels, size(indexToCellID), 2))
       call nc_check(nf90_open(trim(ox_file), NF90_NOWRITE, ncid), 'open ' // trim(ox_file))
       ox_has_h2o2 = .false.
       do v = 1, 2
@@ -3612,25 +3612,27 @@ contains
                        'read ' // trim(vname(v)))
          do iCell = 1, size(indexToCellID)
             if (v == 1) then
-               ox_o3(:,iCell) = real(glob(indexToCellID(iCell), :), RKIND)
+               ox_o3(:,iCell,slot) = real(glob(indexToCellID(iCell), :), RKIND)
             else
-               ox_h2o2(:,iCell) = real(glob(indexToCellID(iCell), :), RKIND)
+               ox_h2o2(:,iCell,slot) = real(glob(indexToCellID(iCell), :), RKIND)
             end if
          end do
          deallocate(glob)
       end do
       call nc_check(nf90_close(ncid), 'close ' // trim(ox_file))
-      ox_month = month
-      call mpas_log_write('PartMC: O3 (and H2O2 if in the file: $l) relaxed toward month $i of ' // trim(ox_file) &
+      if (slot == 1) ox_month = month
+      if (slot == 1) call mpas_log_write('PartMC: O3 (and H2O2 if in the file: $l) relaxed toward months $i and next, ' &
+                          // 'interpolated between mid-months, of ' // trim(ox_file) &
                           // ', time scale $r s ($r s in the lowest $r m)', intArgs=(/month/), logicArgs=(/ox_has_h2o2/), &
                           realArgs=(/ox_tau, merge(ox_tau_bl, ox_tau, ox_tau_bl > 0.0_RKIND), ox_zbl/))
 #endif
    end subroutine ox_read
 
 
-   !> When the model date has moved past both months held for the monthly emission fields
-   !> (fires, DMS), hold the current month and the next one and read them again. Runs longer
-   !> than about a month needed this; before, they kept the second month.
+   !> Hold the monthly emission fields (fires, DMS) of month m_a and the next month in slots 1
+   !> and 2, reading them when m_a changes. The fields are interpolated linearly in time between
+   !> the mid-points of the two months (month_interp), as CAM does with monthly emission files;
+   !> before 23 Nov 2026 the value jumped at the start of each month.
    subroutine emis_months_update(domain, mo_now)
       type (domain_type), intent(inout) :: domain
       integer, intent(in) :: mo_now
@@ -3638,7 +3640,7 @@ contains
       integer :: ib, j, n
       logical :: found
 
-      if (emis_mo(1) == 0 .or. mo_now == emis_mo(1) .or. mo_now == emis_mo(2)) return
+      if (emis_mo(1) == 0 .or. mo_now == emis_mo(1)) return
       emis_mo = (/ mo_now, modulo(mo_now, 12) + 1 /)
       n = 0
       if (allocated(bb_bc)) n = size(bb_bc, 1)
@@ -3781,7 +3783,8 @@ contains
       logical :: found
       integer :: ib, i_na, i_cl
       ! emissions by source
-      integer :: i_sec, i_mo, i_oin, mo_now
+      integer :: i_sec, i_mo, i_oin, mo_now, m_a
+      real (kind=RKIND) :: w_mo
       integer, dimension(:), pointer :: indexToCellID
       real (kind=RKIND), dimension(:), pointer :: latCell, lonCell_s, snowh
       real (kind=RKIND) :: cur_dg, prof(200), fm, km(N_KIND), g_km(N_KIND), dd, cum
@@ -3857,10 +3860,10 @@ contains
       call mpas_pool_get_array(mesh, 'zgrid', zgrid_s)
       nullify(snowh)
       call mpas_pool_get_array(sfc_input, 'snowh', snowh)
-      ! the months held for fires and DMS: that of the first emission step and the next
-      if (emis_mo(1) == 0) emis_mo = (/ mo_now, modulo(mo_now, 12) + 1 /)
-      call emis_months_update(domain, mo_now)
-      i_mo = merge(1, 2, mo_now == emis_mo(1))
+      ! the months held for fires and DMS: the two whose mid-points bracket the model date
+      call month_interp(domain, m_a, w_mo)
+      if (emis_mo(1) == 0) emis_mo = (/ m_a, modulo(m_a, 12) + 1 /)
+      call emis_months_update(domain, m_a)
       cur_dg = carb_dg
 
       if (len_trim(emis_file) > 0 .and. .not. emis_part_read) then
@@ -4053,7 +4056,8 @@ contains
                call emit_carb(4 + i_sec, sec_bc(iCell,i_sec), sec_oc(iCell,i_sec))
             end do
             call bb_profile(iCell)
-            call emit_carb(K_BB, bb_bc(iCell,i_mo), bb_oc(iCell,i_mo))
+            call emit_carb(K_BB, (1.0_RKIND - w_mo) * bb_bc(iCell,1) + w_mo * bb_bc(iCell,2), &
+                                 (1.0_RKIND - w_mo) * bb_oc(iCell,1) + w_mo * bb_oc(iCell,2))
             ! dust from bare, snow-free land
             if (dust_src(iCell) > 0.0_RKIND .and. associated(landmask)) then
                if (landmask(iCell) == 1) then
@@ -4487,7 +4491,8 @@ contains
       real (kind=RKIND), dimension(:), pointer :: u10, v10, t2m, swdnb, sst, xice
       real (kind=RKIND), allocatable :: extra(:)
       real (kind=RKIND) :: wind, tc, sc_dms, k_w, f_dms, g_t, g_p, par, nat(3)
-      integer :: mo_now, i_mo, ib, j_so2, j_isop, j_api, j_lim, j_dms
+      integer :: mo_now, i_mo, ib, j_so2, j_isop, j_api, j_lim, j_dms, m_a
+      real (kind=RKIND) :: w_mo
       real (kind=dp) :: t_now
 
       if (.not. pmc_chem .or. pmc_n_part <= 0) return
@@ -4533,8 +4538,8 @@ contains
                         mterp_ef(nCellsSolve))
                gas_bb = 0.0_RKIND
                if (emis_mo(1) == 0) then
-                  call model_date(domain, mo_now, t_now)
-                  emis_mo = (/ mo_now, modulo(mo_now, 12) + 1 /)
+                  call month_interp(domain, m_a, w_mo)
+                  emis_mo = (/ m_a, modulo(m_a, 12) + 1 /)
                end if
                do ib = 1, 2
                   do j = 1, n_gas
@@ -4577,9 +4582,8 @@ contains
       allocate(extra(n_gas))
       extra = 0.0_RKIND
       if (allocated(gas_bb)) then
-         call model_date(domain, mo_now, t_now)
-         call emis_months_update(domain, mo_now)
-         i_mo = merge(1, 2, mo_now == emis_mo(1))
+         call month_interp(domain, m_a, w_mo)
+         call emis_months_update(domain, m_a)
          call mpas_pool_get_subpool(domain % blocklist % structs, 'diag_physics', dphys)
          call mpas_pool_get_array(dphys, 'u10', u10)
          call mpas_pool_get_array(dphys, 'v10', v10)
@@ -4604,7 +4608,7 @@ contains
          air1 = rho_zz(1,iCell) / rdzw(1) / M_AIR
          if (allocated(gas_bb)) then
             ! fires of this month
-            extra = gas_bb(:,iCell,i_mo)
+            extra = (1.0_RKIND - w_mo) * gas_bb(:,iCell,1) + w_mo * gas_bb(:,iCell,2)
             nat = 0.0_RKIND
             if (landmask(iCell) == 0) then
                ! DMS from the sea (Nightingale et al. 2000 transfer velocity, Saltzman et al.
@@ -4613,7 +4617,7 @@ contains
                tc = min(35.0_RKIND, max(-2.0_RKIND, sst(iCell) - 273.15_RKIND))
                sc_dms = 2674.0_RKIND - 147.12_RKIND*tc + 3.726_RKIND*tc**2 - 0.038_RKIND*tc**3
                k_w = (0.222_RKIND * wind**2 + 0.333_RKIND * wind) / 3.6e5_RKIND * (sc_dms / 600.0_RKIND)**(-0.5_RKIND)
-               f_dms = dms_scale * k_w * dms_w(iCell,i_mo) * 1.0e-6_RKIND * (1.0_RKIND - min(1.0_RKIND, max(0.0_RKIND, xice(iCell))))
+               f_dms = dms_scale * k_w * ((1.0_RKIND - w_mo) * dms_w(iCell,1) + w_mo * dms_w(iCell,2)) * 1.0e-6_RKIND * (1.0_RKIND - min(1.0_RKIND, max(0.0_RKIND, xice(iCell))))
                extra(j_dms) = extra(j_dms) + f_dms
                nat(1) = f_dms
             else
@@ -4958,6 +4962,38 @@ contains
 
 
    !> Current model month and time in seconds since 2000-01-01 00:00 UTC.
+   !> The months whose mid-points bracket the model date, m_a and the month after it, and the
+   !> weight w of the second: a monthly field at this time is (1 - w) F(m_a) + w F(m_a + 1).
+   subroutine month_interp(domain, m_a, w)
+      use mpas_timekeeping
+      type (domain_type), intent(in) :: domain
+      integer, intent(out) :: m_a
+      real (kind=RKIND), intent(out) :: w
+      type (MPAS_Time_type) :: now
+      integer :: yr, mo, dy, h, mi, sc, ierr, mb
+      real (kind=RKIND) :: t_in, half_now, half_prev, half_next
+      integer :: ml(12)
+
+      now = mpas_get_clock_time(domain % clock, MPAS_NOW, ierr)
+      call mpas_get_time(now, YYYY=yr, MM=mo, DD=dy, H=h, M=mi, S=sc, ierr=ierr)
+      ml = (/ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 /)
+      if (mod(yr, 4) == 0) ml(2) = 29
+      t_in = real((dy - 1) * 86400 + h * 3600 + mi * 60 + sc, kind=RKIND)
+      half_now = 0.5_RKIND * real(ml(mo), kind=RKIND) * 86400.0_RKIND
+      if (t_in >= half_now) then
+         m_a = mo
+         mb = modulo(mo, 12) + 1
+         half_next = 0.5_RKIND * real(ml(mb), kind=RKIND) * 86400.0_RKIND
+         w = (t_in - half_now) / (half_now + half_next)
+      else
+         m_a = modulo(mo - 2, 12) + 1
+         half_prev = 0.5_RKIND * real(ml(m_a), kind=RKIND) * 86400.0_RKIND
+         w = (t_in + half_prev) / (half_prev + half_now)
+      end if
+      w = min(1.0_RKIND, max(0.0_RKIND, w))
+   end subroutine month_interp
+
+
    subroutine model_date(domain, mo, t_abs)
       use mpas_timekeeping
       type (domain_type), intent(in) :: domain
@@ -5593,7 +5629,7 @@ contains
       real (kind=RKIND), dimension(:,:), pointer :: cldfrac
       integer, pointer :: index_qc
       integer :: i_h2o2, i_o3
-      real (kind=RKIND) :: qc, f_c, l_c, rho_d, d_h, d_o, d_ppb, aq_g(2)
+      real (kind=RKIND) :: qc, f_c, l_c, rho_d, d_h, d_o, d_ppb, aq_g(2), ox_w
       real (kind=RKIND) :: temp_r, pres_r, so2_c, h2o2_c, ph_c, c_air, a_ion, n_ion, d_h1, d_o1, aq_phg(4)
       integer :: n_sub_aq, i_sub_aq, i_nh3, i_hno3
       real (kind=RKIND) :: burden(N_GRP), g_burden(N_GRP), m_grp(N_GRP), rem(3*N_GRP), g_rem(3*N_GRP)
@@ -5661,15 +5697,13 @@ contains
       i_hno3 = gas_data_spec_by_name(gas_data, 'HNO3')
       i_o3 = gas_data_spec_by_name(gas_data, 'O3')
 
-      ! prescribed oxidants: the month of the current model date
+      ! prescribed oxidants: the two months whose mid-points bracket the model date
       if (len_trim(ox_file) > 0) then
-         doy = real(env_state%start_day, dp) + (env_state%start_time + env_state%elapsed_time) / 86400.0d0
-         j = 1
-         do while (j < 12)
-            if (doy < real(days_before(j+1) + 1, dp) + merge(1.0d0, 0.0d0, j+1 > 2 .and. mod(yr, 4) == 0)) exit
-            j = j + 1
-         end do
-         if (j /= ox_month) call ox_read(domain, j)
+         call month_interp(domain, j, ox_w)
+         if (j /= ox_month) then
+            call ox_read(domain, j, 1)
+            call ox_read(domain, modulo(j, 12) + 1, 2)
+         end if
       end if
 
       n_cells = 0
@@ -5702,12 +5736,14 @@ contains
                ! mol of air in the cell, for the record of what the relaxation adds
                c_air = env_state%pressure / (8.314_RKIND * env_state%temp) * vol * 1.0e-9_RKIND
                j = gas_idx(i_o3)
-               d_ppb = t_local * (ox_o3(k,iCell) * moist_fac - scalars(j,k,iCell))
+               d_ppb = t_local * (((1.0_RKIND - ox_w) * ox_o3(k,iCell,1) + ox_w * ox_o3(k,iCell,2)) * moist_fac &
+                                  - scalars(j,k,iCell))
                scalars(j,k,iCell) = scalars(j,k,iCell) + d_ppb
                ox_added(1) = ox_added(1) + d_ppb / moist_fac * c_air
                if (ox_has_h2o2) then
                   j = gas_idx(i_h2o2)
-                  d_ppb = t_local * (ox_h2o2(k,iCell) * moist_fac - scalars(j,k,iCell))
+                  d_ppb = t_local * (((1.0_RKIND - ox_w) * ox_h2o2(k,iCell,1) + ox_w * ox_h2o2(k,iCell,2)) &
+                                     * moist_fac - scalars(j,k,iCell))
                   scalars(j,k,iCell) = scalars(j,k,iCell) + d_ppb
                   ox_added(2) = ox_added(2) + d_ppb / moist_fac * c_air
                end if

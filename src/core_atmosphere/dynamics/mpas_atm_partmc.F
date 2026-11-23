@@ -7098,8 +7098,9 @@ contains
          do iCell = 1, nCellsSolve
             do k = 1, nVertLevels
                vol = cell_volume(areaCell(iCell), rdzw(k), zz(k,iCell))
-               st(1) = st(1) + sulfur_gas_sum(scalars(gas_idx,k,iCell)) * 1.0d-9 * rho_zz(k,iCell) &
-                               * zz(k,iCell) * vol / M_AIR
+               ! gas_idx is set up by the first chemistry or gas emission call
+               if (allocated(gas_idx)) st(1) = st(1) + sulfur_gas_sum(scalars(gas_idx,k,iCell)) * 1.0d-9 &
+                                               * rho_zz(k,iCell) * zz(k,iCell) * vol / M_AIR
                do j = 1, aero_state_n_part(aero_states(k,iCell))
                   st(2) = st(2) + particle_sulfate(aero_states(k,iCell)%apa%particle(j)) &
                                   * aero_weight_array_num_conc(aero_states(k,iCell)%awa, &

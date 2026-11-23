@@ -517,6 +517,10 @@ module mpas_atm_partmc
    !> Brownian coagulation in every cell each step, and events so far.
    logical :: pmc_coag = .false.
    logical :: pmc_checksum = .false.
+   !> PMC_S_TRACE=n: for the first n steps, print global sulfur (gas + particles, mol) less the
+   !> net surface input and the thinning after each process, to find a process that does not
+   !> conserve it
+   integer :: pmc_s_trace = 0
    !> PMC_COAG_DUMP: up to this step, every task writes one line per cell and level of the
    !> coagulation inputs and outputs (hashes) to coag_dump_rNNNN.txt
    integer :: pmc_coag_dump = 0, coag_dump_unit = 0
@@ -638,6 +642,8 @@ contains
       if (stat == 0) pmc_coag_twice = (trim(envval) == '1')
       call get_environment_variable('PMC_COAG_DUMP', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_coag_dump
+      call get_environment_variable('PMC_S_TRACE', envval, status=stat)
+      if (stat == 0) read(envval, *) pmc_s_trace
       call get_environment_variable('PMC_CHECKSUM', envval, status=stat)
       if (stat == 0) pmc_checksum = (trim(envval) == '1')
       call get_environment_variable('PMC_COAG', envval, status=stat)
@@ -6473,7 +6479,43 @@ contains
       integer, allocatable :: rseed(:)
       integer :: iCell, k, j, i, n_rseed
       real (kind=RKIND) :: loc(8), glob(8)
+      real (kind=RKIND), dimension(:,:), pointer :: rho_zz, zz
+      real (kind=RKIND), dimension(:), pointer :: areaCell, rdzw
+      real (kind=RKIND) :: st(5), g_st(5), vol
 
+      if (itimestep <= pmc_s_trace .and. pmc_n_part > 0) then
+         call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
+         call mpas_pool_get_subpool(domain % blocklist % structs, 'state', state)
+         call mpas_pool_get_dimension(mesh, 'nCellsSolve', nCellsSolve)
+         call mpas_pool_get_dimension(mesh, 'nVertLevels', nVertLevels)
+         call mpas_pool_get_array(state, 'scalars', scalars, 2)
+         call mpas_pool_get_array(state, 'rho_zz', rho_zz, 2)
+         call mpas_pool_get_array(mesh, 'zz', zz)
+         call mpas_pool_get_array(mesh, 'areaCell', areaCell)
+         call mpas_pool_get_array(mesh, 'rdzw', rdzw)
+         st = 0.0_RKIND
+         do iCell = 1, nCellsSolve
+            do k = 1, nVertLevels
+               vol = cell_volume(areaCell(iCell), rdzw(k), zz(k,iCell))
+               st(1) = st(1) + sulfur_gas_sum(scalars(gas_idx,k,iCell)) * 1.0d-9 * rho_zz(k,iCell) &
+                               * zz(k,iCell) * vol / M_AIR
+               do j = 1, aero_state_n_part(aero_states(k,iCell))
+                  st(2) = st(2) + particle_sulfate(aero_states(k,iCell)%apa%particle(j)) &
+                                  * aero_weight_array_num_conc(aero_states(k,iCell)%awa, &
+                                       aero_states(k,iCell)%apa%particle(j), aero_data) * vol
+               end do
+            end do
+         end do
+         if (allocated(gas_emitted)) st(3) = sulfur_gas_sum(gas_emitted) - sulfur_gas_sum(gas_deposited) &
+                                             - sulfur_gas_sum(gas_wetdep)
+         st(3) = st(3) - part_s_removed
+         st(4) = part_s_thin
+         st(5) = coag_s
+         call mpas_dmpar_sum_real_array(domain % dminfo, 5, st, g_st)
+         call mpas_log_write('PartMC S trace step $i after '//trim(label)//': gas $r particles $r net input $r ' &
+                             // 'thinning $r coag counter $r; total less input and thinning $r mol', &
+                             intArgs=(/itimestep/), realArgs=(/g_st(1:5), g_st(1) + g_st(2) - g_st(3) - g_st(4)/))
+      end if
       if (.not. pmc_checksum) return
       call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
       call mpas_pool_get_subpool(domain % blocklist % structs, 'state', state)

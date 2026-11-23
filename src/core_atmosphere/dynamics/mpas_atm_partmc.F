@@ -5774,6 +5774,11 @@ contains
          'CH3SO3      ', 'CH3SO2OO    ', 'CH3SO2CH2OO ', 'SULFHOX     ' /)
       logical, allocatable, save :: is_s(:)
       integer :: i, js
+      ! the table is built once the gas data are read (a call before that, e.g. from the S
+      ! trace at the first step of a restarted run, must not fix an empty table)
+      if (allocated(is_s)) then
+         if (size(is_s) /= gas_data_n_spec(gas_data)) deallocate(is_s)
+      end if
       if (.not. allocated(is_s)) then
          allocate(is_s(gas_data_n_spec(gas_data)))
          is_s = .false.

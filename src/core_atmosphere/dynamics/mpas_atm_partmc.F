@@ -126,6 +126,10 @@
 !   PMC_OUT_INTERVAL  write particle files every this many steps (0 = never)
 !   PMC_OUT_FRAC      fraction of cells written each time (default 1)
 !   PMC_OUT_DIR       directory for particle files (default pmc_out)
+!   PMC_LNOX          1: lightning NO from the convective cloud tops (Price and Rind 1992, as in
+!                     CAM-chem; see lightning_no); PMC_LNOX_FACTOR scales the production
+!                     (default 0.1). Needs PMC_MOSAIC=1, an emission file and cu_ntiedtke.
+!   PMC_WET_ICE, PMC_WET_BELOW  ice-phase and below-cloud wet removal (see pmc_wet_ice)
 
 ! Variable-length byte-buffer exchange between neighbouring MPI tasks, used to
 ! move PartMC particles across block boundaries. Kept in its own module so that
@@ -338,6 +342,23 @@ module mpas_atm_partmc
    !> removed below cloud (number), sulfur removed below cloud (mol), number not removed in
    !> cloud because the condensate was ice.
    logical :: pmc_wet_ice = .false., pmc_wet_below = .false.
+   !> Lightning NO (PMC_LNOX=1), as in CAM-chem (mo_lightning.F90): flash rate from the
+   !> convective cloud-top height H (km above sea level; top of the highest layer with an
+   !> updraft, if colder than 273 K) by Price and Rind (1992), 3.44e-5 H^4.9 over land and
+   !> 6.4e-4 H^1.7 over the sea (flashes per minute), 6.7e9 J per flash and 1e17 N atoms per J
+   !> (Price et al. 1997), times PMC_LNOX_FACTOR (default 0.1, CAM's base factor) and the cell
+   !> area over the mean cell area; distributed in height up to H by the profiles of Pickering
+   !> et al. (1998) (midlatitude beyond 25 degrees, else tropical continental or marine),
+   !> scaled to H. Sums by this task: flashes and mol NO since the start of the run.
+   logical :: pmc_lnox = .false.
+   real (kind=RKIND) :: lnox_factor = 0.1_RKIND, lnox_sums(2) = 0.0_RKIND
+   real (kind=RKIND), parameter :: lnox_vdist(16,3) = reshape((/ &
+        3.0_RKIND, 3.0_RKIND, 3.0_RKIND, 3.0_RKIND, 3.4_RKIND, 3.5_RKIND, 3.6_RKIND, 4.0_RKIND, &
+        5.0_RKIND, 7.0_RKIND, 9.0_RKIND, 14.0_RKIND, 16.0_RKIND, 14.0_RKIND, 8.0_RKIND, 0.5_RKIND, &
+        2.5_RKIND, 2.5_RKIND, 2.5_RKIND, 2.5_RKIND, 2.5_RKIND, 2.5_RKIND, 2.5_RKIND, 6.1_RKIND, &
+        17.0_RKIND, 15.4_RKIND, 14.5_RKIND, 13.0_RKIND, 12.5_RKIND, 2.8_RKIND, 0.9_RKIND, 0.3_RKIND, &
+        2.0_RKIND, 2.0_RKIND, 2.0_RKIND, 1.5_RKIND, 1.5_RKIND, 1.5_RKIND, 3.0_RKIND, 5.8_RKIND, &
+        7.6_RKIND, 9.6_RKIND, 11.0_RKIND, 14.0_RKIND, 14.0_RKIND, 14.0_RKIND, 8.2_RKIND, 2.3_RKIND /), (/16, 3/))
    real (kind=RKIND) :: bc_sums(3) = 0.0_RKIND
    !> Removal in the convective updraft: switch, and sums by this task so far: number removed
    !> (reference, particles, expected from the particles present), convective precipitation at
@@ -745,6 +766,10 @@ contains
       if (stat == 0) pmc_wet_ice = (trim(envval) /= '0')
       call get_environment_variable('PMC_WET_BELOW', envval, status=stat)
       if (stat == 0) pmc_wet_below = (trim(envval) /= '0')
+      call get_environment_variable('PMC_LNOX', envval, status=stat)
+      if (stat == 0) pmc_lnox = (trim(envval) /= '0')
+      call get_environment_variable('PMC_LNOX_FACTOR', envval, status=stat)
+      if (stat == 0) read(envval, *) lnox_factor
       call get_environment_variable('PMC_WET_CLDFRAC', envval, status=stat)
       if (stat == 0) pmc_wet_cldfrac = (trim(envval) /= '0')
       call get_environment_variable('PMC_CONV_CHECK', envval, status=stat)
@@ -4553,6 +4578,12 @@ contains
       real (kind=RKIND), dimension(:,:), pointer :: zgrid
       real (kind=RKIND), dimension(:), pointer :: latCell
       integer :: ig, ip
+      ! lightning NO
+      real (kind=RKIND), dimension(:,:), pointer :: cu_mfu, theta_m, exner
+      integer, pointer :: index_qv
+      integer :: j_no
+      real (kind=RKIND) :: a_mean, lsum(2)
+      type (mpas_pool_type), pointer :: diag_l
 
       if (.not. pmc_chem .or. pmc_n_part <= 0) return
       if (len_trim(gas_emit_file) == 0 .and. len_trim(gas_drydep_file) == 0 .and. len_trim(emis_file) == 0 &
@@ -4580,6 +4611,24 @@ contains
       ! landmask, not xland: the physics sets xland to land where there is sea ice
       nullify(landmask)
       call mpas_pool_get_array(sfc_input, 'landmask', landmask)
+      nullify(cu_mfu)
+      j_no = 0
+      if (pmc_lnox) then
+         call mpas_pool_get_subpool(domain % blocklist % structs, 'diag_physics', dphys)
+         call mpas_pool_get_array(dphys, 'cu_mfu', cu_mfu)
+         if (.not. associated(cu_mfu)) call mpas_log_write('PartMC: PMC_LNOX needs the cu_ntiedtke convection scheme', &
+                                                          messageType=MPAS_LOG_CRIT)
+         call mpas_pool_get_array(state, 'theta_m', theta_m, 2)
+         call mpas_pool_get_dimension(state, 'index_qv', index_qv)
+         call mpas_pool_get_subpool(domain % blocklist % structs, 'diag', diag_l)
+         call mpas_pool_get_array(diag_l, 'exner', exner)
+         lsum(1) = sum(areaCell(1:nCellsSolve))
+         lsum(2) = real(nCellsSolve, kind=RKIND)
+         call mpas_dmpar_sum_real(domain % dminfo, lsum(1), a_mean)
+         call mpas_dmpar_sum_real(domain % dminfo, lsum(2), air_emit)
+         a_mean = a_mean / air_emit
+         j_no = gas_data_spec_by_name(gas_data, 'NO')
+      end if
 
       call gas_budget_setup(domain)
       if (.not. gas_surface_read) then
@@ -4776,12 +4825,23 @@ contains
                call emis_profile(11, nVertLevels, zgrid(:,iCell), m_col, latCell(iCell), pt_zbot(ip), pt_ztop(ip), prf)
                call add_gas(amt_g, prf)
             end do
+            if (pmc_lnox .and. j_no > 0 .and. associated(cu_mfu)) then
+               call lightning_no(iCell, amt_g, prf)
+               if (amt_g(j_no) > 0.0_RKIND) call add_gas(amt_g, prf)
+            end if
          end if
       end do
 
       call mpas_pool_get_field(state, 'scalars', scalars_field, 2)
       call mpas_dmpar_exch_halo_field(scalars_field)
 
+      if (pmc_lnox .and. mod(itimestep, 12) == 0) then
+         call mpas_dmpar_sum_real_array(domain % dminfo, 2, lnox_sums, lsum)
+         call mpas_log_write('PartMC lightning step $i: since the start of this run $r flashes, $r mol NO ' &
+                             // '($r flashes/s, $r Tg N/yr on average)', intArgs=(/itimestep/), &
+                             realArgs=(/lsum(1), lsum(2), lsum(1) / (itimestep * config_dt), &
+                                        lsum(2) * 14.007e-3_RKIND / 1.0e9_RKIND / (itimestep * config_dt) * 3.15576e7_RKIND/))
+      end if
       if (n_pt > 0 .and. mod(itimestep, 12) == 0) then
          call mpas_dmpar_sum_real(domain % dminfo, pt_s_emitted, air_emit)
          call mpas_log_write('PartMC gas surface step $i: SO2 from point sources since the start of this run $r mol', &
@@ -4818,6 +4878,59 @@ contains
 
       !> Add amt (mol per m^2 this step, by gas species) to the current cell with the layer
       !> shares prf, and count it as emitted.
+      !> Lightning NO of column ic this step (amt, mol per area, only NO) and its profile (prf).
+      subroutine lightning_no(ic, amt, prf_out)
+         integer, intent(in) :: ic
+         real (kind=RKIND), intent(out) :: amt(:), prf_out(:)
+         integer :: kt, kz, it, kb
+         real (kind=RKIND) :: h, f, t_top, zl, zh, s
+         amt = 0.0_RKIND
+         prf_out = 0.0_RKIND
+         kt = 0
+         do kz = nVertLevels, 1, -1
+            if (cu_mfu(kz,ic) > 1.0e-8_RKIND) then
+               kt = kz
+               exit
+            end if
+         end do
+         if (kt < 2) return
+         t_top = theta_m(kt,ic) / (1.0_RKIND + 1.61_RKIND * scalars(index_qv,kt,ic)) * exner(kt,ic)
+         if (t_top >= 273.15_RKIND) return
+         h = 1.0e-3_RKIND * zgrid(kt+1,ic)
+         if (landmask(ic) == 1) then
+            f = 3.44e-5_RKIND * h**4.9_RKIND
+         else
+            f = 6.4e-4_RKIND * h**1.7_RKIND
+         end if
+         f = f / 60.0_RKIND * areaCell(ic) / a_mean      ! flashes per second in the column
+         ! N atoms per second: 6.7e9 J per flash, 1e17 atoms per J, times the factor
+         amt(j_no) = f * 6.7e9_RKIND * 1.0e17_RKIND * lnox_factor / 6.02214076e23_RKIND * config_dt / areaCell(ic)
+         lnox_sums(1) = lnox_sums(1) + f * config_dt
+         lnox_sums(2) = lnox_sums(2) + amt(j_no) * areaCell(ic)
+         if (abs(latCell(ic)) > 25.0_RKIND * pii / 180.0_RKIND) then
+            it = 1
+         else if (landmask(ic) == 1) then
+            it = 3
+         else
+            it = 2
+         end if
+         ! share of each layer up to the cloud top: the profile in 16 bins of H/16, by height
+         do kz = 1, kt
+            zl = zgrid(kz,ic) * 16.0e-3_RKIND / h
+            zh = zgrid(kz+1,ic) * 16.0e-3_RKIND / h
+            do kb = 1, 16
+               s = min(zh, real(kb, kind=RKIND)) - max(zl, real(kb - 1, kind=RKIND))
+               if (s > 0.0_RKIND) prf_out(kz) = prf_out(kz) + s * lnox_vdist(kb,it)
+            end do
+         end do
+         s = sum(prf_out(1:kt))
+         if (s > 0.0_RKIND) then
+            prf_out(1:kt) = prf_out(1:kt) / s
+         else
+            amt = 0.0_RKIND
+         end if
+      end subroutine lightning_no
+
       subroutine add_gas(amt, prf_in)
          real (kind=RKIND), intent(in) :: amt(:), prf_in(:)
          integer :: kz

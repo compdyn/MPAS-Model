@@ -346,6 +346,14 @@ module mpas_atm_partmc
    !> above it all of the condensate removes aerosol as liquid (GEOS-Chem limits in-cloud
    !> scavenging of soluble aerosol only below 258 K, Wang et al. 2011). Default: all temperatures.
    real (kind=RKIND) :: pmc_wet_ice_t = -1.0_RKIND
+   !> PMC_SO2_DRYDEP_SFC=1: SO2 dry deposition velocity by surface, as prescribed by Rotstayn and
+   !> Lohmann (2002, after Ganzeveld et al. 1998): 0.8 cm/s over wet surfaces (sea, vegetation,
+   !> melting snow and ice), 0.2 cm/s over dry soil (here all bare soil) and 0.1 cm/s over snow
+   !> and ice below 273.15 K (skin temperature); mixed by sea-ice fraction, snow cover and
+   !> vegetation fraction. Replaces the SO2 value of PMC_GAS_DRYDEP. Area sums of the velocity
+   !> (m/s m2) and area over sea, land and ice since the start, for the log.
+   logical :: pmc_so2_drydep_sfc = .false.
+   real (kind=RKIND) :: so2vd_sums(6) = 0.0_RKIND
    !> Lightning NO (PMC_LNOX=1), as in CAM-chem (mo_lightning.F90): flash rate from the
    !> convective cloud-top height H (km above sea level; top of the highest layer with an
    !> updraft, if colder than 273 K) by Price and Rind (1992), 3.44e-5 H^4.9 over land and
@@ -774,6 +782,8 @@ contains
       if (stat == 0) pmc_wet_diag_only = (trim(envval) == '2')
       call get_environment_variable('PMC_WET_ICE', envval, status=stat)
       if (stat == 0) pmc_wet_ice = (trim(envval) /= '0')
+      call get_environment_variable('PMC_SO2_DRYDEP_SFC', envval, status=stat)
+      if (stat == 0) pmc_so2_drydep_sfc = (trim(envval) /= '0')
       call get_environment_variable('PMC_WET_ICE_T', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_wet_ice_t
       call get_environment_variable('PMC_AQ_CONV_RAIN', envval, status=stat)
@@ -4583,6 +4593,9 @@ contains
       ! fires, DMS and biogenic gases (PMC_EMIS_SECTORS)
       type (mpas_pool_type), pointer :: dphys
       real (kind=RKIND), dimension(:), pointer :: u10, v10, t2m, swdnb, sst, xice
+      real (kind=RKIND), dimension(:), pointer :: skintemp, snowc, vegfra
+      real (kind=RKIND) :: v_so2, v_ice, f_ice, f_snow, f_veg, nat6(6)
+      integer :: j_s2
       real (kind=RKIND), allocatable :: extra(:)
       real (kind=RKIND) :: wind, tc, sc_dms, k_w, f_dms, g_t, g_p, par, nat(3)
       integer :: mo_now, i_mo, ib, j_so2, j_isop, j_api, j_lim, j_dms, m_a
@@ -4628,6 +4641,14 @@ contains
       ! landmask, not xland: the physics sets xland to land where there is sea ice
       nullify(landmask)
       call mpas_pool_get_array(sfc_input, 'landmask', landmask)
+      j_s2 = 0
+      if (pmc_so2_drydep_sfc) then
+         call mpas_pool_get_array(sfc_input, 'xice', xice)
+         call mpas_pool_get_array(sfc_input, 'skintemp', skintemp)
+         call mpas_pool_get_array(sfc_input, 'snowc', snowc)
+         call mpas_pool_get_array(sfc_input, 'vegfra', vegfra)
+         j_s2 = gas_data_spec_by_name(gas_data, 'SO2')
+      end if
       nullify(cu_mfu)
       j_no = 0
       if (pmc_lnox) then
@@ -4777,6 +4798,27 @@ contains
          if (allocated(gas_drydep%mix_rat)) then
             dz = 1.0_RKIND / (rdzw(1) * zz(1,iCell))
             frac = 1.0_RKIND - exp(-gas_drydep%mix_rat * config_dt / dz)
+            if (j_s2 > 0) then
+               v_ice = merge(0.001_RKIND, 0.008_RKIND, skintemp(iCell) < 273.15_RKIND)
+               if (landmask(iCell) == 0) then
+                  f_ice = min(1.0_RKIND, max(0.0_RKIND, xice(iCell)))
+                  v_so2 = (1.0_RKIND - f_ice) * 0.008_RKIND + f_ice * v_ice
+                  so2vd_sums(1) = so2vd_sums(1) + (1.0_RKIND - f_ice) * 0.008_RKIND * areaCell(iCell)
+                  so2vd_sums(2) = so2vd_sums(2) + (1.0_RKIND - f_ice) * areaCell(iCell)
+                  so2vd_sums(5) = so2vd_sums(5) + f_ice * v_ice * areaCell(iCell)
+                  so2vd_sums(6) = so2vd_sums(6) + f_ice * areaCell(iCell)
+               else
+                  f_snow = min(1.0_RKIND, max(0.0_RKIND, snowc(iCell)))
+                  f_veg = min(1.0_RKIND, max(0.0_RKIND, vegfra(iCell) / 100.0_RKIND))
+                  v_so2 = f_snow * v_ice + (1.0_RKIND - f_snow) * (f_veg * 0.008_RKIND + (1.0_RKIND - f_veg) * 0.002_RKIND)
+                  so2vd_sums(3) = so2vd_sums(3) + (1.0_RKIND - f_snow) * (f_veg * 0.008_RKIND &
+                                  + (1.0_RKIND - f_veg) * 0.002_RKIND) * areaCell(iCell)
+                  so2vd_sums(4) = so2vd_sums(4) + (1.0_RKIND - f_snow) * areaCell(iCell)
+                  so2vd_sums(5) = so2vd_sums(5) + f_snow * v_ice * areaCell(iCell)
+                  so2vd_sums(6) = so2vd_sums(6) + f_snow * areaCell(iCell)
+               end if
+               frac(j_s2) = 1.0_RKIND - exp(-v_so2 * config_dt / dz)
+            end if
             amount = frac * scalars(gas_idx,1,iCell)
             scalars(gas_idx,1,iCell) = scalars(gas_idx,1,iCell) - amount
             gas_deposited = gas_deposited + amount * 1.0e-9_RKIND * air1 * areaCell(iCell)
@@ -4858,6 +4900,13 @@ contains
                              // '($r flashes/s, $r Tg N/yr on average)', intArgs=(/itimestep/), &
                              realArgs=(/lsum(1), lsum(2), lsum(1) / (itimestep * config_dt), &
                                         lsum(2) * 14.007e-3_RKIND / 1.0e9_RKIND / (itimestep * config_dt) * 3.15576e7_RKIND/))
+      end if
+      if (pmc_so2_drydep_sfc .and. mod(itimestep, 12) == 0) then
+         call mpas_dmpar_sum_real_array(domain % dminfo, 6, so2vd_sums, nat6)
+         call mpas_log_write('PartMC gas surface step $i: mean SO2 dry deposition velocity (cm/s) since the start ' &
+                             // 'of this run: open sea $r, snow-free land $r, snow and ice $r', intArgs=(/itimestep/), &
+                             realArgs=(/100.0_RKIND*nat6(1)/max(1.0_RKIND,nat6(2)), 100.0_RKIND*nat6(3)/max(1.0_RKIND,nat6(4)), &
+                                        100.0_RKIND*nat6(5)/max(1.0_RKIND,nat6(6))/))
       end if
       if (n_pt > 0 .and. mod(itimestep, 12) == 0) then
          call mpas_dmpar_sum_real(domain % dminfo, pt_s_emitted, air_emit)

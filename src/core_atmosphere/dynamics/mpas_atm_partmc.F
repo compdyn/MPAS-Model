@@ -342,6 +342,10 @@ module mpas_atm_partmc
    !> removed below cloud (number), sulfur removed below cloud (mol), number not removed in
    !> cloud because the condensate was ice.
    logical :: pmc_wet_ice = .false., pmc_wet_below = .false.
+   !> PMC_WET_ICE_T (K): if positive, the ice rule applies only below this temperature; at or
+   !> above it all of the condensate removes aerosol as liquid (GEOS-Chem limits in-cloud
+   !> scavenging of soluble aerosol only below 258 K, Wang et al. 2011). Default: all temperatures.
+   real (kind=RKIND) :: pmc_wet_ice_t = -1.0_RKIND
    !> Lightning NO (PMC_LNOX=1), as in CAM-chem (mo_lightning.F90): flash rate from the
    !> convective cloud-top height H (km above sea level; top of the highest layer with an
    !> updraft, if colder than 273 K) by Price and Rind (1992), 3.44e-5 H^4.9 over land and
@@ -446,6 +450,12 @@ module mpas_atm_partmc
    !> than pmc_aq_tmin) before it is detrained, from the convection step; in that air SO2 and
    !> H2O2 react until one is used up. Sulfate made (mol) by this task so far.
    logical :: pmc_aq_conv = .false.
+   !> PMC_AQ_CONV_RAIN=1: of the convective in-cloud sulfate, the fraction pe of the column's
+   !> condensate that falls as convective precipitation (conv_pe, from the convection step) is
+   !> rained out at once, as in a real updraft where the sulfate is made in the cloud water;
+   !> only the rest is added to the particles (booked as made and as convective wet removal).
+   logical :: pmc_aq_conv_rain = .false.
+   real (kind=RKIND), allocatable :: conv_pe(:)
    !> Months of the monthly emission fields (fires, DMS) held in slots 1 and 2: the month of
    !> the model date when the emissions are first read, and the next month. 0 until read.
    integer :: emis_mo(2) = 0
@@ -764,6 +774,10 @@ contains
       if (stat == 0) pmc_wet_diag_only = (trim(envval) == '2')
       call get_environment_variable('PMC_WET_ICE', envval, status=stat)
       if (stat == 0) pmc_wet_ice = (trim(envval) /= '0')
+      call get_environment_variable('PMC_WET_ICE_T', envval, status=stat)
+      if (stat == 0) read(envval, *) pmc_wet_ice_t
+      call get_environment_variable('PMC_AQ_CONV_RAIN', envval, status=stat)
+      if (stat == 0) pmc_aq_conv_rain = (trim(envval) /= '0')
       call get_environment_variable('PMC_WET_BELOW', envval, status=stat)
       if (stat == 0) pmc_wet_below = (trim(envval) /= '0')
       call get_environment_variable('PMC_LNOX', envval, status=stat)
@@ -3328,6 +3342,8 @@ contains
       if (pmc_aq_conv) then
          if (.not. allocated(conv_aq_frac)) allocate(conv_aq_frac(nz, nCells))
          conv_aq_frac = 0.0_RKIND
+         if (.not. allocated(conv_pe)) allocate(conv_pe(nCells))
+         conv_pe = 0.0_RKIND
       end if
 
       do iCell = 1, nCellsSolve
@@ -3417,6 +3433,7 @@ contains
          ! the air entrained at j that is still in the updraft at the first level kc with
          ! condensation (qv(j) > qs(kc)), if kc is warmer than pmc_aq_tmin
          if (pmc_aq_conv) then
+            conv_pe(iCell) = pe
             do k = 1, nz
                qv(k) = max(0.0_RKIND, scalars(index_qv,k,iCell))
                tk(k) = theta_m(k,iCell) / (1.0_RKIND + rvord*qv(k)) * exner(k,iCell)
@@ -6044,7 +6061,7 @@ contains
             p = r * prod / (cond + prod)
             temp_k = theta_m(k,iCell) / (1.0_RKIND + rvord*max(0.0_RKIND, scalars(index_qv,k,iCell))) * exner(k,iCell)
             f_liq = 1.0_RKIND
-            if (pmc_wet_ice) then
+            if (pmc_wet_ice .and. .not. (pmc_wet_ice_t > 0.0_RKIND .and. temp_k >= pmc_wet_ice_t)) then
                if (cond > 0.0_RKIND) then
                   f_liq = max(0.0_RKIND, scalars(index_qc,k,iCell)) / cond
                else
@@ -6312,7 +6329,7 @@ contains
       real (kind=RKIND), dimension(:,:), pointer :: cldfrac
       integer, pointer :: index_qc
       integer :: i_h2o2, i_o3
-      real (kind=RKIND) :: qc, f_c, l_c, rho_d, d_h, d_o, d_ppb, aq_g(2), ox_w
+      real (kind=RKIND) :: qc, f_c, l_c, rho_d, d_h, d_o, d_ppb, aq_g(2), ox_w, f_keep
       real (kind=RKIND) :: temp_r, pres_r, so2_c, h2o2_c, ph_c, c_air, a_ion, n_ion, d_h1, d_o1, aq_phg(4)
       integer :: n_sub_aq, i_sub_aq, i_nh3, i_hno3
       real (kind=RKIND) :: burden(N_GRP), g_burden(N_GRP), m_grp(N_GRP), rem(3*N_GRP), g_rem(3*N_GRP)
@@ -6576,8 +6593,18 @@ contains
                         if (d_ppb > 0.0_RKIND) then
                            scalars(gas_idx(i_so2),k,iCell) = scalars(gas_idx(i_so2),k,iCell) - d_ppb
                            scalars(gas_idx(i_h2o2),k,iCell) = scalars(gas_idx(i_h2o2),k,iCell) - d_ppb
-                           call add_sulfate(aero_states(k,iCell), env_state, &
-                                            d_ppb * 1.0e-9_RKIND * rho_d * vol / M_AIR, vol)
+                           f_keep = 1.0_RKIND
+                           if (pmc_aq_conv_rain .and. allocated(conv_pe)) then
+                              f_keep = 1.0_RKIND - conv_pe(iCell)
+                              s_bud(SB_PWETC, band_of(iCell)) = s_bud(SB_PWETC, band_of(iCell)) &
+                                   + (1.0_RKIND - f_keep) * d_ppb * 1.0e-9_RKIND * rho_d * vol / M_AIR
+                              rem_mass(3,3) = rem_mass(3,3) + (1.0_RKIND - f_keep) * d_ppb * 1.0e-9_RKIND &
+                                              * rho_d * vol / M_AIR * 0.09606_RKIND
+                              part_s_removed = part_s_removed + (1.0_RKIND - f_keep) * d_ppb * 1.0e-9_RKIND &
+                                               * rho_d * vol / M_AIR
+                           end if
+                           if (f_keep > 0.0_RKIND) call add_sulfate(aero_states(k,iCell), env_state, &
+                                            f_keep * d_ppb * 1.0e-9_RKIND * rho_d * vol / M_AIR, vol)
                            aq_s_conv = aq_s_conv + d_ppb * 1.0e-9_RKIND * rho_d * vol / M_AIR
                            s_bud(SB_AQC, band_of(iCell)) = s_bud(SB_AQC, band_of(iCell)) &
                                 + d_ppb * 1.0e-9_RKIND * rho_d * vol / M_AIR

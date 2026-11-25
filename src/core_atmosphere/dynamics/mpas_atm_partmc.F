@@ -39,6 +39,9 @@
 !                     (default 0), and with PMC_CONV=1 also in the convective updraft unless
 !                     PMC_WET_CONV=0. 2 = only the diagnostics: nothing is removed. PMC_WET_SCRIT: only particles with a critical supersaturation
 !                     up to this value (as a fraction, 0.002 = 0.2%) are removed (default: all).
+!                     PMC_WET_SCRIT_CONV: the same for removal in the convective updraft
+!                     (default: PMC_WET_SCRIT). Updrafts reach higher supersaturations than
+!                     stratiform cloud, so more of the weakly hygroscopic particles activate there.
 !                     PMC_GAS_WET: file of the fraction of each gas that is in cloud water
 !                     (species name, 0 to 1); needs PMC_MOSAIC=1.
 !   PMC_EMIS_FILE     NetCDF file of emissions for every cell of the mesh (dimension nCells in
@@ -391,6 +394,9 @@ module mpas_atm_partmc
    !> Fraction of each gas species that is in cloud water (from the PMC_GAS_WET file).
    real (kind=RKIND), allocatable :: gas_wet_frac(:)
    real (kind=RKIND) :: pmc_wet_scrit = 1.0e9_RKIND
+   !> PMC_WET_SCRIT_CONV: largest critical supersaturation removed in the convective updraft
+   !> (negative: pmc_wet_scrit).
+   real (kind=RKIND) :: pmc_wet_scrit_conv = -1.0_RKIND
    character(len=256) :: gas_wet_file = ''
    real (kind=RKIND) :: wet_sums(6) = 0.0_RKIND
    !> Sums weighted by the reference number removed, to describe where removal happens:
@@ -802,6 +808,9 @@ contains
       if (stat == 0) pmc_wet_conv = (trim(envval) /= '0')
       call get_environment_variable('PMC_WET_SCRIT', envval, status=stat)
       if (stat == 0) read(envval, *) pmc_wet_scrit
+      call get_environment_variable('PMC_WET_SCRIT_CONV', envval, status=stat)
+      if (stat == 0) read(envval, *) pmc_wet_scrit_conv
+      if (pmc_wet_scrit_conv < 0.0_RKIND) pmc_wet_scrit_conv = pmc_wet_scrit
       call get_environment_variable('PMC_GAS_WET', envval, status=stat)
       if (stat == 0) gas_wet_file = envval
       call get_environment_variable('PMC_GAS_EMIT', envval, status=stat)
@@ -3175,9 +3184,9 @@ contains
          if (present(tmat_s)) env_state%temp = temp(k)
          do j = pos(k,iCell) % n, 1, -1
             scav = present(tmat_s)
-            if (scav .and. pmc_wet_scrit < 1.0e8_RKIND) then
+            if (scav .and. pmc_wet_scrit_conv < 1.0e8_RKIND) then
                scav = (aero_particle_crit_rel_humid(aero_states(k,iCell)%apa%particle(j), aero_data, env_state) &
-                       - 1.0d0 <= pmc_wet_scrit)
+                       - 1.0d0 <= pmc_wet_scrit_conv)
             end if
             if (scav) then
                g = aero_states(k,iCell)%apa%particle(j)%weight_class

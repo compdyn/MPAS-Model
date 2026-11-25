@@ -133,6 +133,8 @@
 !                     CAM-chem; see lightning_no); PMC_LNOX_FACTOR scales the production
 !                     (default 0.1). Needs PMC_MOSAIC=1, an emission file and cu_ntiedtke.
 !   PMC_WET_ICE, PMC_WET_BELOW  ice-phase and below-cloud wet removal (see pmc_wet_ice)
+!   PMC_WASHOUT_HNO3  1: below-cloud washout of HNO3 gas by grid-scale precipitation, as in
+!                     GEOS-Chem (needs PMC_WET_BELOW=1; see atm_partmc_wet_removal)
 
 ! Variable-length byte-buffer exchange between neighbouring MPI tasks, used to
 ! move PartMC particles across block boundaries. Kept in its own module so that
@@ -345,6 +347,8 @@ module mpas_atm_partmc
    !> removed below cloud (number), sulfur removed below cloud (mol), number not removed in
    !> cloud because the condensate was ice.
    logical :: pmc_wet_ice = .false., pmc_wet_below = .false.
+   !> PMC_WASHOUT_HNO3=1: below-cloud washout of HNO3 gas (GEOS-Chem, Liu et al. 2001).
+   logical :: pmc_wash_hno3 = .false.
    !> PMC_WET_ICE_T (K): if positive, the ice rule applies only below this temperature; at or
    !> above it all of the condensate removes aerosol as liquid (GEOS-Chem limits in-cloud
    !> scavenging of soluble aerosol only below 258 K, Wang et al. 2011). Default: all temperatures.
@@ -375,6 +379,8 @@ module mpas_atm_partmc
         2.0_RKIND, 2.0_RKIND, 2.0_RKIND, 1.5_RKIND, 1.5_RKIND, 1.5_RKIND, 3.0_RKIND, 5.8_RKIND, &
         7.6_RKIND, 9.6_RKIND, 11.0_RKIND, 14.0_RKIND, 14.0_RKIND, 14.0_RKIND, 8.2_RKIND, 2.3_RKIND /), (/16, 3/))
    real (kind=RKIND) :: bc_sums(3) = 0.0_RKIND
+   !> HNO3 washed out below cloud by this task since the start of the run (mol).
+   real (kind=RKIND) :: wash_sum = 0.0_RKIND
    !> Removal in the convective updraft: switch, and sums by this task so far: number removed
    !> (reference, particles, expected from the particles present), convective precipitation at
    !> the surface, water condensed in the updraft, and the part of it counted as precipitation
@@ -796,6 +802,8 @@ contains
       if (stat == 0) pmc_aq_conv_rain = (trim(envval) /= '0')
       call get_environment_variable('PMC_WET_BELOW', envval, status=stat)
       if (stat == 0) pmc_wet_below = (trim(envval) /= '0')
+      call get_environment_variable('PMC_WASHOUT_HNO3', envval, status=stat)
+      if (stat == 0) pmc_wash_hno3 = (trim(envval) /= '0')
       call get_environment_variable('PMC_LNOX', envval, status=stat)
       if (stat == 0) pmc_lnox = (trim(envval) /= '0')
       call get_environment_variable('PMC_LNOX_FACTOR', envval, status=stat)
@@ -5998,6 +6006,13 @@ contains
    !> rate (mm/h of water) falling through the layer: the column's production above it less
    !> the evaporation (rainprod - evapprod). s = min(1, surface precipitation / R) is the part
    !> of that precipitation that reaches the ground, as for the in-cloud removal.
+   !>
+   !> Washout of HNO3 (PMC_WASHOUT_HNO3=1, with PMC_WET_BELOW=1). HNO3 is so soluble that its
+   !> uptake by falling drops is limited by mass transfer, not by equilibrium; GEOS-Chem
+   !> (wetscav_mod, Liu et al. 2001) removes the fraction 1 - exp(-K P dt) of the HNO3 in a
+   !> layer, with K = 1 cm^-1 and P the precipitation rate through the layer (cm/s of water),
+   !> only at T >= 268 K. The same layers and flux as for the particles are used, with the
+   !> whole cell taken as precipitating, times s as above.
    subroutine atm_partmc_wet_removal(domain, itimestep)
 
       type (domain_type), intent(inout) :: domain
@@ -6286,6 +6301,14 @@ contains
                      removed = .true.
                   end do
                   if (removed .and. lagr_control) call lagr_rebalance(k, iCell, nCells, nEdgesOnCell, cellsOnCell)
+                  if (pmc_wash_hno3 .and. j_hno3 > 0 .and. .not. snow .and. allocated(gas_wetdep)) then
+                     ! K = 1 cm^-1; flux (kg m^-2 s^-1) / 1000 kg m^-3 * 100 cm/m = cm/s
+                     p = (1.0_RKIND - exp(-1.0_RKIND * flux * 0.1_RKIND * config_dt)) * s_reach
+                     amt = p * scalars(gas_idx(j_hno3),k,iCell)
+                     scalars(gas_idx(j_hno3),k,iCell) = scalars(gas_idx(j_hno3),k,iCell) - amt
+                     gas_wetdep(j_hno3) = gas_wetdep(j_hno3) + amt * 1.0e-9_RKIND * mk / M_AIR * areaCell(iCell)
+                     wash_sum = wash_sum + amt * 1.0e-9_RKIND * mk / M_AIR * areaCell(iCell)
+                  end if
                end if
                flux = max(0.0_RKIND, flux + (max(0.0_RKIND, rainprod(k,iCell)) - max(0.0_RKIND, evapprod(k,iCell))) * mk)
             end do
@@ -6308,6 +6331,12 @@ contains
             call mpas_log_write('PartMC wet removal step $i: below cloud so far: particles (number) $r, sulfur $r mol; ' &
                                 // 'in-cloud removal (number, expected) not done because the condensate was ice $r', &
                                 intArgs=(/itimestep/), realArgs=g_sums(1:3))
+            if (pmc_wash_hno3) then
+               sums(1) = wash_sum
+               call mpas_dmpar_sum_real_array(domain % dminfo, 1, sums(1:1), g_sums(1:1))
+               call mpas_log_write('PartMC wet removal step $i: HNO3 washed out below cloud so far $r mol', &
+                                   intArgs=(/itimestep/), realArgs=g_sums(1:1))
+            end if
             sums = wet_sums
             call mpas_dmpar_sum_real_array(domain % dminfo, 6, sums, g_sums)
          end if

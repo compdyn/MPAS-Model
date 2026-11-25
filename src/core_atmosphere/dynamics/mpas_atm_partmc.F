@@ -4933,12 +4933,19 @@ contains
          call mpas_dmpar_sum_real_array(domain % dminfo, n_gas, gas_emitted, g_emit)
          call mpas_dmpar_sum_real_array(domain % dminfo, n_gas, gas_deposited, g_dep)
          call mpas_dmpar_sum_real_array(domain % dminfo, n_gas, gas_wetdep, g_wet)
-         ! the species with the most emitted, dry deposited and wet deposited so far
+         ! the species with the most emitted, dry deposited and wet deposited so far, and the
+         ! reactive nitrogen gases (for the nitrogen budget; lightning NO is logged separately)
          j_e = maxloc(g_emit, dim=1)
          j_d = maxloc(g_dep, dim=1)
          j_w = maxloc(g_wet, dim=1)
          do j = 1, n_gas
-            if (j /= j_e .and. j /= j_d .and. j /= j_w) cycle
+            if (j /= j_e .and. j /= j_d .and. j /= j_w) then
+               select case (trim(gas_data%name(j)))
+               case ('NO', 'NO2', 'NO3', 'N2O5', 'HONO', 'HNO3', 'HNO4', 'PAN', 'ONIT', 'NH3')
+               case default
+                  cycle
+               end select
+            end if
             call mpas_log_write('PartMC gas surface step $i: ' // trim(gas_data%name(j)) // ' (mol) content = $r, ' &
                                 // 'at start = $r, emitted = $r, dry deposited = $r, wet deposited = $r, ' &
                                 // 'budget residual / content = $r', &

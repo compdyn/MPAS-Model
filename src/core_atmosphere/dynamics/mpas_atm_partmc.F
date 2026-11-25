@@ -5970,7 +5970,10 @@ contains
    !> condensate left). Ice-nucleating particles are removed with the full probability, as in
    !> GEOS-Chem (Wang et al. 2011): particles that are mostly dust at any temperature, and
    !> particles that are mostly BC below 258 K. Gases dissolved in cloud water are scaled the
-   !> same way, except HNO3, which ice takes up efficiently.
+   !> same way, except HNO3, which ice takes up efficiently. Applied at all temperatures this is
+   !> stricter than GEOS-Chem, which scavenges soluble aerosol fully in warm and mixed-phase cloud
+   !> (T >= 258 K, where riming and coalescence collect the droplets) and limits it only in cold
+   !> cloud (Wang et al. 2011); PMC_WET_ICE_T=258 gives that rule.
    !>
    !> Below cloud (PMC_WET_BELOW=1). In layers without condensate under precipitation, each
    !> particle is removed with probability (1 - exp(-L dt)) s, with the scavenging coefficient

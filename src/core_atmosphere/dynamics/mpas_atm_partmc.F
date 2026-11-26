@@ -621,7 +621,7 @@ module mpas_atm_partmc
    !> sums (variable, level, cell), the number of samples in them and the group of each species.
    integer :: pmc_diag_interval = 0, pmc_diag_every = 5, n_diag_samples = 0
    character(len=256) :: pmc_diag_dir = 'pmc_diag'
-   integer, parameter :: N_DIAG = 44, N_REG = 11
+   integer, parameter :: N_DIAG = 47, N_REG = 11
    real (kind=RKIND), allocatable :: diag_acc(:,:,:)
    integer, allocatable :: diag_group(:)
    !> Restart files for the particle state: write interval (steps), step to read at start-up,
@@ -7523,7 +7523,8 @@ contains
    !> PMC_DIAG_INTERVAL steps the means are written and the sums start again. Variables (per
    !> volume of air): number of all particles and of submicron ones (dry diameter below 1 um);
    !> number that activates at 0.1%, 0.3% and 1.0% supersaturation; dry mass of six species
-   !> groups for all sizes and for submicron particles; and, for submicron particles, the
+   !> groups for all sizes and for submicron particles; sulfate, nitrate and ammonium for all
+   !> sizes and for submicron particles; and, for submicron particles, the
    !> mass-weighted sums of the per-particle mixing entropy for three choices of "species":
    !> the six groups (chi_a), black carbon against the rest (chi_o), and non-hygroscopic
    !> (BC, dust, primary organic) against hygroscopic (sea salt, secondary organic, secondary
@@ -7557,7 +7558,8 @@ contains
          // 'msub_bc,msub_dust,msub_seasalt,msub_pom,msub_soa,msub_sia,' &
          // 'mh_a,mh_o,mh_h,m_water,m_so4,m_no3,m_nh4,mbc_ccn0p1,mbc_ccn0p3,mage_bc,' &
          // 'mbc_r0,mbc_r1,mbc_r2,mbc_r3,mbc_r4,mbc_r5,mbc_r6,mbc_r7,mbc_r8,mbc_r9,mbc_r10,' &
-         // 'ccnk_0p1,ccnk_0p3,ccni_0p1,ccni_0p3,mage_bc_ccn0p1,mage_bc_ccn0p3'
+         // 'ccnk_0p1,ccnk_0p3,ccni_0p1,ccni_0p3,mage_bc_ccn0p1,mage_bc_ccn0p3,' &
+         // 'msub_so4,msub_no3,msub_nh4'
 
       if (pmc_n_part <= 0 .or. pmc_diag_interval <= 0) return
 
@@ -7676,6 +7678,13 @@ contains
                   if (d_dry >= 1.0d-6 .or. m_tot <= 0.0d0) cycle
                   diag_acc(2,k,iCell) = diag_acc(2,k,iCell) + nc
                   diag_acc(12:17,k,iCell) = diag_acc(12:17,k,iCell) + nc * mg
+                  ! submicron sulfate, nitrate and ammonium (as measured by PM1 instruments)
+                  if (i_so4_d > 0) diag_acc(45,k,iCell) = diag_acc(45,k,iCell) + nc &
+                     * aero_states(k,iCell)%apa%particle(j)%vol(i_so4_d) * aero_data%density(i_so4_d)
+                  if (i_no3_d > 0) diag_acc(46,k,iCell) = diag_acc(46,k,iCell) + nc &
+                     * aero_states(k,iCell)%apa%particle(j)%vol(i_no3_d) * aero_data%density(i_no3_d)
+                  if (i_nh4_d > 0) diag_acc(47,k,iCell) = diag_acc(47,k,iCell) + nc &
+                     * aero_states(k,iCell)%apa%particle(j)%vol(i_nh4_d) * aero_data%density(i_nh4_d)
                   ! per-particle mixing entropies
                   h_a = 0.0d0
                   do g = 1, 6

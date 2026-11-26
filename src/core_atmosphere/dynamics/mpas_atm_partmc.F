@@ -126,6 +126,9 @@
 !                     group masses, and the sums needed for the mixing state index chi) every
 !                     this many steps to PMC_DIAG_DIR (default pmc_diag), one NetCDF file per
 !                     task; the particles are sampled every PMC_DIAG_EVERY steps (default 5)
+!                     and, in the same files, the mean deposition flux of every cell over the
+!                     period (particles by species group: dry, grid-scale and convective wet;
+!                     SO2, HNO3, NH3: dry and wet)
 !   PMC_OUT_INTERVAL  write particle files every this many steps (0 = never)
 !   PMC_OUT_FRAC      fraction of cells written each time (default 1)
 !   PMC_OUT_DIR       directory for particle files (default pmc_out)
@@ -562,6 +565,15 @@ module mpas_atm_partmc
    !> convective wet removal; the group of each aerosol species (0 = none, e.g. water).
    integer, parameter :: N_GRP = 9
    real (kind=RKIND) :: rem_mass(N_GRP,3) = 0.0_RKIND
+   !> Per-cell deposition for the time-mean diagnostics (with PMC_DIAG_INTERVAL), summed over the
+   !> steps since the last diagnostic file: particle mass (kg) of each species group removed by
+   !> dry deposition (1:9), grid-scale wet removal in and below cloud (10:18) and convective wet
+   !> removal (19:27); SO2, HNO3 and NH3 gas (mol) removed by dry deposition (28:30) and wet
+   !> removal (31:33). Written as fluxes per m2 and s. Not in the restart files, so the restart
+   !> interval must be a multiple of PMC_DIAG_INTERVAL for complete periods.
+   integer, parameter :: N_DEP = 3*N_GRP + 6, DEP_GDRY = 3*N_GRP + 1, DEP_GWET = 3*N_GRP + 4
+   real (kind=RKIND), allocatable :: dep_acc(:,:)
+   integer :: dep_steps = 0, dep_gas(3) = -1
    integer, allocatable :: grp_of(:)
    !> Sea salt: switch, scale, and the size distribution of the flux at 1 m/s: bin edges of
    !> the dry diameter (m), cumulative share of the number, number flux (m^-2 s^-1).
@@ -3202,7 +3214,7 @@ contains
                conv_wet(3) = conv_wet(3) + p_rem(k) * w
                if (pmc_random() < p_rem(k)) then
                   conv_wet(2) = conv_wet(2) + w
-                  call note_removal(aero_states(k,iCell)%apa%particle(j), w, 3, band_of(iCell))
+                  call note_removal(aero_states(k,iCell)%apa%particle(j), w, 3, band_of(iCell), iCell)
                   call aero_state_remove_particle_no_info(aero_states(k,iCell), j)
                   call pos_remove(pos(k,iCell), j)
                   cycle
@@ -3604,6 +3616,7 @@ contains
                if (gas_of(i_s) > 0) then
                   gas_wetdep(gas_of(i_s)) = gas_wetdep(gas_of(i_s)) &
                                             + lost * 1.0e-9_RKIND / M_AIR * areaCell(iCell)
+                  call dep_note_gas(iCell, DEP_GWET, (/lost * 1.0e-9_RKIND / M_AIR * areaCell(iCell)/), gas_of(i_s))
                   if (is_sulfur_gas(gas_of(i_s))) s_bud(SB_GWET, band_of(iCell)) = s_bud(SB_GWET, band_of(iCell)) &
                        + lost * 1.0e-9_RKIND / M_AIR * areaCell(iCell)
                end if
@@ -4081,7 +4094,7 @@ contains
                drydep_sums(4) = drydep_sums(4) + w
                if (pmc_random() >= p_dep) cycle
                drydep_sums(2) = drydep_sums(2) + w
-               call note_removal(aero_states(1,iCell)%apa%particle(j), w, 1, band_of(iCell))
+               call note_removal(aero_states(1,iCell)%apa%particle(j), w, 1, band_of(iCell), iCell)
                call aero_state_remove_particle_no_info(aero_states(1,iCell), j)
                call pos_remove(pos(1,iCell), j)
             end do
@@ -4097,7 +4110,7 @@ contains
                   g = aero_states(1,iCell)%apa%particle(j)%weight_class
                   surf_sums(4) = surf_sums(4) + lagr_w * 2.0_RKIND**(g - LAGR_G0)
                   call note_removal(aero_states(1,iCell)%apa%particle(j), lagr_w * 2.0_RKIND**(g - LAGR_G0), 1, &
-                                    band_of(iCell))
+                                    band_of(iCell), iCell)
                   call aero_state_remove_particle_no_info(aero_states(1,iCell), j)
                   call pos_remove(pos(1,iCell), j)
                end do
@@ -4839,6 +4852,7 @@ contains
             amount = frac * scalars(gas_idx,1,iCell)
             scalars(gas_idx,1,iCell) = scalars(gas_idx,1,iCell) - amount
             gas_deposited = gas_deposited + amount * 1.0e-9_RKIND * air1 * areaCell(iCell)
+            call dep_note_gas(iCell, DEP_GDRY, amount * 1.0e-9_RKIND * air1 * areaCell(iCell), 0)
             s_bud(SB_GDRY, band_of(iCell)) = s_bud(SB_GDRY, band_of(iCell)) &
                  + sulfur_gas_sum(amount) * 1.0e-9_RKIND * air1 * areaCell(iCell)
          end if
@@ -5720,17 +5734,62 @@ contains
    end function bcs_lambda
 
 
-   subroutine note_removal(particle, w, proc, ib)
+   subroutine note_removal(particle, w, proc, ib, iCell)
       type(aero_particle_t), intent(in) :: particle
       real (kind=RKIND), intent(in) :: w
-      integer, intent(in) :: proc, ib
+      integer, intent(in) :: proc, ib, iCell
       real (kind=RKIND) :: m(N_GRP)
 
       part_s_removed = part_s_removed + particle_sulfate(particle) * w
       s_bud(SB_PDRY + proc - 1, ib) = s_bud(SB_PDRY + proc - 1, ib) + particle_sulfate(particle) * w
       call group_masses(particle, m)
       rem_mass(:,proc) = rem_mass(:,proc) + m * w
+      call dep_note(iCell, (proc - 1) * N_GRP + 1, m * w)
    end subroutine note_removal
+
+
+   !> Add v to the per-cell deposition sums dep_acc(i0:, iCell) (see dep_acc).
+   subroutine dep_note(iCell, i0, v)
+      integer, intent(in) :: iCell, i0
+      real (kind=RKIND), intent(in) :: v(:)
+
+      if (pmc_diag_interval <= 0) return
+      if (.not. allocated(dep_acc)) then
+         allocate(dep_acc(N_DEP, size(aero_states, 2)))
+         dep_acc = 0.0_RKIND
+      end if
+      dep_acc(i0:i0+size(v)-1, iCell) = dep_acc(i0:i0+size(v)-1, iCell) + v
+   end subroutine dep_note
+
+
+   !> Per-cell deposition of SO2, HNO3 and NH3: mol(g) is the amount of gas g removed (mol),
+   !> for all gases (n = 0) or only gas n; i0 = DEP_GDRY or DEP_GWET.
+   subroutine dep_note_gas(iCell, i0, mol, n)
+      integer, intent(in) :: iCell, i0, n
+      real (kind=RKIND), intent(in) :: mol(:)
+      real (kind=RKIND) :: v(3)
+      integer :: g
+
+      if (pmc_diag_interval <= 0) return
+      if (dep_gas(1) < 0) then
+         dep_gas = 0
+#ifdef MPAS_PARTMC_MOSAIC
+         dep_gas(1) = gas_data_spec_by_name(gas_data, 'SO2')
+         dep_gas(2) = gas_data_spec_by_name(gas_data, 'HNO3')
+         dep_gas(3) = gas_data_spec_by_name(gas_data, 'NH3')
+#endif
+      end if
+      v = 0.0_RKIND
+      do g = 1, 3
+         if (dep_gas(g) <= 0) cycle
+         if (n == 0) then
+            v(g) = mol(dep_gas(g))
+         else if (n == dep_gas(g)) then
+            v(g) = mol(1)
+         end if
+      end do
+      call dep_note(iCell, i0, v)
+   end subroutine dep_note_gas
 
 
    !> New particle formation in cell (k,iCell) after its MOSAIC step (PMC_NPF, see the header).
@@ -6233,6 +6292,7 @@ contains
                amount = gas_wet_frac * p_gas * scalars(gas_idx,k,iCell)
                scalars(gas_idx,k,iCell) = scalars(gas_idx,k,iCell) - amount
                gas_wetdep = gas_wetdep + amount * 1.0e-9_RKIND * mk / M_AIR * areaCell(iCell)
+               call dep_note_gas(iCell, DEP_GWET, amount * 1.0e-9_RKIND * mk / M_AIR * areaCell(iCell), 0)
                s_bud(SB_GWET, band_of(iCell)) = s_bud(SB_GWET, band_of(iCell)) &
                     + sulfur_gas_sum(amount) * 1.0e-9_RKIND * mk / M_AIR * areaCell(iCell)
             end if
@@ -6263,7 +6323,7 @@ contains
                g = aero_states(k,iCell)%apa%particle(j)%weight_class
                w = lagr_w * 2.0_RKIND**(g - LAGR_G0)
                wet_sums(2) = wet_sums(2) + w
-               call note_removal(aero_states(k,iCell)%apa%particle(j), w, 2, band_of(iCell))
+               call note_removal(aero_states(k,iCell)%apa%particle(j), w, 2, band_of(iCell), iCell)
                call aero_state_remove_particle_no_info(aero_states(k,iCell), j)
                call pos_remove(pos(k,iCell), j)
                removed = .true.
@@ -6295,7 +6355,7 @@ contains
                      bc_sums(1) = bc_sums(1) + w
                      bc_sums(2) = bc_sums(2) + particle_sulfate(aero_states(k,iCell)%apa%particle(j)) * w
                      wet_sums(2) = wet_sums(2) + w
-                     call note_removal(aero_states(k,iCell)%apa%particle(j), w, 2, band_of(iCell))
+                     call note_removal(aero_states(k,iCell)%apa%particle(j), w, 2, band_of(iCell), iCell)
                      call aero_state_remove_particle_no_info(aero_states(k,iCell), j)
                      call pos_remove(pos(k,iCell), j)
                      removed = .true.
@@ -6308,6 +6368,7 @@ contains
                      scalars(gas_idx(j_hno3),k,iCell) = scalars(gas_idx(j_hno3),k,iCell) - amt
                      gas_wetdep(j_hno3) = gas_wetdep(j_hno3) + amt * 1.0e-9_RKIND * mk / M_AIR * areaCell(iCell)
                      wash_sum = wash_sum + amt * 1.0e-9_RKIND * mk / M_AIR * areaCell(iCell)
+                     call dep_note_gas(iCell, DEP_GWET, (/amt * 1.0e-9_RKIND * mk / M_AIR * areaCell(iCell)/), j_hno3)
                   end if
                end if
                flux = max(0.0_RKIND, flux + (max(0.0_RKIND, rainprod(k,iCell)) - max(0.0_RKIND, evapprod(k,iCell))) * mk)
@@ -6697,6 +6758,8 @@ contains
                                    + (1.0_RKIND - f_keep) * d_ppb * 1.0e-9_RKIND * rho_d * vol / M_AIR
                               rem_mass(3,3) = rem_mass(3,3) + (1.0_RKIND - f_keep) * d_ppb * 1.0e-9_RKIND &
                                               * rho_d * vol / M_AIR * 0.09606_RKIND
+                              call dep_note(iCell, 2*N_GRP + 3, (/(1.0_RKIND - f_keep) * d_ppb * 1.0e-9_RKIND &
+                                            * rho_d * vol / M_AIR * 0.09606_RKIND/))
                               part_s_removed = part_s_removed + (1.0_RKIND - f_keep) * d_ppb * 1.0e-9_RKIND &
                                                * rho_d * vol / M_AIR
                            end if
@@ -7551,8 +7614,15 @@ contains
       integer :: mo_d, i_so4_d, i_no3_d, i_nh4_d, src, reg
       real (kind=RKIND) :: age_d
       type(env_state_t) :: env_state
-      real (kind=R4KIND), allocatable :: out(:,:,:), zm(:,:)
+      real (kind=R4KIND), allocatable :: out(:,:,:), zm(:,:), dep_out(:,:)
+      real (kind=RKIND), dimension(:), pointer :: areaCell
+      real (kind=RKIND), pointer :: config_dt
+      integer :: d_dep
       character(len=512) :: fname
+      character(len=*), parameter :: dep_names = 'dry_bc,dry_pom,dry_so4,dry_no3,dry_nh4,dry_soa,' &
+         // 'dry_seasalt,dry_dust,dry_msa,wet_bc,wet_pom,wet_so4,wet_no3,wet_nh4,wet_soa,wet_seasalt,' &
+         // 'wet_dust,wet_msa,cwet_bc,cwet_pom,cwet_so4,cwet_no3,cwet_nh4,cwet_soa,cwet_seasalt,' &
+         // 'cwet_dust,cwet_msa,gdry_so2,gdry_hno3,gdry_nh3,gwet_so2,gwet_hno3,gwet_nh3'
       character(len=*), parameter :: var_names = 'num,num_sub,ccn_0p1,ccn_0p3,ccn_1p0,' &
          // 'm_bc,m_dust,m_seasalt,m_pom,m_soa,m_sia,' &
          // 'msub_bc,msub_dust,msub_seasalt,msub_pom,msub_soa,msub_sia,' &
@@ -7562,6 +7632,7 @@ contains
          // 'msub_so4,msub_no3,msub_nh4'
 
       if (pmc_n_part <= 0 .or. pmc_diag_interval <= 0) return
+      dep_steps = dep_steps + 1
 
       call mpas_pool_get_subpool(domain % blocklist % structs, 'mesh', mesh)
       call mpas_pool_get_subpool(domain % blocklist % structs, 'state', state)
@@ -7741,6 +7812,23 @@ contains
       call nc_check(nf90_put_var(ncid, varid, zm), 'put height')
       call nc_check(nf90_def_var(ncid, 'mean', NF90_FLOAT, (/d_var, d_lev, d_cell/), varid, deflate_level=1), 'def mean')
       call nc_check(nf90_put_var(ncid, varid, out), 'put mean')
+      ! deposition fluxes over the same period (see dep_acc): particles kg m-2 s-1, gases mol m-2 s-1
+      call mpas_pool_get_array(mesh, 'areaCell', areaCell)
+      call mpas_pool_get_config(domain % blocklist % configs, 'config_dt', config_dt)
+      allocate(dep_out(N_DEP, nCellsSolve))
+      dep_out = 0.0_R4KIND
+      if (allocated(dep_acc) .and. dep_steps > 0) then
+         do iCell = 1, nCellsSolve
+            dep_out(:,iCell) = real(dep_acc(:,iCell) / (areaCell(iCell) * dep_steps * config_dt), kind=R4KIND)
+         end do
+      end if
+      call nc_check(nf90_def_dim(ncid, 'dep_variable', N_DEP, d_dep), 'dim dep_variable')
+      call nc_check(nf90_def_var(ncid, 'dep', NF90_FLOAT, (/d_dep, d_cell/), varid, deflate_level=1), 'def dep')
+      call nc_check(nf90_put_att(ncid, varid, 'variables', dep_names), 'att')
+      call nc_check(nf90_put_att(ncid, varid, 'units', 'particles kg m-2 s-1, gases (gdry_, gwet_) mol m-2 s-1'), 'att')
+      call nc_check(nf90_put_att(ncid, varid, 'steps', dep_steps), 'att')
+      call nc_check(nf90_put_var(ncid, varid, dep_out), 'put dep')
+      deallocate(dep_out)
       call nc_check(nf90_close(ncid), 'close')
       if (domain % dminfo % my_proc_id == 0) then
          call mpas_log_write('PartMC diag step $i: time-mean aerosol fields written, $i samples', &
@@ -7748,6 +7836,8 @@ contains
       end if
       diag_acc = 0.0_RKIND
       n_diag_samples = 0
+      if (allocated(dep_acc)) dep_acc = 0.0_RKIND
+      dep_steps = 0
 #endif
 
    end subroutine atm_partmc_diag
